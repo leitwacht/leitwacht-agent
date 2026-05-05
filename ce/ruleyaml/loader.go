@@ -1,0 +1,408 @@
+package ruleyaml
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+	"gitlab.com/leitwacht/leitwacht-agent/agentcore/policy"
+	"gopkg.in/yaml.v3"
+)
+
+const supportedSchemaVersion = 1
+
+// Loader implements policy.Source by reading a rules.yaml file and
+// satisfying policy.WatcherReadiness. Hot-reload runs off an fsnotify
+// watch; the parsed snapshot is swapped atomically.
+type Loader struct {
+	path string
+	log  *slog.Logger
+
+	snapshot atomic.Pointer[snapshot]
+	ready    atomic.Bool
+	version  atomic.Int64
+}
+
+type snapshot struct {
+	scopes       map[string]*policy.ResolvedPolicy
+	defaultScope *policy.ResolvedPolicy
+}
+
+// New creates a Loader and performs the initial parse. Returns an error
+// if the file cannot be read or the schema is invalid — the daemon
+// refuses to start with bad rules rather than silently allowing all
+// egress.
+func New(path string, log *slog.Logger) (*Loader, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve rules path: %w", err)
+	}
+
+	// Resolve symlinks so the path we compare against fsnotify events
+	// matches what the kernel reports. On darwin /var → /private/var
+	// trips this; on Linux atomic ConfigMap projection (..data symlink)
+	// also depends on it.
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
+
+	l := &Loader{path: abs, log: log}
+
+	if err := l.reload(); err != nil {
+		return nil, err
+	}
+
+	l.ready.Store(true)
+
+	return l, nil
+}
+
+// Resolve returns the policy for projectPath. CE matches on scope name:
+// callers pass either the scope name (preferred — set via container env
+// or label) or any string. On miss the "default" scope is returned if
+// configured; otherwise (nil, false, nil).
+func (l *Loader) Resolve(projectPath string) (*policy.ResolvedPolicy, bool, error) {
+	snap := l.snapshot.Load()
+	if snap == nil {
+		return nil, false, nil
+	}
+
+	if pol, ok := snap.scopes[projectPath]; ok {
+		return pol, true, nil
+	}
+
+	if snap.defaultScope != nil {
+		// Clone so callers that mutate ProjectPath for ForJob() etc. don't
+		// pollute the shared default.
+		clone := *snap.defaultScope
+		clone.ProjectPath = projectPath
+		return &clone, true, nil
+	}
+
+	return nil, false, nil
+}
+
+// Ready satisfies policy.WatcherReadiness. CE is ready as soon as the
+// initial parse succeeded.
+func (l *Loader) Ready() bool { return l.ready.Load() }
+
+// Run watches the rules file for changes and reloads on writes. Returns
+// when ctx is cancelled. The optional ready channel, if non-nil, is
+// closed once the fsnotify watch is in place — useful for tests that
+// need to write the file after Run() is observing.
+func (l *Loader) Run(stop <-chan struct{}) error {
+	return l.runWithReady(stop, nil)
+}
+
+// RunWithReady is Run plus a ready signal. Production callers use Run;
+// tests that race writes against watcher startup pass a non-nil ready
+// channel and wait on it before writing.
+func (l *Loader) RunWithReady(stop <-chan struct{}, ready chan<- struct{}) error {
+	return l.runWithReady(stop, ready)
+}
+
+func (l *Loader) runWithReady(stop <-chan struct{}, ready chan<- struct{}) error {
+	w, err := fsnotify.NewWatcher()
+	if err != nil {
+		return fmt.Errorf("fsnotify: %w", err)
+	}
+	defer w.Close()
+
+	dir := filepath.Dir(l.path)
+	if resolved, rerr := filepath.EvalSymlinks(dir); rerr == nil {
+		dir = resolved
+	}
+	if err := w.Add(dir); err != nil {
+		return fmt.Errorf("watch %s: %w", dir, err)
+	}
+
+	if ready != nil {
+		close(ready)
+	}
+
+	// Compare on basename rather than the full path. A symlinked tmpdir
+	// (darwin /var → /private/var) and Kubernetes ConfigMap projection
+	// (..data/rules.yaml swap) both deliver events with paths that
+	// don't equal l.path verbatim, but the basename always matches.
+	want := filepath.Base(l.path)
+
+	// Coalesce bursts of writes (editors, ConfigMap atomic-rename) into a
+	// single reload after a short quiet period.
+	const debounce = 250 * time.Millisecond
+
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	resetTimer := func() {
+		if timer != nil {
+			timer.Stop()
+		}
+		timer = time.AfterFunc(debounce, func() {
+			if err := l.reload(); err != nil {
+				l.log.Error("rules reload failed (keeping previous snapshot)",
+					"path", l.path, "error", err)
+				return
+			}
+			l.log.Info("rules reloaded", "path", l.path, "version", l.version.Load())
+		})
+	}
+
+	for {
+		select {
+		case <-stop:
+			return nil
+		case ev, ok := <-w.Events:
+			if !ok {
+				return nil
+			}
+			if filepath.Base(ev.Name) != want {
+				continue
+			}
+			if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+				resetTimer()
+			}
+		case err, ok := <-w.Errors:
+			if !ok {
+				return nil
+			}
+			l.log.Warn("fsnotify error", "error", err)
+		}
+	}
+}
+
+// Version returns the monotonic counter advanced on every successful
+// reload. Surfaced for diagnostic logging — callers should not rely on
+// the exact integer for caching decisions.
+func (l *Loader) Version() int64 { return l.version.Load() }
+
+func (l *Loader) reload() error {
+	raw, err := os.ReadFile(l.path)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", l.path, err)
+	}
+
+	var f File
+	if err := yaml.Unmarshal(raw, &f); err != nil {
+		return fmt.Errorf("parse yaml: %w", err)
+	}
+
+	if f.SchemaVersion != supportedSchemaVersion {
+		return fmt.Errorf("unsupported schema_version %d (want %d)",
+			f.SchemaVersion, supportedSchemaVersion)
+	}
+
+	if len(f.Scopes) == 0 {
+		return errors.New("no scopes defined")
+	}
+
+	// Increment version *before* building the snapshot so concurrent
+	// reload paths (the test path that calls reload() directly bypasses
+	// the debounce serialisation) can't both stamp the same version on
+	// two snapshots.
+	version := int(l.version.Add(1))
+
+	snap, err := buildSnapshot(&f, version)
+	if err != nil {
+		return err
+	}
+
+	l.snapshot.Store(snap)
+
+	return nil
+}
+
+func buildSnapshot(f *File, version int) (*snapshot, error) {
+	now := time.Now()
+	out := &snapshot{scopes: make(map[string]*policy.ResolvedPolicy, len(f.Scopes))}
+
+	for i := range f.Scopes {
+		s := &f.Scopes[i]
+
+		if s.Name == "" {
+			return nil, fmt.Errorf("scope[%d]: name is required", i)
+		}
+
+		action, err := normaliseAction(s.DefaultAction, ActionAllow)
+		if err != nil {
+			return nil, fmt.Errorf("scope %q: default_action: %w", s.Name, err)
+		}
+
+		jobActions := make(map[string]string, len(s.JobActions))
+		for job, ja := range s.JobActions {
+			a, err := normaliseAction(ja, "")
+			if err != nil {
+				return nil, fmt.Errorf("scope %q: job_actions[%q]: %w", s.Name, job, err)
+			}
+			jobActions[job] = a
+		}
+
+		ruleSets := make(map[string][]policy.Rule, len(s.RuleSets))
+		// Always provide a default catch-all key so the handler can range.
+		if _, ok := s.RuleSets[""]; !ok {
+			ruleSets[""] = nil
+		}
+
+		for jobName, rules := range s.RuleSets {
+			converted, err := convertRules(rules)
+			if err != nil {
+				return nil, fmt.Errorf("scope %q: rule_sets[%q]: %w", s.Name, jobName, err)
+			}
+			ruleSets[jobName] = converted
+		}
+
+		denyIPs, denyIPSet, err := buildDenyIPs(s.DenyIPs)
+		if err != nil {
+			return nil, fmt.Errorf("scope %q: deny_ips: %w", s.Name, err)
+		}
+
+		pol := &policy.ResolvedPolicy{
+			ProjectPath: s.Name,
+			Action:      action,
+			JobActions:  jobActions,
+			RuleSets:    ruleSets,
+			DenyIPs:     denyIPs,
+			DenyIPSet:   denyIPSet,
+			Enrolled:    true,
+			Version:     version,
+			FetchedAt:   now,
+			TTL:         24 * time.Hour, // CE serves from snapshot; the cache TTL is irrelevant.
+		}
+
+		if _, dup := out.scopes[s.Name]; dup {
+			return nil, fmt.Errorf("scope %q: duplicate name", s.Name)
+		}
+		out.scopes[s.Name] = pol
+
+		if s.Name == DefaultScopeName {
+			out.defaultScope = pol
+		}
+	}
+
+	return out, nil
+}
+
+func convertRules(in []Rule) ([]policy.Rule, error) {
+	out := make([]policy.Rule, 0, len(in))
+	for i, r := range in {
+		pt, pattern, err := normalisePattern(r.PatternType, r.Pattern)
+		if err != nil {
+			return nil, fmt.Errorf("rule[%d]: %w", i, err)
+		}
+
+		action, err := normaliseAction(r.Action, "")
+		if err != nil {
+			return nil, fmt.Errorf("rule[%d]: action: %w", i, err)
+		}
+
+		// agentcore action vocabulary at rule scope is allow|deny only.
+		// Per-rule `audit` is rejected because it doesn't have a
+		// distinct enforcement semantics yet — it would silently behave
+		// as allow and surprise operators. Audit-mode is a project-
+		// level decision: set `default_action: audit` on the scope.
+		if action == ActionAudit {
+			return nil, fmt.Errorf("rule[%d]: action: audit is not supported per-rule; "+
+				"use default_action: audit on the scope to put the whole scope in audit mode", i)
+		}
+		if action == ActionBlock {
+			action = policy.ActionDeny
+		}
+
+		// Reject `allow + domain/wildcard` rules without explicit ports.
+		// agentcore's primitive treats empty ports as "all ports
+		// allowed" — that's a footgun for an egress-control rule
+		// (`allow github.com` with no ports also opens SSH, RDP, and
+		// any port someone runs an unrelated service on). Both CE and
+		// EE force operators to spell out the ports they actually need.
+		if action == policy.ActionAllow && pt == policy.PatternFQDN && len(r.Ports) == 0 {
+			return nil, fmt.Errorf("rule[%d]: allow + domain/wildcard rule must specify ports "+
+				"(e.g., ports: [443]); empty ports would permit every port on the matched host", i)
+		}
+
+		resolution := r.Resolution
+		if action == policy.ActionDeny && pt == policy.PatternFQDN && resolution == "" {
+			resolution = policy.DenyResolutionNXDomain
+		}
+
+		out = append(out, policy.Rule{
+			Pattern:     pattern,
+			PatternType: pt,
+			Action:      action,
+			Resolution:  resolution,
+			Ports:       r.Ports,
+			Reason:      r.Reason,
+			Source:      "ce-yaml",
+		})
+	}
+	return out, nil
+}
+
+func normaliseAction(in, fallback string) (string, error) {
+	v := strings.ToLower(strings.TrimSpace(in))
+	if v == "" {
+		if fallback == "" {
+			return "", errors.New("action is required")
+		}
+		v = fallback
+	}
+	switch v {
+	case ActionAllow, ActionBlock, ActionAudit, policy.ActionDeny:
+		return v, nil
+	default:
+		return "", fmt.Errorf("unknown action %q (want allow|block|audit)", in)
+	}
+}
+
+func normalisePattern(ptype, pattern string) (string, string, error) {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return "", "", errors.New("pattern is required")
+	}
+
+	switch strings.ToLower(strings.TrimSpace(ptype)) {
+	case "", PatternDomain, PatternWildcard:
+		return policy.PatternFQDN, strings.ToLower(pattern), nil
+	case PatternIP:
+		ip := net.ParseIP(pattern)
+		if ip == nil {
+			return "", "", fmt.Errorf("invalid ip %q", pattern)
+		}
+		// Single-host CIDR for the eBPF map.
+		if ip.To4() != nil {
+			return policy.PatternCIDR, ip.String() + "/32", nil
+		}
+		return policy.PatternCIDR, ip.String() + "/128", nil
+	case PatternCIDR:
+		if _, _, err := net.ParseCIDR(pattern); err != nil {
+			return "", "", fmt.Errorf("invalid cidr %q: %w", pattern, err)
+		}
+		return policy.PatternCIDR, pattern, nil
+	default:
+		return "", "", fmt.Errorf("unknown pattern_type %q", ptype)
+	}
+}
+
+func buildDenyIPs(in []DenyIP) ([]policy.DenyIP, map[policy.DenyIPKey]bool, error) {
+	out := make([]policy.DenyIP, 0, len(in))
+	set := make(map[policy.DenyIPKey]bool, len(in))
+	for i, d := range in {
+		ip := net.ParseIP(d.IP)
+		if ip == nil {
+			return nil, nil, fmt.Errorf("deny_ips[%d]: invalid ip %q", i, d.IP)
+		}
+		entry := policy.DenyIP{IP: ip.String(), Port: d.Port}
+		out = append(out, entry)
+		set[policy.DenyIPKey{IP: entry.IP, Port: entry.Port}] = true
+	}
+	return out, set, nil
+}

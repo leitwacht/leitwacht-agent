@@ -1,0 +1,89 @@
+# leitwacht-ce — example rule file.
+#
+# Runs the data-plane in default-block mode for the catch-all "default"
+# scope, with a small allow-list for the registries and package mirrors
+# a typical CI job needs. See ce/SCHEMA.md for the full schema.
+schema_version: 1
+
+scopes:
+  - name: default
+    default_action: block
+
+    rule_sets:
+      "":
+        # Container registries.
+        - pattern: registry.gitlab.com
+          pattern_type: domain
+          action: allow
+          ports: [443]
+        - pattern: "*.docker.io"
+          pattern_type: wildcard
+          action: allow
+          ports: [443]
+        - pattern: ghcr.io
+          pattern_type: domain
+          action: allow
+          ports: [443]
+
+        # Package mirrors.
+        - pattern: "*.debian.org"
+          pattern_type: wildcard
+          action: allow
+          ports: [80, 443]
+        - pattern: "*.ubuntu.com"
+          pattern_type: wildcard
+          action: allow
+          ports: [80, 443]
+        - pattern: pypi.org
+          pattern_type: domain
+          action: allow
+          ports: [443]
+        - pattern: files.pythonhosted.org
+          pattern_type: domain
+          action: allow
+          ports: [443]
+
+        # Source control.
+        - pattern: github.com
+          pattern_type: domain
+          action: allow
+          ports: [443]
+        - pattern: gitlab.com
+          pattern_type: domain
+          action: allow
+          ports: [443]
+
+        # Observability — block IMDSv1 on AWS unconditionally.
+        - pattern: 169.254.169.254
+          pattern_type: ip
+          action: block
+          reason: "AWS IMDSv1 token theft surface"
+
+    # Per-job overrides flip the action mode for a specific CI job
+    # name. Here, jobs called "release" get hard block mode regardless
+    # of the project's default. Add per-job rule_sets above to give a
+    # named job its own allow list.
+    job_actions:
+      release: block
+
+    deny_ips:
+      # Private link-local + metadata addresses — defense in depth.
+      - ip: 169.254.169.254
+        port: 80
+      - ip: 169.254.169.254
+        port: 443
+
+  - name: trusted-internal
+    # A second scope opted into by setting the
+    # leitwacht.eu/scope=trusted-internal label on the runner pod.
+    # default_action: audit logs every connection without blocking — in
+    # this mode the rules below are advisory; egress is never denied.
+    # Use this for triage / staging before flipping to default_action:
+    # block once you've observed the real allow-list.
+    default_action: audit
+    rule_sets:
+      "":
+        - pattern: "*.internal.example.com"
+          pattern_type: wildcard
+          action: allow
+          ports: [443]

@@ -1,0 +1,20 @@
+bin/
+*.test
+coverage.out
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# eBPF objects are committed (CI needs them to build); the .o files
+# under agentcore/enforcer/ are tracked.
+/TODO.md

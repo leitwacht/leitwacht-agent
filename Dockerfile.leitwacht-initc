@@ -1,0 +1,57 @@
+# syntax=docker/dockerfile:1.7
+#
+# leitwacht-agent / leitwacht-initc
+#
+# CI job pod init container. Blocks main container startup until the
+# in-netns DNS proxy answers _leitwacht.attached.local with the agent's
+# version, proving enforcement is live. Pure DNS, no RPC, no socket,
+# no hostPath — PSA-baseline compatible.
+#
+# Pure Go, no CGO — ships from scratch with a static binary.
+
+ARG GO_VERSION=1.26
+
+FROM golang:${GO_VERSION}-alpine AS build
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
+
+COPY agentcore/ ./agentcore/
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build \
+      -trimpath \
+      -ldflags "-s -w \
+        -X gitlab.com/leitwacht/leitwacht-agent/agentcore/version.Version=${VERSION} \
+        -X gitlab.com/leitwacht/leitwacht-agent/agentcore/version.Commit=${COMMIT}" \
+      -o /out/leitwacht-initc \
+      ./agentcore/cmd/leitwacht-initc
+
+FROM scratch
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+
+LABEL org.opencontainers.image.title="leitwacht-initc"
+LABEL org.opencontainers.image.description="Init container that gates entrypoints on leitwacht agent attach"
+LABEL org.opencontainers.image.licenses="MPL-2.0"
+LABEL org.opencontainers.image.source="https://gitlab.com/leitwacht/leitwacht-agent"
+LABEL org.opencontainers.image.url="https://gitlab.com/leitwacht/leitwacht-agent"
+LABEL org.opencontainers.image.documentation="https://gitlab.com/leitwacht/leitwacht-agent/-/blob/main/README.md"
+LABEL org.opencontainers.image.vendor="leitwacht"
+LABEL org.opencontainers.image.version="${VERSION}"
+LABEL org.opencontainers.image.revision="${COMMIT}"
+
+COPY --from=build /out/leitwacht-initc /leitwacht-initc
+
+ENTRYPOINT ["/leitwacht-initc"]

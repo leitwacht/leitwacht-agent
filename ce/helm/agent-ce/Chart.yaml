@@ -1,0 +1,20 @@
+apiVersion: v2
+name: leitwacht-agent-ce
+description: leitwacht Community Edition agent — YAML-driven egress control for GitLab CI runners.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://gitlab.com/leitwacht/leitwacht-agent
+sources:
+  - https://gitlab.com/leitwacht/leitwacht-agent
+maintainers:
+  - name: leitwacht maintainers
+    email: security@leitwacht.eu
+    url: https://gitlab.com/leitwacht
+keywords:
+  - gitlab
+  - gitlab-runner
+  - security
+  - egress
+  - ci-cd
+  - ebpf

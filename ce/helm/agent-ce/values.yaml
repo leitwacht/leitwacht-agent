@@ -1,0 +1,149 @@
+# leitwacht-agent-ce — default values.
+
+image:
+  repository: registry.gitlab.com/leitwacht/leitwacht-agent/agent-ce
+  pullPolicy: IfNotPresent
+  # Pin to a digest in production. The chart's appVersion is used when
+  # tag is empty.
+  tag: ""
+
+imagePullSecrets: []
+
+# rules.yaml content for the ConfigMap. The daemon hot-reloads when the
+# ConfigMap is updated. See ce/SCHEMA.md for the schema.
+rules: |
+  schema_version: 1
+  scopes:
+    - name: default
+      default_action: block
+      rule_sets:
+        "":
+          - pattern: registry.gitlab.com
+            pattern_type: domain
+            action: allow
+            ports: [443]
+          - pattern: gitlab.com
+            pattern_type: domain
+            action: allow
+            ports: [443]
+
+# Container runtime — "containerd" (default) or "docker".
+#
+# leitwacht only watches containers carrying the GitLab Runner managed
+# label `com.gitlab.gitlab-runner.managed=true`. If you spin up
+# non-Runner workloads on the same node they are ignored — no events,
+# no enforcement.
+runtime: containerd
+
+# Containerd-specific settings (ignored when runtime=docker).
+containerd:
+  socket: /run/containerd/containerd.sock
+  namespace: k8s.io
+  runnerPodNamespace: ""
+
+# Scope matching — sets the label / env that selects a YAML scope.
+scope:
+  label: leitwacht.eu/scope
+  env: LEITWACHT_SCOPE
+
+# Default action when no scope matches: block | audit | allow.
+defaultAction: block
+
+# What to do when a container's project doesn't match any scope:
+#   enforce — synthesise a policy with defaultAction; full security
+#             gauntlet runs; eBPF attaches and applies the action.
+#             Pick this when an unmapped scope means "default-deny."
+#   pass    — treat as unenrolled; DNS proxy attaches so the
+#             leitwacht-init init container exits, but no security
+#             checks run, no advisories fire. Pick this when an
+#             unmapped scope means "out of scope, leave it alone."
+unknownProject: enforce
+
+# DNS upstreams the in-netns proxy forwards to. **Required** — there is
+# no default, because defaulting to public resolvers would leak every CI
+# job's queries to a third party and bypass cluster DNS. Set this to
+# the IP[:port] of your cluster resolver:
+#
+#   - On K8s with CoreDNS, use the kube-dns Service ClusterIP. Find it
+#     with: `kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIP}'`
+#   - On bare-metal Docker, use the host's recursive resolver
+#     (typically the first nameserver in /etc/resolv.conf).
+#
+# A `helm install` without this set will fail at agent startup.
+dnsUpstream: ""
+
+# Trusted CIDRs that bypass enforcement (e.g., cluster pod / service nets).
+# Example: ["10.0.0.0/8", "192.168.0.0/16"]
+trustedCIDRs: []
+
+honeypot:
+  enabled: false
+  dir: /var/lib/leitwacht/honeypot
+
+# When true, attach env-var NAMES (never values) of the offending PID
+# to each violation report. Useful for "what secrets could this process
+# have exfiltrated?" forensics. Cost: one /proc/<pid>/environ read per
+# unique PID per bucket flush. Note: CI_JOB_TOKEN is in every GitLab
+# Runner job's env and will show up on every violation.
+recordEnvNames: false
+
+# Sinks.
+#
+# At least one of stdout / prometheus.enabled / webhook.url must be set
+# — the daemon refuses to start otherwise (silent reports are worse than
+# no enforcement).
+sinks:
+  stdout: true
+  prometheus:
+    enabled: true
+    addr: ":9090"
+  webhook:
+    url: ""
+    auth: ""
+    timeout: 5s
+
+# Concurrency tuning.
+# eventBuffer sizes the watcher's container-event channel. If the
+# leitwacht_ce_event_channel_depth gauge is persistently non-zero you
+# are back-pressuring containerd's subscription — raise this and/or
+# maxConcurrentEnforcers.
+maxConcurrentEnforcers: 64
+eventBuffer: 64
+# How long a netns context survives after its last container detaches.
+# K8s init-container patterns rely on this to keep audit-mode rules alive
+# across init→build container boundaries. Set higher if you observe
+# "netns context torn down after grace period" warnings paired with
+# missed-attach failures.
+netnsGrace: 30s
+bucketInterval: 5m
+
+# Logging.
+logLevel: info
+
+# Pod / DaemonSet shape.
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Optional. Set to "system-node-critical" on production clusters so the
+# agent isn't preempted under memory pressure — a missing data plane is
+# worse than a degraded node.
+priorityClassName: ""
+
+# Service exposing /metrics — only used when sinks.prometheus.enabled.
+service:
+  type: ClusterIP
+  port: 9090
+  annotations: {}

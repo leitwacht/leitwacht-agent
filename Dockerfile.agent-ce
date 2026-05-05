@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1.7
+#
+# leitwacht-agent / agent-ce
+#
+# Community Edition daemon: YAML-driven, backend-free build of the
+# leitwacht data plane. Loads /etc/leitwacht/rules.yaml, attaches eBPF +
+# nftables + DNS proxy enforcement on every runner container, and ships
+# violations to NDJSON / Prometheus / webhook.
+#
+# Pure Go, no CGO, ships from gcr.io/distroless/static-debian12.
+#
+# Operators set rules via a Kubernetes ConfigMap (or bind-mounted file
+# on Docker hosts) — there is no enrolment, no auth token, no backend.
+
+ARG GO_VERSION=1.26
+
+FROM golang:${GO_VERSION}-alpine AS build
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download
+
+COPY agentcore/ ./agentcore/
+COPY ce/        ./ce/
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build \
+      -trimpath \
+      -ldflags "-s -w \
+        -X gitlab.com/leitwacht/leitwacht-agent/agentcore/version.Version=${VERSION} \
+        -X gitlab.com/leitwacht/leitwacht-agent/agentcore/version.Commit=${COMMIT}" \
+      -o /out/agent-ce \
+      ./ce/cmd/agent-ce
+
+FROM gcr.io/distroless/static-debian12:latest
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+
+LABEL org.opencontainers.image.title="leitwacht agent-ce"
+LABEL org.opencontainers.image.description="leitwacht Community Edition agent — YAML-driven egress control for GitLab CI runners."
+LABEL org.opencontainers.image.licenses="MPL-2.0"
+LABEL org.opencontainers.image.source="https://gitlab.com/leitwacht/leitwacht-agent"
+LABEL org.opencontainers.image.url="https://gitlab.com/leitwacht/leitwacht-agent"
+LABEL org.opencontainers.image.documentation="https://gitlab.com/leitwacht/leitwacht-agent/-/blob/main/README.md"
+LABEL org.opencontainers.image.vendor="leitwacht"
+LABEL org.opencontainers.image.version="${VERSION}"
+LABEL org.opencontainers.image.revision="${COMMIT}"
+
+COPY --from=build /out/agent-ce /usr/local/bin/agent-ce
+
+# /etc/leitwacht/rules.yaml is the rule source. Mount a ConfigMap or a
+# host file at this path. The daemon hot-reloads on writes.
+VOLUME ["/etc/leitwacht", "/var/lib/leitwacht"]
+
+EXPOSE 9090
+
+# Run as root. The agent needs CAP_SYS_ADMIN, CAP_NET_ADMIN, CAP_BPF and
+# CAP_PERFMON to load eBPF programs and manipulate nftables; the
+# distroless `nonroot` user (UID 65532) cannot acquire those caps even
+# under privileged: true on PSA-restricted clusters.
+USER 0
+ENTRYPOINT ["/usr/local/bin/agent-ce"]

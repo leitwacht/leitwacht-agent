@@ -1,0 +1,144 @@
+# CE rule YAML schema (v1)
+
+`leitwacht-ce` reads its rules from a single YAML file
+(default `/etc/leitwacht/rules.yaml`, override with
+`LEITWACHT_CE_RULES_PATH`). The file is reloaded automatically when it
+changes — bad reloads are logged and the previous good snapshot is
+retained.
+
+> **Container scope:** leitwacht only watches containers labelled
+> `com.gitlab.gitlab-runner.managed=true`. Workloads without this
+> label are never inspected and never produce violations. If you're
+> testing CE outside of GitLab Runner, you must add this label
+> manually (`docker run --label com.gitlab.gitlab-runner.managed=true …`)
+> for the agent to see the container at all.
+
+## Top-level
+
+```yaml
+schema_version: 1            # required, must be 1
+scopes: [...]                # required, at least one entry
+reserved_domains: [...]      # optional list of FQDNs the agent owns
+```
+
+## Scope
+
+A scope is an operator-named group of rules. CE matches a running
+container to a scope using the configured label
+(`LEITWACHT_CE_SCOPE_LABEL`, default `leitwacht.eu/scope`) or env var
+(`LEITWACHT_CE_SCOPE_ENV`, default `LEITWACHT_SCOPE`). If no match is
+found, the scope named `default` is used as the fallback.
+
+```yaml
+scopes:
+  - name: default            # required
+    default_action: allow    # allow | block | audit
+    job_actions:             # optional, override default_action per CI job
+      build: block
+      release: allow
+    rule_sets:               # required
+      "":                    # "" is the catch-all rule list
+        - pattern: github.com
+          pattern_type: domain
+          action: allow
+    deny_ips:                # optional, IP/CIDR-only deny list
+      - ip: 169.254.169.254  # AWS IMDS
+        port: 80
+```
+
+### `default_action` values
+
+| Value   | Meaning                                                |
+| ------- | ------------------------------------------------------ |
+| `allow` | Agent does not attach enforcement at all.              |
+| `block` | Default-deny — only rules with `action: allow` get out. |
+| `audit` | Default-allow but log every connection (no blocking). |
+
+### `job_actions`
+
+Optional per-CI-job overrides. Keys are CI job names (matched against
+the container's `CI_JOB_NAME` env var); values are the same set as
+`default_action`.
+
+## Rule
+
+```yaml
+- pattern: <string>          # required
+  pattern_type: <enum>       # required: domain | wildcard | ip | cidr
+  action: <enum>             # required: allow | block
+  resolution: <enum>         # optional, fqdn-block only: nxdomain | sinkhole
+  ports: [80, 443]           # required for allow + domain/wildcard; otherwise optional
+  reason: "free-text"        # optional, surfaced in violation reports
+```
+
+> Per-rule `audit` is intentionally not supported — audit is a scope-
+> level mode (`default_action: audit`), not a rule-level decision. A
+> rule listing `action: audit` is rejected at parse time.
+
+### `pattern_type` values
+
+| Value      | Meaning                                                     |
+| ---------- | ----------------------------------------------------------- |
+| `domain`   | Exact FQDN match (e.g., `github.com`).                      |
+| `wildcard` | FQDN with `*` labels (e.g., `*.amazonaws.com`).             |
+| `ip`       | Single IPv4 or IPv6 address.                                |
+| `cidr`     | IPv4 or IPv6 CIDR (e.g., `10.0.0.0/8`, `fd00::/8`).         |
+
+`domain` and `wildcard` are both stored as FQDN rules at runtime —
+agentcore's matcher walks domain labels and applies wildcard semantics
+automatically.
+
+### `resolution` values
+
+Only meaningful when `action: block` AND `pattern_type` is `domain` or
+`wildcard`. Controls how the in-netns DNS proxy answers blocked
+queries.
+
+| Value      | Behaviour                                                |
+| ---------- | -------------------------------------------------------- |
+| `nxdomain` | Proxy returns NXDOMAIN. Default for FQDN denies.         |
+| `sinkhole` | Proxy returns the configured sinkhole IP, the eBPF deny map then drops the connection. Useful for catching exfil tools that ignore DNS errors. |
+
+### `ports`
+
+List of TCP ports. **Required** when `action: allow` and
+`pattern_type` is `domain` or `wildcard`. Optional (and ignored) for
+all other rules.
+
+The agent's underlying primitive treats an empty port list on an
+allow rule as "all ports allowed" — that's a footgun for an egress
+firewall, since `allow github.com` with no ports also opens 22, 3389,
+and any other service running on the host. Both CE and the EE
+counterpart force operators to spell out which ports they actually
+need so a single allow rule cannot accidentally widen the surface.
+
+If you genuinely want all ports for a host (rare), list the ones you
+mean explicitly. CIDR rules still accept empty ports because
+"allow this internal subnet on any port" is a normal firewall pattern.
+
+## Stability
+
+Schema v1 is stable. Adding optional fields is backwards-compatible
+and stays under v1; any breaking change advances `schema_version` to
+2 with explicit migration notes.
+
+## Example: minimal default-block
+
+```yaml
+schema_version: 1
+scopes:
+  - name: default
+    default_action: block
+    rule_sets:
+      "":
+        - pattern: registry.gitlab.com
+          pattern_type: domain
+          action: allow
+        - pattern: "*.docker.io"
+          pattern_type: wildcard
+          action: allow
+        - pattern: 169.254.169.254
+          pattern_type: ip
+          action: block
+          reason: "block IMDSv1 on AWS"
+```

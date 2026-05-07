@@ -28,17 +28,17 @@ type Config struct {
 	ScopeEnv           string // container env var whose value selects a scope (fallback)
 
 	// Enforcement defaults.
-	DefaultAction       string // "block" | "audit" | "allow" — fallback when no scope matches
-	UnknownProjectMode  string // "enforce" (default — apply DefaultAction) | "pass" (passive-only, no checks)
-	DNSUpstream         string
-	TrustedCIDRs     string
-	HoneypotEnabled  bool
-	HoneypotDir      string
-	RecordEnvNames   bool // when true, attach env-var NAMES (never values) to each Violation report
-	MaxConcurrentEnf int
-	EventBuffer      int           // size of the watcher's event channel; back-pressures containerd subscriptions when full
-	NetnsGrace       time.Duration // how long a netns context survives after its last container detaches
-	BucketInterval   time.Duration
+	DefaultAction      string // "block" | "audit" | "allow" — fallback when no scope matches
+	UnknownProjectMode string // "enforce" (default — apply DefaultAction) | "pass" (passive-only, no checks)
+	DNSUpstream        string
+	TrustedCIDRs       string
+	HoneypotEnabled    bool
+	HoneypotDir        string
+	RecordEnvNames     bool // when true, attach env-var NAMES (never values) to each Violation report
+	MaxConcurrentEnf   int
+	EventBuffer        int           // size of the watcher's event channel; back-pressures containerd subscriptions when full
+	NetnsGrace         time.Duration // how long a netns context survives after its last container detaches
+	BucketInterval     time.Duration
 
 	// Sinks.
 	StdoutEnabled  bool

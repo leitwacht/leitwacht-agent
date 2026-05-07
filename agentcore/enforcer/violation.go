@@ -40,15 +40,15 @@ type Violation struct {
 // surfaces as two distinct entries — qtype is a strong exfil signal
 // (TXT/NULL/MX abuse for DNSCat-style tunnels).
 type DNSActivityEntry struct {
-	Domain      string    `json:"domain"`
-	QueryType   string    `json:"query_type"` // "A", "AAAA", "TXT", "CNAME", "MX", ...
-	QueryCount  int64     `json:"query_count"`
-	ResolvedIPs []string  `json:"resolved_ips"` //nolint:tagliatelle // IPs is a well-known abbreviation
-	Action      string    `json:"action"`       // dns_allowed, dns_blocked, dns_observed, dns_denied
-	PID         uint32    `json:"pid,omitempty"`
-	Comm        string    `json:"comm,omitempty"`
-	ParentComm  string    `json:"parent_comm,omitempty"`
-	BinaryPath  string    `json:"binary_path,omitempty"`
+	Domain      string   `json:"domain"`
+	QueryType   string   `json:"query_type"` // "A", "AAAA", "TXT", "CNAME", "MX", ...
+	QueryCount  int64    `json:"query_count"`
+	ResolvedIPs []string `json:"resolved_ips"` //nolint:tagliatelle // IPs is a well-known abbreviation
+	Action      string   `json:"action"`       // dns_allowed, dns_blocked, dns_observed, dns_denied
+	PID         uint32   `json:"pid,omitempty"`
+	Comm        string   `json:"comm,omitempty"`
+	ParentComm  string   `json:"parent_comm,omitempty"`
+	BinaryPath  string   `json:"binary_path,omitempty"`
 	// EnvNames mirrors Violation.EnvNames: env-var names (never values)
 	// for the PID that issued this query. Populated only when the
 	// recorder has an enricher configured.

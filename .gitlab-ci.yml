@@ -247,10 +247,17 @@ sign-agent-ce:
   # alpine ships syft in its community repo; using alpine instead of
   # anchore/syft (also distroless) so the k8s executor has a shell.
   image: alpine:3.21
+  variables:
+    # syft reads these to authenticate against the GitLab Container
+    # Registry when scanning the just-built image. cosign jobs handle
+    # this via 'cosign login'; syft has its own env-var-driven flow.
+    SYFT_REGISTRY_AUTH_AUTHORITY: "${CI_REGISTRY}"
+    SYFT_REGISTRY_AUTH_USERNAME: "${CI_REGISTRY_USER}"
+    SYFT_REGISTRY_AUTH_PASSWORD: "${CI_REGISTRY_PASSWORD}"
   before_script:
     - apk add --no-cache syft
   script:
-    - syft --output spdx-json="${CI_PROJECT_DIR}/sbom.spdx.json" "${IMAGE}:sha-${CI_COMMIT_SHORT_SHA}"
+    - syft --output spdx-json="${CI_PROJECT_DIR}/sbom.spdx.json" "registry:${IMAGE}:sha-${CI_COMMIT_SHORT_SHA}"
   artifacts:
     paths:
       - sbom.spdx.json

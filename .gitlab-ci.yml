@@ -107,6 +107,7 @@ semantic-release:
         --provider=gitlab \
         --provider-opt="slug=${CI_PROJECT_PATH}" \
         --allow-initial-development-versions \
+        --allow-no-changes \
         --changelog="CHANGELOG.md" \
         --update="ce/helm/agent-ce/Chart.yaml"
   rules:

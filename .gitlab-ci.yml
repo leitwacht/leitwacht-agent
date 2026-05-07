@@ -170,7 +170,6 @@ semantic-release:
         --reproducible
   rules:
     - if: $CI_COMMIT_TAG
-    - if: $CI_COMMIT_BRANCH == "main"
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
       variables:
         # MR pipelines push to a per-MR tag only, no moving tags.
@@ -219,7 +218,6 @@ build-agent-ce:
       fi
   rules:
     - if: $CI_COMMIT_TAG
-    - if: $CI_COMMIT_BRANCH == "main"
 
 sign-leitwacht-initc:
   extends: .sign_image
@@ -252,7 +250,6 @@ sign-agent-ce:
     expire_in: 1 year
   rules:
     - if: $CI_COMMIT_TAG
-    - if: $CI_COMMIT_BRANCH == "main"
 
 sbom-leitwacht-initc:
   extends: .sbom_image
@@ -284,7 +281,6 @@ attach-sbom-leitwacht-initc:
     - cosign attest --predicate sbom.spdx.json --type spdxjson "${INITC_IMAGE}:sha-${CI_COMMIT_SHORT_SHA}"
   rules:
     - if: $CI_COMMIT_TAG
-    - if: $CI_COMMIT_BRANCH == "main"
 
 attach-sbom-agent-ce:
   stage: sbom
@@ -304,7 +300,6 @@ attach-sbom-agent-ce:
     - cosign attest --predicate sbom.spdx.json --type spdxjson "${AGENT_CE_IMAGE}:sha-${CI_COMMIT_SHORT_SHA}"
   rules:
     - if: $CI_COMMIT_TAG
-    - if: $CI_COMMIT_BRANCH == "main"
 
 # ------------------------------------------------------------- MIRROR
 # Tag-only: copy signed images + attestations from GitLab to Quay.io.

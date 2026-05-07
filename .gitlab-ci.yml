@@ -122,7 +122,7 @@ semantic-release:
 .build_image:
   stage: build
   image:
-    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    name: ghcr.io/osscontainertools/kaniko:v1.27.4-debug
     entrypoint: [""]
   script:
     # Resolve the tag set we'll push. CI_COMMIT_TAG is set on git tags;

@@ -39,6 +39,22 @@ test: ## fast unit tests (Linux build tags, no integration)
 test-ce: ## CE-only unit + component tests (cross-platform)
 	$(GO) test -race -count=1 ./ce/...
 
+.PHONY: ebpf-generate
+ebpf-generate: ## regenerate eBPF .o + Go bindings (requires clang + llvm-strip)
+	$(GO) generate ./agentcore/enforcer/...
+
+.PHONY: check-ebpf-drift
+check-ebpf-drift: ## fail if committed eBPF artefacts don't match the .c sources
+	@$(GO) generate ./agentcore/enforcer/... >/dev/null
+	@if ! git diff --quiet -- 'agentcore/enforcer/*_bpfel.go' 'agentcore/enforcer/*_bpfel.o'; then \
+		echo "ebpf drift detected — regenerate via 'make ebpf-generate' (clang from debian bookworm) and commit:"; \
+		git diff --stat -- 'agentcore/enforcer/*_bpfel.go' 'agentcore/enforcer/*_bpfel.o'; \
+		exit 1; \
+	fi
+
+.PHONY: ci-checks
+ci-checks: lint test check-ebpf-drift ## run the same checks CI runs (lint + tests + eBPF drift)
+
 .PHONY: integration
 integration: ## agentcore integration tests (Linux + root + containerd)
 	$(GO) test -tags='integration linux' -count=1 -v ./agentcore/enforcer/...

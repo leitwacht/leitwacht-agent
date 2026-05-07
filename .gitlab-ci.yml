@@ -56,6 +56,18 @@ lint:
     - go vet ./...
     - test -z "$(gofmt -l .)" || (echo "gofmt found issues — run 'gofmt -w .' locally"; gofmt -l .; exit 1)
 
+# Re-run `go generate ./agentcore/enforcer/...` and fail if the regenerated
+# eBPF .o files or bpf2go-emitted .go bindings differ from what's committed.
+# Forces eBPF C-source edits to land alongside their regenerated artefacts.
+# Pinned to bookworm (clang 14, llvm-strip from llvm) for byte-reproducible
+# output — local regen with a different toolchain will mismatch on purpose.
+check-ebpf-drift:
+  stage: lint
+  image: golang:${GO_VERSION}-bookworm
+  script:
+    - apt-get update -qq && apt-get install -y --no-install-recommends clang libbpf-dev llvm
+    - make check-ebpf-drift
+
 # ---------------------------------------------------------------- TEST
 test:
   stage: test

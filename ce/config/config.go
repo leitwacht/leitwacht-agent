@@ -23,7 +23,7 @@ type Config struct {
 	ContainerRuntime   string // "docker" or "containerd"
 	ContainerSocket    string
 	ContainerdNS       string
-	RunnerPodNamespace string
+	RunnerPodNamespace string // K8S namespace filter, comma-separated
 	ScopeLabel         string // container label whose value selects a scope
 	ScopeEnv           string // container env var whose value selects a scope (fallback)
 

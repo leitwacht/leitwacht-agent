@@ -39,6 +39,7 @@ runtime: containerd
 containerd:
   socket: /run/containerd/containerd.sock
   namespace: k8s.io
+  # K8S namespace filter for runner containers, comma-separated for multiple namespaces.
   runnerPodNamespace: ""
 
 # Scope matching — sets the label / env that selects a YAML scope.

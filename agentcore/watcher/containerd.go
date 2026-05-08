@@ -6,6 +6,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -25,7 +27,7 @@ import (
 type ContainerdWatcher struct {
 	client       *containerd.Client
 	logger       *slog.Logger
-	podNamespace string // K8S namespace filter for runner pods (empty = no filtering)
+	podNamespaces map[string]bool // K8S namespace filter for runner pods (empty = no filtering)
 
 	// sandboxIDs tracks pause-container IDs for which we emitted pod_sandbox_start.
 	// On the corresponding TaskExit we look up here so we can emit pod_sandbox_die
@@ -43,10 +45,10 @@ type ContainerdWatcher struct {
 func (w *ContainerdWatcher) SetScope(s Scope) { w.scope = s }
 
 // NewContainerd creates a ContainerdWatcher connected to the given containerd socket.
-// podNamespace filters containers to a specific K8S namespace (e.g., "gitlab-runner").
-// Only containers with `io.kubernetes.pod.namespace` matching this value are inspected.
-// If empty, all containers are inspected.
-func NewContainerd(address, namespace, podNamespace string, buffer int, logger *slog.Logger) (*ContainerdWatcher, error) {
+// podNamespaces filters containers to the given K8S namespaces (e.g., "gitlab-runner,gitlab-runner-staging").
+// Only containers with `io.kubernetes.pod.namespace` matching one of these values are inspected.
+// If empty, all containers are inspected. Comma-separated values are split automatically.
+func NewContainerd(address, namespace, podNamespaces string, buffer int, logger *slog.Logger) (*ContainerdWatcher, error) {
 	if buffer < 1 {
 		buffer = DefaultEventBuffer
 	}
@@ -62,9 +64,20 @@ func NewContainerd(address, namespace, podNamespace string, buffer int, logger *
 		ch:     make(chan ContainerEvent, buffer),
 	}
 
-	if podNamespace != "" {
-		w.podNamespace = podNamespace
-		logger.Info("containerd pod namespace filter", "namespace", podNamespace)
+	if podNamespaces != "" {
+		w.podNamespaces = make(map[string]bool)
+		for _, ns := range strings.Split(podNamespaces, ",") {
+			ns = strings.TrimSpace(ns)
+			if ns != "" {
+				w.podNamespaces[ns] = true
+			}
+		}
+		names := make([]string, 0, len(w.podNamespaces))
+		for ns := range w.podNamespaces {
+			names = append(names, ns)
+		}
+		slices.Sort(names)
+		logger.Info("containerd pod namespace filter", "namespaces", strings.Join(names, ","))
 	}
 
 	return w, nil
@@ -570,11 +583,11 @@ func (w *ContainerdWatcher) consumeSandbox(containerID string) (string, bool) {
 // isRunnerContainer checks if the container belongs to the configured runner pod namespace.
 // Returns true if no namespace filter is configured (all containers pass).
 func (w *ContainerdWatcher) isRunnerContainer(labels map[string]string) bool {
-	if w.podNamespace == "" {
+	if w.podNamespaces == nil {
 		return true
 	}
 
-	return labels["io.kubernetes.pod.namespace"] == w.podNamespace
+	return w.podNamespaces[labels["io.kubernetes.pod.namespace"]]
 }
 
 // Close releases the containerd client connection.

@@ -25,8 +25,8 @@ import (
 // ContainerdWatcher monitors the containerd API for container lifecycle events.
 // Used in K8S environments where containers are managed by containerd via CRI.
 type ContainerdWatcher struct {
-	client       *containerd.Client
-	logger       *slog.Logger
+	client        *containerd.Client
+	logger        *slog.Logger
 	podNamespaces map[string]bool // K8S namespace filter for runner pods (empty = no filtering)
 
 	// sandboxIDs tracks pause-container IDs for which we emitted pod_sandbox_start.

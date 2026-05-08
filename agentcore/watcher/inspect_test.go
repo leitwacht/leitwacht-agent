@@ -203,3 +203,23 @@ func TestExtractContainerEvent_MissingFFNetworkPerBuild(t *testing.T) {
 		})
 	}
 }
+
+// FF_NETWORK_PER_BUILD is a Docker-executor concept (per-build bridge
+// network). On k8s every job has its own pod netns, so the flag never
+// applies and we must not advisory/kill on it.
+func TestExtractContainerEvent_K8sPodSkipsFFCheck(t *testing.T) {
+	labels := map[string]string{
+		"com.gitlab.gitlab-runner.managed": "true",
+		"io.kubernetes.pod.name":           "runner-xyz-project-1-concurrent-0-abc",
+		"io.kubernetes.pod.namespace":      "gitlab-runner",
+	}
+	env := []string{"CI_PROJECT_PATH=team/app"} // no FF_NETWORK_PER_BUILD
+
+	ev := extractContainerEvent("start", "abc", labels, env, nil, "runc", 42, "", Scope{})
+	if ev == nil {
+		t.Fatal("expected non-nil event")
+	}
+	if ev.MissingNetworkPerBld {
+		t.Fatal("k8s pod must not be flagged MissingNetworkPerBld — FF is a Docker-executor concept")
+	}
+}

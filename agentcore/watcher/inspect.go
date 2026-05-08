@@ -70,10 +70,17 @@ func extractContainerEvent(
 		ev.HasGVisor = true
 	}
 
-	// FF_NETWORK_PER_BUILD detection
-	ffVal := envMap["FF_NETWORK_PER_BUILD"]
-	if ffVal == "" || strings.EqualFold(ffVal, "false") || ffVal == "0" {
-		ev.MissingNetworkPerBld = true
+	// FF_NETWORK_PER_BUILD detection — only relevant for Docker-executor.
+	// On the Kubernetes executor each job already runs in its own pod
+	// netns, so the flag is a no-op (the runner leaves it unset/false).
+	// Detect k8s shape via the io.kubernetes.pod.name label that
+	// containerd attaches to every CRI pod container; the Docker daemon
+	// never sets it.
+	if labels["io.kubernetes.pod.name"] == "" {
+		ffVal := envMap["FF_NETWORK_PER_BUILD"]
+		if ffVal == "" || strings.EqualFold(ffVal, "false") || ffVal == "0" {
+			ev.MissingNetworkPerBld = true
+		}
 	}
 
 	// Honeypot mount detection — check for expected honeypot target paths.

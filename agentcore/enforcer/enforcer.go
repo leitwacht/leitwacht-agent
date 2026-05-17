@@ -13,8 +13,6 @@ import (
 	"gitlab.com/leitwacht/leitwacht-agent/agentcore/policy"
 )
 
-const policyActionAudit = "audit"
-
 // agentMark is the fwmark set on the proxy's upstream DNS sockets
 // (via SO_MARK) so nftables can skip redirect for those packets.
 const agentMark = 0x5E17
@@ -124,6 +122,10 @@ func (nctx *NetnsContext) lookupPacketRecorder(cgroupID uint64) *ViolationRecord
 		return rec
 	}
 
+	// Fallback: cgroupID unknown, return any registered recorder. Map
+	// iteration order is randomised, so callers must not depend on
+	// which sibling's recorder is picked — they just need to record
+	// the event under *something* attributable to the netns.
 	for _, rec := range nctx.cgroupRecorders {
 		return rec
 	}
@@ -205,6 +207,12 @@ type Manager struct {
 	// goroutines mid-POST and lose final reports to SIGKILL.
 	inFlightReports sync.WaitGroup
 
+	// shutdownCh is closed by DetachAll so background goroutines
+	// (currently deferredTeardown) can break out of their grace-period
+	// waits instead of blocking the process past SIGTERM.
+	shutdownCh     chan struct{}
+	shutdownChOnce sync.Once
+
 	// EnvNamesFn, when non-nil, is the live env-name reader (typically
 	// procenv.Names). The recorder calls it at RECORD time — when the
 	// offending PID is still alive — and caches the result for the
@@ -229,6 +237,7 @@ func NewManager(
 		honeypotCfg:       honeypotCfg,
 		containers:        make(map[string]*honeypotContainerState),
 		cgroupToContainer: make(map[uint64]string),
+		shutdownCh:        make(chan struct{}),
 	}
 }
 
@@ -352,7 +361,7 @@ func (m *Manager) applyJoinerPolicy(info ContainerInfo, nctx *NetnsContext, pol 
 		nctx.dnsProxy.UpdatePolicy(pol)
 	}
 
-	joinerAudit := pol.Action == policyActionAudit
+	joinerAudit := pol.Action == policy.ActionAudit
 	if joinerAudit == nctx.auditMode.Load() {
 		return
 	}
@@ -412,7 +421,7 @@ func (m *Manager) PrepareNetns(containerID string, pid int, cgroupPath string) e
 	}
 
 	auditPol := &policy.ResolvedPolicy{
-		Action:   policyActionAudit,
+		Action:   policy.ActionAudit,
 		Enrolled: true,
 		RuleSets: map[string][]policy.Rule{"": nil},
 	}
@@ -638,7 +647,7 @@ func (m *Manager) seedSinkholeDeny(handle EBPFHandle) {
 func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.ResolvedPolicy) error {
 	overallStart := time.Now()
 
-	auditMode := pol.Action == policyActionAudit
+	auditMode := pol.Action == policy.ActionAudit
 	nctx.primaryPID = pid
 	nctx.auditMode.Store(auditMode)
 	nctx.dnsCache = NewDNSCache()
@@ -1143,8 +1152,18 @@ func (m *Manager) startDNSBucketReporter(info ContainerInfo, nctx *NetnsContext)
 // deferredTeardown waits for the grace period then tears down the netns context
 // if no new containers joined. This handles the K8s init container lifecycle where
 // init-permissions exits before the build container starts.
+//
+// Aborts immediately if shutdownCh is closed (DetachAll), so an in-flight
+// grace period doesn't hold the process open past SIGTERM.
 func (m *Manager) deferredTeardown(nctx *NetnsContext) {
-	time.Sleep(m.NetnsGrace)
+	timer := time.NewTimer(m.NetnsGrace)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+	case <-m.shutdownCh:
+		return
+	}
 
 	m.mu.Lock()
 	if nctx.refcount > 0 || nctx.tornDown {
@@ -1399,6 +1418,11 @@ func (m *Manager) Count() int {
 // DetachAll detaches all active enforcers. Used during graceful shutdown
 // to clean up eBPF programs and nftables rules so containers recover DNS.
 func (m *Manager) DetachAll() []*DetachResult {
+	// Signal background goroutines (deferredTeardown grace periods) to
+	// abort. sync.Once so calling DetachAll twice doesn't panic on
+	// double-close.
+	m.shutdownChOnce.Do(func() { close(m.shutdownCh) })
+
 	m.mu.Lock()
 
 	ids := make([]string, 0, len(m.enforcers))

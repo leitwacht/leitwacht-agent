@@ -196,6 +196,22 @@ func (r *SessionRegistry) LookupByCgroupID(cgroupID uint64) (CgroupBinding, bool
 	return binding, ok
 }
 
+// CgroupSnapshot returns a copy of the current cgroup_id → binding
+// map. Intended for observability (dev probes, metrics gauges) — the
+// hot-path egress lookup uses LookupByCgroupID instead. Cheap on
+// non-BuildKit deployments because the map stays empty.
+func (r *SessionRegistry) CgroupSnapshot() map[uint64]CgroupBinding {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	out := make(map[uint64]CgroupBinding, len(r.cgroupIndex))
+	for k, v := range r.cgroupIndex {
+		out[k] = v
+	}
+
+	return out
+}
+
 // PendingVertices returns vertices that have started but not yet
 // completed across all active sessions. Used by the cgroup-join
 // layer to match cmdline strings against in-flight build steps.

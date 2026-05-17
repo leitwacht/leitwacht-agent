@@ -1,18 +1,22 @@
-// buildkit-probe is a dev tool that connects to a real buildkitd and
-// prints session/vertex events as they flow through the
-// AttributionWatcher. Use it to confirm Phase 1 of step attribution
-// works against your local BuildKit before wiring it into agent-ce.
+// buildkit-probe is a dev tool that drives the agent's BuildKit
+// attribution stack against a real buildkitd. It exercises both
+// Phase 1 (Control.Status subscriber → SessionRegistry) and Phase 2
+// (cgroup-to-vertex join → cgroup_id index) without requiring the
+// rest of agent-ce, eBPF, or root.
 //
 // Usage:
 //
+//	# Phase 1 only — observe vertex events.
 //	go run ./agentcore/cmd/buildkit-probe -addr tcp://127.0.0.1:1234
 //
-// In another terminal, drive a build:
+//	# Phase 1 + Phase 2 — observe cgroup_id → vertex bindings live.
+//	# (Read access to the cgroup paths required; root usually not needed
+//	# for cgroup v2 unified hierarchies.)
+//	go run ./agentcore/cmd/buildkit-probe \
+//	    -addr tcp://127.0.0.1:1234 \
+//	    -cgroup-paths /sys/fs/cgroup/system.slice/docker-<id>.scope/buildkit
 //
-//	docker buildx build --no-cache -f Dockerfile.probe .
-//
-// Each STARTED / vertex update / COMPLETE event prints a line. Ctrl+C
-// to exit.
+// Each session/vertex/cgroup event prints one line. Ctrl+C to exit.
 package main
 
 import (
@@ -23,6 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,6 +36,7 @@ import (
 
 func main() {
 	addr := flag.String("addr", "tcp://127.0.0.1:1234", "buildkitd gRPC address (tcp://host:port or unix:///path)")
+	cgroupPaths := flag.String("cgroup-paths", "", "comma-separated cgroup parent paths to watch for RUN-container creates (enables Phase 2 cgroup-join)")
 	pollInterval := flag.Duration("poll", 300*time.Millisecond, "registry snapshot interval")
 	flag.Parse()
 
@@ -44,6 +50,14 @@ func main() {
 	defer cancel()
 
 	fmt.Fprintf(os.Stderr, "buildkit-probe: connecting to %s\n", *addr)
+
+	paths := splitNonEmpty(*cgroupPaths)
+	if len(paths) > 0 {
+		fmt.Fprintf(os.Stderr, "buildkit-probe: cgroup-join watching %v\n", paths)
+	} else {
+		fmt.Fprintln(os.Stderr, "buildkit-probe: cgroup-join disabled (pass -cgroup-paths to enable)")
+	}
+
 	fmt.Fprintln(os.Stderr, "buildkit-probe: drive a build in another terminal (Ctrl+C to exit)")
 	fmt.Fprintln(os.Stderr, "---")
 
@@ -54,12 +68,42 @@ func main() {
 		}
 	}()
 
+	if len(paths) > 0 {
+		source := enforcer.NewInotifyCgroupSource(paths)
+		joiner := enforcer.NewCgroupJoiner(registry, source, logger)
+
+		go func() {
+			err := joiner.Run(ctx)
+			if err != nil && ctx.Err() == nil {
+				logger.Error("cgroup joiner exited", "error", err)
+			}
+		}()
+	}
+
 	pollRegistry(ctx, registry, *pollInterval)
 }
 
+func splitNonEmpty(s string) []string {
+	if s == "" {
+		return nil
+	}
+
+	parts := strings.Split(s, ",")
+
+	out := parts[:0]
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+
+	return out
+}
+
 // pollRegistry diff-prints registry state at each tick so the operator
-// sees new sessions, new vertices, vertex completions, and session
-// completions as they happen.
+// sees new sessions, new vertices, vertex completions, session
+// completions, and cgroup→vertex bindings as they happen.
 func pollRegistry(ctx context.Context, registry *enforcer.SessionRegistry, interval time.Duration) {
 	type vertexKey struct{ ref, digest string }
 
@@ -67,6 +111,7 @@ func pollRegistry(ctx context.Context, registry *enforcer.SessionRegistry, inter
 	seenVertices := map[vertexKey]bool{}
 	completedVertices := map[vertexKey]bool{}
 	completedSessions := map[string]bool{}
+	seenCgroups := map[uint64]bool{}
 
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
@@ -140,6 +185,26 @@ func pollRegistry(ctx context.Context, registry *enforcer.SessionRegistry, inter
 
 				fmt.Printf("[%s] SESSION DONE    ref=%s\n", time.Now().Format("15:04:05.000"), ref)
 			}
+		}
+
+		for cgID, binding := range registry.CgroupSnapshot() {
+			if seenCgroups[cgID] {
+				continue
+			}
+
+			seenCgroups[cgID] = true
+
+			ambig := ""
+			if binding.Ambiguous {
+				ambig = fmt.Sprintf(" AMBIGUOUS candidates=%d", len(binding.AmbiguousCandidates))
+			}
+
+			fmt.Printf("[%s] CGROUP  LINKED  cgroup_id=%d container=%s → ref=%s digest=%s name=%q%s\n",
+				time.Now().Format("15:04:05.000"),
+				cgID, binding.ContainerID,
+				binding.SessionRef, shortDigest(binding.VertexDigest), binding.VertexName,
+				ambig,
+			)
 		}
 	}
 }

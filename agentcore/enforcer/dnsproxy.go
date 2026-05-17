@@ -137,7 +137,7 @@ func HandleDNSQuery(
 		return handleAllowRule(msg, cfg, qname, qtype, match, recorder, pid, comm, parentComm, binaryPath)
 	}
 
-	isAudit := pol.Action == policyActionAudit
+	isAudit := pol.Action == policy.ActionAudit
 
 	if !isAudit {
 		if recorder != nil {

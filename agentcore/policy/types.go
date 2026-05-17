@@ -16,6 +16,8 @@ const (
 const (
 	ActionAllow = "allow"
 	ActionDeny  = "deny"
+	ActionAudit = "audit"
+	ActionBlock = "block"
 
 	PatternFQDN = "fqdn"
 	PatternCIDR = "cidr"

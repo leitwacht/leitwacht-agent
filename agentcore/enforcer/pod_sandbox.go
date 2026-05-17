@@ -75,7 +75,7 @@ func (m *Manager) AttachPodSandbox(info PodSandboxInfo) error {
 	}
 
 	auditPol := &policy.ResolvedPolicy{
-		Action:   policyActionAudit,
+		Action:   policy.ActionAudit,
 		Enrolled: true,
 		RuleSets: map[string][]policy.Rule{"": nil},
 	}

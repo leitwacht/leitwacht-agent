@@ -22,8 +22,6 @@ import (
 )
 
 const (
-	actionBlock = "block"
-
 	// handleStartTimeout bounds the pause-to-unpause window. If enforcement
 	// cannot be set up within this time (e.g., backend unreachable), the
 	// container is unpaused to avoid indefinite freezes that would trigger
@@ -168,7 +166,7 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 
 		pol = &policy.ResolvedPolicy{
 			ProjectPath: ev.ProjectPath,
-			Action:      "audit",
+			Action:      policy.ActionAudit,
 			Enrolled:    true, // locally true so the downstream attach runs
 			RuleSets:    map[string][]policy.Rule{"": nil},
 		}
@@ -220,7 +218,7 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 
 	// DinD — block mode kills, audit mode warns.
 	if ev.HasDinD {
-		if pol.Action == actionBlock {
+		if pol.Action == policy.ActionBlock {
 			h.Logger.Error("DinD detected in block mode, killing container", "container_id", truncID(ev.ContainerID))
 			_ = h.Watcher.KillContainer(ctx, ev.ContainerID)
 
@@ -244,7 +242,7 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 
 	// Socket mount — block mode kills, audit mode warns.
 	if ev.HasSocketMount {
-		if pol.Action == actionBlock {
+		if pol.Action == policy.ActionBlock {
 			h.Logger.Error("Docker socket mount in block mode, killing container", "container_id", truncID(ev.ContainerID))
 			_ = h.Watcher.KillContainer(ctx, ev.ContainerID)
 
@@ -270,7 +268,7 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 
 	// FF_NETWORK_PER_BUILD missing — block mode kills, audit mode warns.
 	if ev.MissingNetworkPerBld {
-		if pol.Action == actionBlock {
+		if pol.Action == policy.ActionBlock {
 			h.Logger.Error("FF_NETWORK_PER_BUILD missing in block mode, killing container", "container_id", truncID(ev.ContainerID))
 			_ = h.Watcher.KillContainer(ctx, ev.ContainerID)
 

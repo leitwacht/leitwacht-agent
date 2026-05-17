@@ -388,7 +388,7 @@ func startBuildkitDNS(addr string, upstreams []string, bm *BuildkitMonitor, logg
 // auditAllPolicy returns a policy that records everything, blocks nothing.
 func auditAllPolicy() *policy.ResolvedPolicy {
 	return &policy.ResolvedPolicy{
-		Action:   policyActionAudit,
+		Action:   policy.ActionAudit,
 		Enrolled: true,
 		RuleSets: map[string][]policy.Rule{"": nil},
 	}

@@ -190,18 +190,24 @@ func (w *ContainerdWatcher) handleEnvelope(ctx context.Context, envelope *events
 		// detach pod-level eBPF. Real-container exits go through the
 		// generic die path as today.
 		if podUID, isSandbox := w.consumeSandbox(e.ContainerID); isSandbox {
-			ch <- ContainerEvent{
+			select {
+			case ch <- ContainerEvent{
 				Action:      "pod_sandbox_die",
 				ContainerID: e.ContainerID,
 				PodUID:      podUID,
+			}:
+			case <-ctx.Done():
 			}
 
 			return
 		}
 
-		ch <- ContainerEvent{
+		select {
+		case ch <- ContainerEvent{
 			Action:      "die",
 			ContainerID: e.ContainerID,
+		}:
+		case <-ctx.Done():
 		}
 	default:
 		w.logger.Warn("unexpected containerd event type", "type", fmt.Sprintf("%T", evt))
@@ -295,12 +301,15 @@ func (w *ContainerdWatcher) handleTaskStart(ctx context.Context, containerID str
 			"pod_name", info.Labels["io.kubernetes.pod.name"],
 		)
 
-		ch <- ContainerEvent{
+		select {
+		case ch <- ContainerEvent{
 			Action:      "sibling_start",
 			ContainerID: containerID,
 			Labels:      info.Labels,
 			PID:         int(pid),
 			CgroupPath:  cgroupPath,
+		}:
+		case <-ctx.Done():
 		}
 
 		return
@@ -313,7 +322,10 @@ func (w *ContainerdWatcher) handleTaskStart(ctx context.Context, containerID str
 		"cgroup", cgroupPath,
 	)
 
-	ch <- *event
+	select {
+	case ch <- *event:
+	case <-ctx.Done():
+	}
 }
 
 // RecoverRunning enumerates already-running managed build and sibling containers.
@@ -492,13 +504,16 @@ func (w *ContainerdWatcher) handleSandboxStart(
 	w.logger.Info("pod sandbox detected", "container_id", truncID(containerID),
 		"pod_uid", podUID, "pod_name", info.Labels["io.kubernetes.pod.name"])
 
-	ch <- ContainerEvent{
+	select {
+	case ch <- ContainerEvent{
 		Action:      "pod_sandbox_start",
 		ContainerID: containerID,
 		Labels:      info.Labels,
 		PID:         int(pid),
 		CgroupPath:  cgroupPath,
 		PodUID:      podUID,
+	}:
+	case <-ctx.Done():
 	}
 }
 

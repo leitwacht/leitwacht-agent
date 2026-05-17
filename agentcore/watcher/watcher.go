@@ -139,12 +139,15 @@ func (w *Watcher) handleEvent(ctx context.Context, ev events.Message, ch chan<- 
 	containerID := ev.Actor.ID
 
 	if action == "die" {
-		ch <- ContainerEvent{
+		select {
+		case ch <- ContainerEvent{
 			Action:      "die",
 			ContainerID: containerID,
 			Labels:      ev.Actor.Attributes,
 			JobID:       ev.Actor.Attributes[labelPrefix+"job.id"],
 			PipelineID:  ev.Actor.Attributes[labelPrefix+"pipeline.id"],
+		}:
+		case <-ctx.Done():
 		}
 
 		return
@@ -188,7 +191,10 @@ func (w *Watcher) handleEvent(ctx context.Context, ev events.Message, ch chan<- 
 		"job_id", event.JobID,
 	)
 
-	ch <- *event
+	select {
+	case ch <- *event:
+	case <-ctx.Done():
+	}
 }
 
 func extractMountPaths(mounts []container.MountPoint) []string {

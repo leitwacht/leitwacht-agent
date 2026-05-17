@@ -17,6 +17,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	controlapi "github.com/moby/buildkit/api/services/control"
@@ -79,6 +80,40 @@ type AmbiguousCandidate struct {
 	SessionRef   string
 	VertexDigest string
 	VertexName   string
+}
+
+// buildKitLookup is the hot-path cgroup-to-binding hook called by
+// the eBPF event handler on every egress packet. The no-op default
+// keeps non-BuildKit deployments cost-free; the SessionRegistry's
+// owner installs the real lookup via SetBuildKitLookup at startup.
+//
+//nolint:gochecknoglobals // package-level hook avoids plumbing a registry through every event-handler call site.
+var buildKitLookup atomic.Pointer[func(uint64) (CgroupBinding, bool)]
+
+// SetBuildKitLookup installs the cgroup-to-binding lookup hook. Pass
+// SessionRegistry.LookupByCgroupID from the agent's startup wiring.
+// Passing nil restores the no-op default (useful for tests and for
+// shutdown ordering).
+func SetBuildKitLookup(fn func(cgroupID uint64) (CgroupBinding, bool)) {
+	if fn == nil {
+		buildKitLookup.Store(nil)
+
+		return
+	}
+
+	buildKitLookup.Store(&fn)
+}
+
+// LookupBuildKitBinding queries the installed hook. Returns
+// (zero, false) when no hook is installed or no binding is known
+// for the cgroup. Cheap enough to call on every egress event.
+func LookupBuildKitBinding(cgroupID uint64) (CgroupBinding, bool) {
+	fn := buildKitLookup.Load()
+	if fn == nil {
+		return CgroupBinding{}, false
+	}
+
+	return (*fn)(cgroupID)
 }
 
 // SessionState is the per-build view: a build ref plus the vertices

@@ -33,6 +33,18 @@ type Violation struct {
 	Timestamp    time.Time `json:"timestamp"`
 	Action       string    `json:"action"` // dns_blocked, packet_dropped, dns_observed, packet_observed, sinkhole_hit
 	DomainSource string    `json:"domain_source,omitempty"`
+
+	// BuildKit step attribution. Populated only when the egress
+	// fired inside a BuildKit RUN cgroup and the SessionRegistry
+	// had a binding for that cgroup id. All zero/empty fields on
+	// non-BuildKit egress, which is the common case. The
+	// AmbiguousCandidates slice carries the colliding vertex set
+	// when the cgroup-join couldn't disambiguate across builds.
+	BuildSessionRef          string               `json:"build_session_ref,omitempty"`
+	BuildVertexDigest        string               `json:"build_vertex_digest,omitempty"`
+	BuildVertexName          string               `json:"build_vertex_name,omitempty"`
+	BuildAmbiguous           bool                 `json:"build_ambiguous,omitempty"`
+	BuildAmbiguousCandidates []AmbiguousCandidate `json:"build_ambiguous_candidates,omitempty"`
 }
 
 // DNSActivityEntry tracks DNS queries bucketed by (domain, query_type)

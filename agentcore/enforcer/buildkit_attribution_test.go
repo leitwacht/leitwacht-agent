@@ -433,3 +433,70 @@ func TestNextBackoff(t *testing.T) {
 		t.Errorf("capped at max: got %v, want 10s", got)
 	}
 }
+
+// ---------------- enrichment-hook tests ----------------
+
+func TestLookupBuildKitBinding_DefaultNoOp(t *testing.T) {
+	SetBuildKitLookup(nil) // start clean
+
+	binding, ok := LookupBuildKitBinding(12345)
+	if ok {
+		t.Fatalf("default hook returned ok=true: %+v", binding)
+	}
+}
+
+func TestLookupBuildKitBinding_InstalledHook(t *testing.T) {
+	t.Cleanup(func() { SetBuildKitLookup(nil) })
+
+	want := CgroupBinding{
+		SessionRef:   "rA",
+		VertexDigest: "dA",
+		VertexName:   "[build 1/2] RUN npm ci",
+		ContainerID:  "ctr-abc",
+	}
+
+	SetBuildKitLookup(func(id uint64) (CgroupBinding, bool) {
+		if id == 9876 {
+			return want, true
+		}
+
+		return CgroupBinding{}, false
+	})
+
+	got, ok := LookupBuildKitBinding(9876)
+	if !ok {
+		t.Fatal("installed hook returned ok=false")
+	}
+
+	if got.SessionRef != want.SessionRef || got.VertexDigest != want.VertexDigest {
+		t.Fatalf("binding mismatch: got %+v want %+v", got, want)
+	}
+
+	// Unrelated cgroup id surfaces no binding.
+	if _, ok := LookupBuildKitBinding(1111); ok {
+		t.Fatal("hook returned binding for unrelated cgroup id")
+	}
+}
+
+func TestLookupBuildKitBinding_WiresThroughRegistry(t *testing.T) {
+	t.Cleanup(func() { SetBuildKitLookup(nil) })
+
+	r := NewSessionRegistry(time.Minute)
+	r.LinkCgroup(54321, CgroupBinding{
+		SessionRef:   "rZ",
+		VertexDigest: "dZ",
+		VertexName:   "[final 1/1] RUN ls /",
+		ContainerID:  "ctr-z",
+	})
+
+	SetBuildKitLookup(r.LookupByCgroupID)
+
+	got, ok := LookupBuildKitBinding(54321)
+	if !ok {
+		t.Fatal("registry hook missed a linked cgroup")
+	}
+
+	if got.VertexName != "[final 1/1] RUN ls /" {
+		t.Fatalf("VertexName = %q", got.VertexName)
+	}
+}

@@ -558,7 +558,7 @@ func (h *linuxEBPFHandle) StartRingbufReader(
 			// canary condition rather than a steady-state fallback.
 			binaryPath := nullTerminated(ev.BinaryPath[:])
 
-			recorder.RecordViolation(Violation{
+			v := Violation{
 				IP:         ip.String(),
 				Port:       port,
 				PID:        ev.PID,
@@ -566,7 +566,22 @@ func (h *linuxEBPFHandle) StartRingbufReader(
 				BinaryPath: binaryPath,
 				Timestamp:  time.Now(),
 				Action:     action,
-			})
+			}
+
+			// Stamp BuildKit step attribution if the event's cgroup
+			// is a runc RUN container bound to a vertex by the
+			// cgroup-join layer. No-op when the BuildKit subscriber
+			// isn't installed or the cgroup isn't tracked (the
+			// common case for non-BuildKit egress).
+			if binding, ok := LookupBuildKitBinding(ev.CgroupID); ok {
+				v.BuildSessionRef = binding.SessionRef
+				v.BuildVertexDigest = binding.VertexDigest
+				v.BuildVertexName = binding.VertexName
+				v.BuildAmbiguous = binding.Ambiguous
+				v.BuildAmbiguousCandidates = binding.AmbiguousCandidates
+			}
+
+			recorder.RecordViolation(v)
 		}
 	})
 

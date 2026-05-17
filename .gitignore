@@ -18,3 +18,4 @@ Thumbs.db
 # eBPF objects are committed (CI needs them to build); the .o files
 # under agentcore/enforcer/ are tracked.
 /TODO.md
+agent-ce

@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -211,14 +209,3 @@ func (w *Webhook) post(body any) {
 	}
 }
 
-// ErrEmptyURL is returned when a webhook is requested without a URL.
-var ErrEmptyURL = errors.New("webhook url is empty")
-
-// ValidateURL returns ErrEmptyURL if the URL is unset; otherwise nil.
-// Lightweight check called from main wiring.
-func ValidateURL(url string) error {
-	if url == "" {
-		return fmt.Errorf("%w", ErrEmptyURL)
-	}
-	return nil
-}

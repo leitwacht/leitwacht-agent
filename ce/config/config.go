@@ -73,23 +73,44 @@ func Load() (*Config, error) {
 		// must point this at their own resolver — typically the kube-
 		// dns ClusterIP on K8s or the host's recursive resolver on
 		// bare metal.
-		DNSUpstream:     os.Getenv("LEITWACHT_CE_DNS_UPSTREAM"),
-		TrustedCIDRs:    os.Getenv("LEITWACHT_CE_TRUSTED_CIDRS"),
-		HoneypotEnabled: envBool("LEITWACHT_CE_HONEYPOT_ENABLED", false),
-		HoneypotDir:     envOr("LEITWACHT_CE_HONEYPOT_DIR", "/var/lib/leitwacht/honeypot"),
-		RecordEnvNames:  envBool("LEITWACHT_CE_RECORD_ENV_NAMES", false),
-		StdoutEnabled:   envBool("LEITWACHT_CE_STDOUT_ENABLED", true),
-		PromEnabled:     envBool("LEITWACHT_CE_PROM_ENABLED", true),
-		PromAddr:        envOr("LEITWACHT_CE_PROM_ADDR", ":9090"),
-		WebhookURL:      os.Getenv("LEITWACHT_CE_WEBHOOK_URL"),
-		WebhookAuth:     os.Getenv("LEITWACHT_CE_WEBHOOK_AUTH"),
-		LogLevel:        envOr("LEITWACHT_CE_LOG_LEVEL", "info"),
+		DNSUpstream:  os.Getenv("LEITWACHT_CE_DNS_UPSTREAM"),
+		TrustedCIDRs: os.Getenv("LEITWACHT_CE_TRUSTED_CIDRS"),
+		HoneypotDir:  envOr("LEITWACHT_CE_HONEYPOT_DIR", "/var/lib/leitwacht/honeypot"),
+		PromAddr:     envOr("LEITWACHT_CE_PROM_ADDR", ":9090"),
+		WebhookURL:   os.Getenv("LEITWACHT_CE_WEBHOOK_URL"),
+		WebhookAuth:  os.Getenv("LEITWACHT_CE_WEBHOOK_AUTH"),
+		LogLevel:     envOr("LEITWACHT_CE_LOG_LEVEL", "info"),
 	}
 
-	c.MaxConcurrentEnf = envInt("LEITWACHT_CE_MAX_CONCURRENT", 64)
-	c.EventBuffer = envInt("LEITWACHT_CE_EVENT_BUFFER", 64)
+	var err error
 
-	bucket, err := envDuration("LEITWACHT_CE_BUCKET_INTERVAL", 5*time.Minute)
+	c.HoneypotEnabled, err = envBool("LEITWACHT_CE_HONEYPOT_ENABLED", false)
+	if err != nil {
+		return nil, err
+	}
+	c.RecordEnvNames, err = envBool("LEITWACHT_CE_RECORD_ENV_NAMES", false)
+	if err != nil {
+		return nil, err
+	}
+	c.StdoutEnabled, err = envBool("LEITWACHT_CE_STDOUT_ENABLED", true)
+	if err != nil {
+		return nil, err
+	}
+	c.PromEnabled, err = envBool("LEITWACHT_CE_PROM_ENABLED", true)
+	if err != nil {
+		return nil, err
+	}
+
+	c.MaxConcurrentEnf, err = envInt("LEITWACHT_CE_MAX_CONCURRENT", 64)
+	if err != nil {
+		return nil, err
+	}
+	c.EventBuffer, err = envInt("LEITWACHT_CE_EVENT_BUFFER", 64)
+	if err != nil {
+		return nil, err
+	}
+
+	bucket, err := envDuration("LEITWACHT_CE_BUCKET_INTERVAL", 5*time.Minute) //nolint:govet // err is re-declared intentionally to keep the err-check pattern uniform across envBool/envInt/envDuration above
 	if err != nil {
 		return nil, err
 	}
@@ -185,31 +206,37 @@ func envOr(key, def string) string {
 	return def
 }
 
-func envBool(key string, def bool) bool {
+// envBool reads a boolean from the environment. Unset → default;
+// recognised value → that value; anything else → error so an operator
+// typo like LEITWACHT_CE_PROM_ENABLED=yess surfaces at boot rather
+// than silently falling back to the default.
+func envBool(key string, def bool) (bool, error) {
 	v, ok := os.LookupEnv(key)
 	if !ok {
-		return def
+		return def, nil
 	}
 	switch strings.ToLower(v) {
 	case "1", "true", "yes", "on":
-		return true
+		return true, nil
 	case "0", "false", "no", "off", "":
-		return false
+		return false, nil
 	default:
-		return def
+		return false, fmt.Errorf("%s = %q (must be one of: 1, true, yes, on, 0, false, no, off)", key, v)
 	}
 }
 
-func envInt(key string, def int) int {
+// envInt — same fail-fast posture as envBool. Unparseable strings
+// are operator errors, not silent defaults.
+func envInt(key string, def int) (int, error) {
 	v, ok := os.LookupEnv(key)
 	if !ok {
-		return def
+		return def, nil
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
-		return def
+		return 0, fmt.Errorf("%s = %q: %w", key, v, err)
 	}
-	return n
+	return n, nil
 }
 
 func envDuration(key string, def time.Duration) (time.Duration, error) {

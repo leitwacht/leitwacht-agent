@@ -37,12 +37,48 @@ type SessionRegistry struct {
 	mu       sync.RWMutex
 	sessions map[string]*SessionState
 
+	// cgroupIndex is the hot-path lookup: kernel cgroup_id (the
+	// inode of the cgroup directory) -> the build context that
+	// owns the runc container occupying that cgroup. Populated by
+	// the cgroup-join layer (Phase 2) and read by egress event
+	// enrichment (Phase 3).
+	cgroupIndex map[uint64]CgroupBinding
+
 	// completedTTL controls how long a completed session stays in
 	// the registry. Set to a small value (default 30s) so the
 	// cgroup-join layer can still attribute tail traffic (cache
 	// pushes, layer exports) that fires after the final vertex
 	// completes but before runc tears down the container.
 	completedTTL time.Duration
+}
+
+// CgroupBinding ties a kernel cgroup_id to the build session and
+// vertex that own the runc container occupying that cgroup. Returned
+// by SessionRegistry.LookupByCgroupID; used by egress event
+// enrichment to attach BuildStepAttribution to outgoing violations.
+type CgroupBinding struct {
+	SessionRef    string
+	VertexDigest  string
+	VertexName    string
+	ContainerID   string // runc container id (also the cgroup directory name)
+	LinkedAt      time.Time
+	FrontendAttrs map[string]string
+
+	// Ambiguous is true when the cgroup-join couldn't disambiguate
+	// between multiple concurrent vertices with identical command
+	// strings. AmbiguousCandidates lists the colliding (ref,
+	// digest) tuples for forensics. When Ambiguous is true, the
+	// VertexDigest/Name fields are not authoritative.
+	Ambiguous           bool
+	AmbiguousCandidates []AmbiguousCandidate
+}
+
+// AmbiguousCandidate is one of the colliding vertex candidates when
+// the cgroup-join couldn't pin a cgroup to a single vertex.
+type AmbiguousCandidate struct {
+	SessionRef   string
+	VertexDigest string
+	VertexName   string
 }
 
 // SessionState is the per-build view: a build ref plus the vertices
@@ -85,8 +121,87 @@ func NewSessionRegistry(completedTTL time.Duration) *SessionRegistry {
 
 	return &SessionRegistry{
 		sessions:     make(map[string]*SessionState),
+		cgroupIndex:  make(map[uint64]CgroupBinding),
 		completedTTL: completedTTL,
 	}
+}
+
+// LinkCgroup records that the cgroup with the given id holds the runc
+// container for (ref, vertexDigest). Called by the cgroup-join layer
+// after a successful match. Idempotent on repeated calls for the
+// same cgroup_id (later calls overwrite — the latest match wins,
+// which matters for runc container ID reuse across builds).
+func (r *SessionRegistry) LinkCgroup(cgroupID uint64, binding CgroupBinding) {
+	if binding.LinkedAt.IsZero() {
+		binding.LinkedAt = time.Now()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cgroupIndex[cgroupID] = binding
+}
+
+// UnlinkCgroup removes a cgroup-to-vertex binding. Called when the
+// cgroup directory is removed (runc cleanup after RUN completes).
+// Cheap no-op if the cgroup isn't tracked.
+func (r *SessionRegistry) UnlinkCgroup(cgroupID uint64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.cgroupIndex, cgroupID)
+}
+
+// LookupByCgroupID returns the binding for a cgroup, or false when
+// the cgroup isn't tracked (the common case — most egress events
+// fire from cgroups outside BuildKit's tree).
+func (r *SessionRegistry) LookupByCgroupID(cgroupID uint64) (CgroupBinding, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	binding, ok := r.cgroupIndex[cgroupID]
+
+	return binding, ok
+}
+
+// PendingVertices returns vertices that have started but not yet
+// completed across all active sessions. Used by the cgroup-join
+// layer to match cmdline strings against in-flight build steps.
+// Returns the join's view of the active set; the registry's mutex
+// is held only for the snapshot, not the caller's match loop.
+func (r *SessionRegistry) PendingVertices() []PendingVertex {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var out []PendingVertex
+
+	for _, s := range r.sessions {
+		for _, v := range s.Vertices {
+			if v.Completed {
+				continue
+			}
+
+			if v.StartedAt.IsZero() {
+				continue
+			}
+
+			out = append(out, PendingVertex{
+				SessionRef:    s.Ref,
+				VertexDigest:  v.Digest,
+				VertexName:    v.Name,
+				FrontendAttrs: cloneStringMap(s.FrontendAttrs),
+			})
+		}
+	}
+
+	return out
+}
+
+// PendingVertex is the join-layer's view of an in-flight vertex.
+// Carries the human name (used for cmdline matching) and the
+// session's FrontendAttrs (used as the tiebreaker on collisions).
+type PendingVertex struct {
+	SessionRef    string
+	VertexDigest  string
+	VertexName    string
+	FrontendAttrs map[string]string
 }
 
 // RegisterSession records a STARTED event from ListenBuildHistory.

@@ -1,0 +1,393 @@
+package enforcer
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strconv"
+	"testing"
+	"time"
+)
+
+// ---------------- pure-logic tests ----------------
+
+func TestExtractRunCommand(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain", "RUN npm ci", "npm ci"},
+		{"with bracket prefix", "[build 5/12] RUN npm ci", "npm ci"},
+		{"prefix + complex run", "[stage-final 2/4] RUN apt-get install -y curl", "apt-get install -y curl"},
+		{"non-run vertex", "[stage-final 1/4] COPY --from=build /out /", ""},
+		{"from", "[internal] FROM docker.io/library/alpine:3.18", ""},
+		{"empty", "", ""},
+		{"only bracket", "[stage 1/2]", ""},
+	}
+
+	for _, tc := range cases {
+		got := extractRunCommand(tc.in)
+		if got != tc.want {
+			t.Errorf("extractRunCommand(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestMatchPendingByCmdline(t *testing.T) {
+	pending := []PendingVertex{
+		{SessionRef: "rA", VertexDigest: "dA", VertexName: "[build 1/3] RUN apt-get update"},
+		{SessionRef: "rA", VertexDigest: "dB", VertexName: "[build 2/3] RUN npm ci"},
+		{SessionRef: "rB", VertexDigest: "dC", VertexName: "[final 1/2] COPY --from=build /out /"},
+	}
+
+	// /bin/sh -c "<cmd>" — common runc invocation shape.
+	got := matchPendingByCmdline(pending, "/bin/sh -c apt-get update")
+	if len(got) != 1 || got[0].VertexDigest != "dA" {
+		t.Fatalf("apt-get match: got %+v", got)
+	}
+
+	got = matchPendingByCmdline(pending, "/bin/sh -c npm ci")
+	if len(got) != 1 || got[0].VertexDigest != "dB" {
+		t.Fatalf("npm ci match: got %+v", got)
+	}
+
+	// COPY doesn't match — it never enters the cmdline space.
+	got = matchPendingByCmdline(pending, "/bin/sh -c apt-get install -y curl")
+	if len(got) != 0 {
+		t.Fatalf("unrelated cmdline matched: %+v", got)
+	}
+}
+
+func TestMatchPendingByCmdline_CrossBuildDuplicate(t *testing.T) {
+	// Two sessions, both running the same exact RUN — the join layer
+	// should report both as candidates and let the tiebreaker decide.
+	pending := []PendingVertex{
+		{SessionRef: "rA", VertexDigest: "dA", VertexName: "[build 1/2] RUN apt-get update", FrontendAttrs: map[string]string{"build-arg:VERSION": "1"}},
+		{SessionRef: "rB", VertexDigest: "dB", VertexName: "[build 1/2] RUN apt-get update", FrontendAttrs: map[string]string{"build-arg:VERSION": "2"}},
+	}
+
+	got := matchPendingByCmdline(pending, "/bin/sh -c apt-get update")
+	if len(got) != 2 {
+		t.Fatalf("expected 2 matches, got %d: %+v", len(got), got)
+	}
+}
+
+func TestTiebreakByEnviron(t *testing.T) {
+	matches := []PendingVertex{
+		{SessionRef: "rA", VertexDigest: "dA", FrontendAttrs: map[string]string{"build-arg:VERSION": "1"}},
+		{SessionRef: "rB", VertexDigest: "dB", FrontendAttrs: map[string]string{"build-arg:VERSION": "2"}},
+	}
+
+	// Environ matches session A.
+	got := tiebreakByEnviron(matches, map[string]string{"VERSION": "1", "PATH": "/usr/bin"})
+	if len(got) != 1 || got[0].SessionRef != "rA" {
+		t.Fatalf("environ tiebreak: got %+v, want rA", got)
+	}
+
+	// Environ matches neither — fall back to all candidates ("still ambiguous").
+	got = tiebreakByEnviron(matches, map[string]string{"VERSION": "9"})
+	if len(got) != 2 {
+		t.Fatalf("non-match should fall back to all candidates: got %+v", got)
+	}
+
+	// Empty environ — no tiebreaker available, return all.
+	got = tiebreakByEnviron(matches, map[string]string{})
+	if len(got) != 2 {
+		t.Fatalf("empty environ should return all matches: got %+v", got)
+	}
+}
+
+// ---------------- registry cgroup-index tests ----------------
+
+func TestSessionRegistry_LinkAndLookupCgroup(t *testing.T) {
+	r := NewSessionRegistry(time.Minute)
+	r.LinkCgroup(12345, CgroupBinding{
+		SessionRef:   "rA",
+		VertexDigest: "dA",
+		VertexName:   "RUN npm ci",
+		ContainerID:  "abc123",
+	})
+
+	got, ok := r.LookupByCgroupID(12345)
+	if !ok {
+		t.Fatal("LookupByCgroupID missed a linked cgroup")
+	}
+
+	if got.SessionRef != "rA" || got.VertexDigest != "dA" {
+		t.Fatalf("binding: got %+v", got)
+	}
+
+	if got.LinkedAt.IsZero() {
+		t.Fatal("LinkedAt should default to now")
+	}
+
+	r.UnlinkCgroup(12345)
+
+	_, ok = r.LookupByCgroupID(12345)
+	if ok {
+		t.Fatal("UnlinkCgroup did not remove binding")
+	}
+}
+
+func TestSessionRegistry_PendingVerticesExcludesCompleted(t *testing.T) {
+	r := NewSessionRegistry(time.Minute)
+	r.RegisterSession("rA", time.Unix(1000, 0), nil)
+	r.UpsertVertex("rA", VertexState{Digest: "dA", Name: "RUN a", StartedAt: time.Unix(1010, 0)})
+	r.UpsertVertex("rA", VertexState{Digest: "dB", Name: "RUN b", StartedAt: time.Unix(1020, 0)})
+	r.UpsertVertex("rA", VertexState{Digest: "dA", Completed: true, CompletedAt: time.Unix(1030, 0)})
+
+	pending := r.PendingVertices()
+	if len(pending) != 1 {
+		t.Fatalf("pending size = %d, want 1", len(pending))
+	}
+
+	if pending[0].VertexDigest != "dB" {
+		t.Fatalf("pending vertex = %s, want dB", pending[0].VertexDigest)
+	}
+}
+
+// ---------------- joiner end-to-end with fake source ----------------
+
+type fakeEventSource struct {
+	creates chan CgroupCreateEvent
+	removes chan CgroupRemoveEvent
+}
+
+func newFakeEventSource() *fakeEventSource {
+	return &fakeEventSource{
+		creates: make(chan CgroupCreateEvent, 8),
+		removes: make(chan CgroupRemoveEvent, 8),
+	}
+}
+
+func (s *fakeEventSource) Run(ctx context.Context, creates chan<- CgroupCreateEvent, removes chan<- CgroupRemoveEvent) error {
+	defer close(creates)
+	defer close(removes)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case evt, ok := <-s.creates:
+			if !ok {
+				return nil
+			}
+
+			select {
+			case creates <- evt:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		case evt, ok := <-s.removes:
+			if !ok {
+				return nil
+			}
+
+			select {
+			case removes <- evt:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+	}
+}
+
+// stageCgroup writes a cgroup.procs file under tmpDir/cgroupID with
+// the supplied pid, and a /proc/<pid>/cmdline file with the supplied
+// cmd. Returns the cgroupPath the joiner should observe.
+func stageCgroup(t *testing.T, root, cgroupName string, pid int, cmd string) string {
+	t.Helper()
+
+	cgroupPath := filepath.Join(root, "cgroups", cgroupName)
+	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+		t.Fatalf("mkdir cgroup: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil { //nolint:gosec // test fixture, not a security boundary
+		t.Fatalf("write cgroup.procs: %v", err)
+	}
+
+	procPid := filepath.Join(root, "proc", strconv.Itoa(pid))
+	if err := os.MkdirAll(procPid, 0o755); err != nil {
+		t.Fatalf("mkdir procPid: %v", err)
+	}
+
+	// cmdline uses NUL separators; encode with \x00 between argv[].
+	if err := os.WriteFile(filepath.Join(procPid, "cmdline"), []byte(cmd), 0o644); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("write cmdline: %v", err)
+	}
+
+	return cgroupPath
+}
+
+func TestCgroupJoiner_HappyPathSingleMatch(t *testing.T) {
+	root := t.TempDir()
+	reg := NewSessionRegistry(time.Minute)
+
+	// Stage a session with a pending RUN vertex.
+	reg.RegisterSession("rA", time.Unix(1000, 0), nil)
+	reg.UpsertVertex("rA", VertexState{
+		Digest:    "dA",
+		Name:      "[build 1/2] RUN npm ci",
+		StartedAt: time.Unix(1010, 0),
+	})
+
+	// Stage the cgroupfs + /proc entries the joiner will read.
+	cgroupPath := stageCgroup(t, root, "ctr-abc", 4242, "/bin/sh\x00-c\x00npm ci\x00")
+
+	source := newFakeEventSource()
+
+	statCalls := 0
+	statFn := func(path string) (uint64, error) {
+		statCalls++
+		if path != cgroupPath {
+			t.Errorf("stat called with unexpected path %s", path)
+		}
+
+		return 9876, nil
+	}
+
+	j := NewCgroupJoiner(reg, source, nil,
+		WithProcRoot(filepath.Join(root, "proc")),
+		WithStatFn(statFn),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		_ = j.Run(ctx)
+
+		close(done)
+	}()
+
+	source.creates <- CgroupCreateEvent{ContainerID: "ctr-abc", CgroupPath: cgroupPath}
+
+	waitFor(t, time.Second, func() bool {
+		_, ok := reg.LookupByCgroupID(9876)
+
+		return ok
+	})
+
+	got, _ := reg.LookupByCgroupID(9876)
+	if got.SessionRef != "rA" || got.VertexDigest != "dA" {
+		t.Fatalf("binding wrong: %+v", got)
+	}
+
+	if got.ContainerID != "ctr-abc" {
+		t.Fatalf("ContainerID = %q, want ctr-abc", got.ContainerID)
+	}
+
+	if got.Ambiguous {
+		t.Fatal("single match should not be marked ambiguous")
+	}
+
+	cancel()
+	<-done
+}
+
+func TestCgroupJoiner_AmbiguousFallsBackToCandidateList(t *testing.T) {
+	root := t.TempDir()
+	reg := NewSessionRegistry(time.Minute)
+
+	// Two sessions running the same command — collision.
+	reg.RegisterSession("rA", time.Unix(1000, 0), nil)
+	reg.UpsertVertex("rA", VertexState{Digest: "dA", Name: "[build 1/1] RUN apt-get update", StartedAt: time.Unix(1010, 0)})
+
+	reg.RegisterSession("rB", time.Unix(1001, 0), nil)
+	reg.UpsertVertex("rB", VertexState{Digest: "dB", Name: "[build 1/1] RUN apt-get update", StartedAt: time.Unix(1011, 0)})
+
+	cgroupPath := stageCgroup(t, root, "ctr-dup", 5555, "/bin/sh\x00-c\x00apt-get update\x00")
+	// Empty environ (no /proc/<pid>/environ written) → tiebreaker
+	// has no signal → ambiguous result.
+
+	source := newFakeEventSource()
+
+	statFn := func(_ string) (uint64, error) { return 4321, nil }
+
+	j := NewCgroupJoiner(reg, source, nil,
+		WithProcRoot(filepath.Join(root, "proc")),
+		WithStatFn(statFn),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = j.Run(ctx) }()
+
+	source.creates <- CgroupCreateEvent{ContainerID: "ctr-dup", CgroupPath: cgroupPath}
+
+	waitFor(t, time.Second, func() bool {
+		_, ok := reg.LookupByCgroupID(4321)
+
+		return ok
+	})
+
+	got, _ := reg.LookupByCgroupID(4321)
+	if !got.Ambiguous {
+		t.Fatalf("expected ambiguous binding, got %+v", got)
+	}
+
+	if len(got.AmbiguousCandidates) != 2 {
+		t.Fatalf("AmbiguousCandidates = %d, want 2", len(got.AmbiguousCandidates))
+	}
+}
+
+func TestCgroupJoiner_RemoveUnlinks(t *testing.T) {
+	reg := NewSessionRegistry(time.Minute)
+	reg.LinkCgroup(7777, CgroupBinding{
+		SessionRef:   "rA",
+		VertexDigest: "dA",
+		ContainerID:  "ctr-remove",
+	})
+
+	source := newFakeEventSource()
+	j := NewCgroupJoiner(reg, source, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = j.Run(ctx) }()
+
+	source.removes <- CgroupRemoveEvent{ContainerID: "ctr-remove"}
+
+	waitFor(t, time.Second, func() bool {
+		_, ok := reg.LookupByCgroupID(7777)
+
+		return !ok
+	})
+}
+
+func TestCgroupJoiner_NoMatchSilentlyDropped(t *testing.T) {
+	root := t.TempDir()
+	reg := NewSessionRegistry(time.Minute)
+
+	// No pending vertices in the registry. The create event should
+	// produce no binding and no panic.
+	cgroupPath := stageCgroup(t, root, "ctr-orphan", 6666, "/bin/sh\x00-c\x00whatever\x00")
+
+	source := newFakeEventSource()
+	statFn := func(_ string) (uint64, error) { return 1111, nil }
+
+	j := NewCgroupJoiner(reg, source, nil,
+		WithProcRoot(filepath.Join(root, "proc")),
+		WithStatFn(statFn),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = j.Run(ctx) }()
+
+	source.creates <- CgroupCreateEvent{ContainerID: "ctr-orphan", CgroupPath: cgroupPath}
+
+	// Wait a beat for the joiner to process. Verify the index is
+	// still empty.
+	time.Sleep(50 * time.Millisecond)
+
+	if _, ok := reg.LookupByCgroupID(1111); ok {
+		t.Fatal("no pending vertices but cgroup got bound anyway")
+	}
+}

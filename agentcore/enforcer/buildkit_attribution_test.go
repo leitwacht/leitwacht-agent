@@ -500,3 +500,129 @@ func TestLookupBuildKitBinding_WiresThroughRegistry(t *testing.T) {
 		t.Fatalf("VertexName = %q", got.VertexName)
 	}
 }
+
+// TestBuildKitAttribution_FullChain composes every agent-side component
+// in one in-process test: fake BuildKit Control gRPC → AttributionWatcher
+// (Phase 1) → SessionRegistry → LinkCgroup (Phase 2 join layer) →
+// SetBuildKitLookup → LookupBuildKitBinding (the hot-path hook called
+// by Phase 3 egress enrichment in platform_linux.go).
+//
+// This is the strongest "BuildKit step attribution works" signal we can
+// produce in unit-test form. The only piece not exercised here is the
+// real cgroupfs walker that resolves container_id → cgroup_id; that's
+// covered by the platform_linux integration build tag.
+func TestBuildKitAttribution_FullChain(t *testing.T) {
+	t.Cleanup(func() { SetBuildKitLookup(nil) })
+
+	fake, dialOpts, cleanup := startFakeServer(t)
+	defer cleanup()
+
+	reg := NewSessionRegistry(time.Minute)
+
+	w := NewAttributionWatcher(
+		"passthrough://bufnet",
+		reg,
+		nil,
+		WithDialOptions(dialOpts...),
+		WithSweepInterval(time.Hour),
+		WithBackoff(time.Millisecond, time.Millisecond),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		_ = w.Run(ctx)
+
+		close(done)
+	}()
+
+	// 1. BuildKit announces a new session.
+	fake.emitHistory(t, &controlapi.BuildHistoryEvent{
+		Type: controlapi.BuildHistoryEventType_STARTED,
+		Record: &controlapi.BuildHistoryRecord{
+			Ref:           "sess-fullchain",
+			CreatedAt:     timestamppb.New(time.Unix(1000, 0)),
+			FrontendAttrs: map[string]string{"target": "build"},
+		},
+	})
+
+	// 2. BuildKit emits a vertex on that session — Phase 1 subscriber
+	// must hoist it into the registry.
+	fake.emitStatus(t, "sess-fullchain", &controlapi.StatusResponse{
+		Vertexes: []*controlapi.Vertex{
+			{
+				Digest:  "sha256:vertex-curl",
+				Name:    "[build 2/3] RUN curl https://registry.example.com",
+				Started: timestamppb.New(time.Unix(1010, 0)),
+			},
+		},
+	})
+
+	waitFor(t, time.Second, func() bool {
+		s := reg.Snapshot()["sess-fullchain"]
+
+		return s.Ref == "sess-fullchain" && s.Vertices["sha256:vertex-curl"] != nil
+	})
+
+	// 3. Phase 2 join layer would normally walk cgroupfs and produce
+	// this LinkCgroup call. Simulated here with a hardcoded cgroup_id
+	// to keep the test platform-independent.
+	const cgroupID uint64 = 0x12345
+
+	reg.LinkCgroup(cgroupID, CgroupBinding{
+		SessionRef:   "sess-fullchain",
+		VertexDigest: "sha256:vertex-curl",
+		VertexName:   "[build 2/3] RUN curl https://registry.example.com",
+		ContainerID:  "ctr-fullchain",
+	})
+
+	// 4. Phase 3 startup wiring installs the lookup hook.
+	SetBuildKitLookup(reg.LookupByCgroupID)
+
+	// 5. The eBPF egress handler in platform_linux.go does exactly
+	// this on every packet — call the hook with the cgroup_id from
+	// the kernel and staple the result onto the outgoing violation.
+	binding, ok := LookupBuildKitBinding(cgroupID)
+	if !ok {
+		t.Fatal("LookupBuildKitBinding returned ok=false — chain is broken between Registry.LinkCgroup and the hot-path hook")
+	}
+
+	if binding.SessionRef != "sess-fullchain" {
+		t.Errorf("SessionRef = %q, want sess-fullchain", binding.SessionRef)
+	}
+	if binding.VertexDigest != "sha256:vertex-curl" {
+		t.Errorf("VertexDigest = %q, want sha256:vertex-curl", binding.VertexDigest)
+	}
+	if binding.VertexName != "[build 2/3] RUN curl https://registry.example.com" {
+		t.Errorf("VertexName = %q", binding.VertexName)
+	}
+	if binding.Ambiguous {
+		t.Errorf("Ambiguous = true, want false for single-match link")
+	}
+
+	// 6. Unknown cgroup ids must surface no binding so non-BuildKit
+	// egress stays attribution-free (the common case).
+	if _, ok := LookupBuildKitBinding(0xDEAD); ok {
+		t.Error("LookupBuildKitBinding returned a binding for an unlinked cgroup_id")
+	}
+
+	// 7. After the session completes BuildKit emits COMPLETE; the
+	// registry must mark the session done so the sweep loop can
+	// eventually evict it.
+	fake.emitHistory(t, &controlapi.BuildHistoryEvent{
+		Type: controlapi.BuildHistoryEventType_COMPLETE,
+		Record: &controlapi.BuildHistoryRecord{
+			Ref:         "sess-fullchain",
+			CompletedAt: timestamppb.New(time.Unix(1020, 0)),
+		},
+	})
+
+	waitFor(t, time.Second, func() bool {
+		return reg.Snapshot()["sess-fullchain"].Completed
+	})
+
+	cancel()
+	<-done
+}

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // CgroupCreateEvent is the signal emitted by the platform-specific
@@ -79,6 +80,20 @@ type CgroupJoiner struct {
 	// os.Stat + Sys().Ino via the platform helper; tests override
 	// to inject deterministic ids.
 	statFn func(path string) (uint64, error)
+
+	// deferredMatchTimeout caps how long we keep retrying a
+	// procs-read + cmdline-match for a freshly-created cgroup.
+	// BuildKit's OCI executor creates the cgroup directory before
+	// the runc child PID is moved into it AND before the Status
+	// stream announces the vertex (~100-200ms gap observed in
+	// practice). Retrying covers both races. Zero disables retry.
+	deferredMatchTimeout time.Duration
+
+	// deferredMatchInterval is the poll interval inside the retry
+	// loop. Trade-off: too short wastes CPU on cgroups that will
+	// never match (internal BuildKit containers); too long misses
+	// fast RUNs. 100ms catches typical timing comfortably.
+	deferredMatchInterval time.Duration
 }
 
 // JoinerOption tunes a CgroupJoiner at construction.
@@ -99,6 +114,18 @@ func WithChannelBuffer(n int) JoinerOption {
 	return func(j *CgroupJoiner) { j.channelBuffer = n }
 }
 
+// WithDeferredMatch sets how long the joiner keeps retrying a
+// match for a freshly-created cgroup, and the interval between
+// attempts. Zero timeout disables retry (legacy behaviour: a single
+// match attempt at cgroup-create time, drop on empty procs or no
+// pending vertex). Production default is 2s/100ms.
+func WithDeferredMatch(timeout, interval time.Duration) JoinerOption {
+	return func(j *CgroupJoiner) {
+		j.deferredMatchTimeout = timeout
+		j.deferredMatchInterval = interval
+	}
+}
+
 // NewCgroupJoiner returns a joiner wired to the supplied registry
 // and platform event source.
 func NewCgroupJoiner(registry *SessionRegistry, source CgroupEventSource, logger *slog.Logger, opts ...JoinerOption) *CgroupJoiner {
@@ -107,12 +134,14 @@ func NewCgroupJoiner(registry *SessionRegistry, source CgroupEventSource, logger
 	}
 
 	j := &CgroupJoiner{
-		registry:      registry,
-		logger:        logger,
-		source:        source,
-		channelBuffer: 256,
-		procRoot:      "/proc",
-		statFn:        defaultStatFn,
+		registry:              registry,
+		logger:                logger,
+		source:                source,
+		channelBuffer:         256,
+		procRoot:              "/proc",
+		statFn:                defaultStatFn,
+		deferredMatchTimeout:  2 * time.Second,
+		deferredMatchInterval: 100 * time.Millisecond,
 	}
 
 	for _, opt := range opts {
@@ -151,7 +180,7 @@ func (j *CgroupJoiner) Run(ctx context.Context) error {
 				return nil
 			}
 
-			j.handleCreate(evt)
+			j.handleCreate(ctx, evt)
 		case evt, ok := <-removes:
 			if !ok {
 				return nil
@@ -162,7 +191,7 @@ func (j *CgroupJoiner) Run(ctx context.Context) error {
 	}
 }
 
-func (j *CgroupJoiner) handleCreate(evt CgroupCreateEvent) {
+func (j *CgroupJoiner) handleCreate(ctx context.Context, evt CgroupCreateEvent) {
 	cgroupID, err := j.statFn(evt.CgroupPath)
 	if err != nil {
 		// Cgroup may have been removed already (very short-lived
@@ -172,18 +201,35 @@ func (j *CgroupJoiner) handleCreate(evt CgroupCreateEvent) {
 		return
 	}
 
+	// First attempt runs synchronously so the happy fast-path
+	// (cgroup already populated, vertex already announced) takes
+	// no goroutine. The deferred loop only spawns when this misses.
+	if j.tryMatch(cgroupID, evt) {
+		return
+	}
+
+	if j.deferredMatchTimeout <= 0 {
+		// Legacy behaviour: drop on first miss. Egress events for
+		// this cgroup will be emitted unattributed.
+		return
+	}
+
+	go j.deferredMatch(ctx, cgroupID, evt)
+}
+
+// tryMatch performs one read-procs + read-cmdline + match-pending
+// attempt. Returns true if a binding was linked (success), false on
+// any miss (procs empty, cmdline unreadable, no pending vertex).
+// The deferred loop calls this on each tick.
+func (j *CgroupJoiner) tryMatch(cgroupID uint64, evt CgroupCreateEvent) bool {
 	pid, err := readFirstPID(evt.CgroupPath)
 	if err != nil {
-		j.logger.Debug("cgroup procs unreadable", "path", evt.CgroupPath, "err", err)
-
-		return
+		return false
 	}
 
 	cmdline, err := readCmdline(j.procRoot, pid)
 	if err != nil {
-		j.logger.Debug("pid cmdline unreadable", "pid", pid, "err", err)
-
-		return
+		return false
 	}
 
 	pending := j.registry.PendingVertices()
@@ -191,12 +237,7 @@ func (j *CgroupJoiner) handleCreate(evt CgroupCreateEvent) {
 
 	switch len(matches) {
 	case 0:
-		// Not a buildkit RUN, or vertex hasn't streamed yet
-		// (race; status events arrive slightly after the runc
-		// fork). Drop silently — the cgroup index just doesn't
-		// gain an entry, and egress events for this cgroup are
-		// emitted unattributed.
-		return
+		return false
 	case 1:
 		m := matches[0]
 		j.registry.LinkCgroup(cgroupID, CgroupBinding{
@@ -206,6 +247,8 @@ func (j *CgroupJoiner) handleCreate(evt CgroupCreateEvent) {
 			ContainerID:   evt.ContainerID,
 			FrontendAttrs: m.FrontendAttrs,
 		})
+
+		return true
 	default:
 		// Tiebreaker: environ. Read /proc/<pid>/environ and pick
 		// the candidate whose FrontendAttrs values appear in the
@@ -224,7 +267,7 @@ func (j *CgroupJoiner) handleCreate(evt CgroupCreateEvent) {
 				FrontendAttrs: m.FrontendAttrs,
 			})
 
-			return
+			return true
 		}
 
 		j.registry.LinkCgroup(cgroupID, CgroupBinding{
@@ -237,6 +280,43 @@ func (j *CgroupJoiner) handleCreate(evt CgroupCreateEvent) {
 			"container_id", evt.ContainerID,
 			"candidates", len(matches),
 		)
+
+		return true
+	}
+}
+
+// deferredMatch retries tryMatch on a ticker until it succeeds, the
+// deadline expires, or ctx is cancelled. Covers the BuildKit + runc
+// timing window where the cgroup directory is created before the
+// child PID is in procs AND before the Status stream announces the
+// vertex. One goroutine per cgroup create; bounded by buildkit's
+// max-parallelism (typically low tens).
+func (j *CgroupJoiner) deferredMatch(ctx context.Context, cgroupID uint64, evt CgroupCreateEvent) {
+	deadline := time.Now().Add(j.deferredMatchTimeout)
+
+	tick := time.NewTicker(j.deferredMatchInterval)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+
+		if j.tryMatch(cgroupID, evt) {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			j.logger.Debug("cgroup-to-vertex join deadline; dropped",
+				"container_id", evt.ContainerID,
+				"cgroup_id", cgroupID,
+				"path", evt.CgroupPath,
+			)
+
+			return
+		}
 	}
 }
 

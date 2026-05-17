@@ -360,6 +360,136 @@ func TestCgroupJoiner_RemoveUnlinks(t *testing.T) {
 	})
 }
 
+// TestCgroupJoiner_DeferredMatchOnLateVertex covers the BuildKit + runc
+// race: the cgroup directory is created (and our inotify source fires)
+// before the Status stream has announced the vertex AND before runc
+// has moved the child PID into the cgroup. The first match attempt
+// must miss; the deferred loop must catch the match once procs + the
+// pending vertex both populate.
+func TestCgroupJoiner_DeferredMatchOnLateVertex(t *testing.T) {
+	root := t.TempDir()
+	reg := NewSessionRegistry(time.Minute)
+
+	// At T=0 there's no session and the cgroup directory is empty —
+	// just the path. Stage a cgroup procs file that's intentionally
+	// empty for now.
+	cgroupPath := filepath.Join(root, "cgroups", "ctr-late")
+	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte(""), 0o644); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("write empty procs: %v", err)
+	}
+
+	source := newFakeEventSource()
+	statFn := func(_ string) (uint64, error) { return 7777, nil }
+
+	j := NewCgroupJoiner(reg, source, nil,
+		WithProcRoot(filepath.Join(root, "proc")),
+		WithStatFn(statFn),
+		// Short retry budget to keep the test fast — production
+		// defaults are 2s/100ms.
+		WithDeferredMatch(500*time.Millisecond, 20*time.Millisecond),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		_ = j.Run(ctx)
+
+		close(done)
+	}()
+
+	// Inotify fires. First attempt: procs is empty, no pending.
+	// Deferred loop must start retrying.
+	source.creates <- CgroupCreateEvent{ContainerID: "ctr-late", CgroupPath: cgroupPath}
+
+	// Race window: ~80ms after inotify, BuildKit announces the
+	// vertex AND runc moves the PID into the cgroup. Mirror that
+	// here by populating both after a delay.
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+
+		reg.RegisterSession("late-ref", time.Unix(1000, 0), nil)
+		reg.UpsertVertex("late-ref", VertexState{
+			Digest:    "late-digest",
+			Name:      "[build 1/1] RUN npm test",
+			StartedAt: time.Unix(1010, 0),
+		})
+
+		// Now stage procs + cmdline so the deferred read can succeed.
+		const latePID = 9001
+
+		_ = os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"),
+			[]byte(strconv.Itoa(latePID)+"\n"), 0o644) //nolint:gosec // test fixture
+
+		procPID := filepath.Join(root, "proc", strconv.Itoa(latePID))
+		_ = os.MkdirAll(procPID, 0o755)
+		_ = os.WriteFile(filepath.Join(procPID, "cmdline"),
+			[]byte("/bin/sh\x00-c\x00npm test\x00"), 0o644) //nolint:gosec // test fixture
+	}()
+
+	waitFor(t, time.Second, func() bool {
+		_, ok := reg.LookupByCgroupID(7777)
+
+		return ok
+	})
+
+	got, _ := reg.LookupByCgroupID(7777)
+	if got.SessionRef != "late-ref" || got.VertexDigest != "late-digest" {
+		t.Fatalf("deferred match wrong: %+v", got)
+	}
+
+	if got.VertexName != "[build 1/1] RUN npm test" {
+		t.Errorf("VertexName = %q", got.VertexName)
+	}
+
+	cancel()
+	<-done
+}
+
+// TestCgroupJoiner_DeferredMatchGivesUpAtDeadline ensures the retry
+// loop terminates so a cgroup that never matches doesn't tie up a
+// goroutine forever. Uses a tiny budget to keep the test fast.
+func TestCgroupJoiner_DeferredMatchGivesUpAtDeadline(t *testing.T) {
+	root := t.TempDir()
+	reg := NewSessionRegistry(time.Minute)
+
+	// Nothing will ever match — no session, no pending vertex, no PID.
+	cgroupPath := filepath.Join(root, "cgroups", "ctr-orphan")
+	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte(""), 0o644); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("write procs: %v", err)
+	}
+
+	source := newFakeEventSource()
+	statFn := func(_ string) (uint64, error) { return 8888, nil }
+
+	j := NewCgroupJoiner(reg, source, nil,
+		WithProcRoot(filepath.Join(root, "proc")),
+		WithStatFn(statFn),
+		WithDeferredMatch(100*time.Millisecond, 20*time.Millisecond),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = j.Run(ctx) }()
+
+	source.creates <- CgroupCreateEvent{ContainerID: "ctr-orphan", CgroupPath: cgroupPath}
+
+	// Wait past the deadline.
+	time.Sleep(300 * time.Millisecond)
+
+	if _, ok := reg.LookupByCgroupID(8888); ok {
+		t.Fatal("orphan cgroup got linked after the retry budget expired")
+	}
+}
+
 func TestCgroupJoiner_NoMatchSilentlyDropped(t *testing.T) {
 	root := t.TempDir()
 	reg := NewSessionRegistry(time.Minute)

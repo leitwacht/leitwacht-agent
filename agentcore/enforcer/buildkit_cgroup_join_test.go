@@ -450,6 +450,88 @@ func TestCgroupJoiner_DeferredMatchOnLateVertex(t *testing.T) {
 	<-done
 }
 
+// TestCgroupJoiner_RemoveDuringDeferredRetryDropsLink covers the
+// teardown race: the cgroup is created (inotify fires), the deferred
+// matcher starts retrying, the cgroup is removed (runc tearing down a
+// fast-failing RUN), and only THEN the registry would have linked a
+// match. The remove must cancel the goroutine and prevent the
+// post-remove link — otherwise a stale binding leaks for a container
+// that no longer exists.
+func TestCgroupJoiner_RemoveDuringDeferredRetryDropsLink(t *testing.T) {
+	root := t.TempDir()
+	reg := NewSessionRegistry(time.Minute)
+
+	cgroupPath := filepath.Join(root, "cgroups", "ctr-removed")
+	if err := os.MkdirAll(cgroupPath, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte(""), 0o644); err != nil { //nolint:gosec // test fixture
+		t.Fatalf("write procs: %v", err)
+	}
+
+	source := newFakeEventSource()
+	statFn := func(_ string) (uint64, error) { return 4242, nil }
+
+	j := NewCgroupJoiner(reg, source, nil,
+		WithProcRoot(filepath.Join(root, "proc")),
+		WithStatFn(statFn),
+		WithDeferredMatch(500*time.Millisecond, 20*time.Millisecond),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		_ = j.Run(ctx)
+
+		close(done)
+	}()
+
+	// Fire create — procs is empty, no pending vertex, deferred
+	// retry starts.
+	source.creates <- CgroupCreateEvent{ContainerID: "ctr-removed", CgroupPath: cgroupPath}
+
+	// Let the deferred loop tick at least once.
+	time.Sleep(50 * time.Millisecond)
+
+	// Fire remove. The deferred goroutine must be cancelled BEFORE
+	// the registry would have written a binding.
+	source.removes <- CgroupRemoveEvent{ContainerID: "ctr-removed", CgroupPath: cgroupPath}
+
+	// Now make a match possible — if cancellation didn't take, the
+	// goroutine would now succeed and link a stale binding.
+	reg.RegisterSession("ref-removed", time.Unix(1000, 0), nil)
+	reg.UpsertVertex("ref-removed", VertexState{
+		Digest:    "digest-removed",
+		Name:      "[1/1] RUN never-actually-runs",
+		StartedAt: time.Unix(1010, 0),
+	})
+
+	const latePID = 7777
+
+	_ = os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"),
+		[]byte(strconv.Itoa(latePID)+"\n"), 0o644) //nolint:gosec // test fixture
+
+	procPID := filepath.Join(root, "proc", strconv.Itoa(latePID))
+	_ = os.MkdirAll(procPID, 0o755)
+	_ = os.WriteFile(filepath.Join(procPID, "cmdline"),
+		[]byte("/bin/sh\x00-c\x00never-actually-runs\x00"), 0o644) //nolint:gosec // test fixture
+
+	// Wait well past the retry budget. If the cancellation worked,
+	// no binding ever appears. If it didn't, the deferred goroutine
+	// catches a successful tryMatch above and links — leaving a
+	// stale binding for a container that was removed.
+	time.Sleep(600 * time.Millisecond)
+
+	if _, ok := reg.LookupByCgroupID(4242); ok {
+		t.Fatal("deferred match wrote a binding for a container that was already removed")
+	}
+
+	cancel()
+	<-done
+}
+
 // TestCgroupJoiner_DeferredMatchGivesUpAtDeadline ensures the retry
 // loop terminates so a cgroup that never matches doesn't tie up a
 // goroutine forever. Uses a tiny budget to keep the test fast.

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -94,6 +95,21 @@ type CgroupJoiner struct {
 	// never match (internal BuildKit containers); too long misses
 	// fast RUNs. 100ms catches typical timing comfortably.
 	deferredMatchInterval time.Duration
+
+	// inflight tracks active deferred-match goroutines keyed by
+	// ContainerID. handleRemove uses it to cancel the goroutine
+	// and wait for it to exit before doing the unlink walk, so a
+	// goroutine that wins its retry after the remove fired can't
+	// re-link a binding for a runc container that's already gone.
+	inflight sync.Map
+}
+
+// pendingDeferredMatch is the handle on one in-flight deferred-match
+// goroutine. cancel signals the goroutine to give up; done closes
+// when the goroutine returns.
+type pendingDeferredMatch struct {
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 // JoinerOption tunes a CgroupJoiner at construction.
@@ -204,7 +220,7 @@ func (j *CgroupJoiner) handleCreate(ctx context.Context, evt CgroupCreateEvent) 
 	// First attempt runs synchronously so the happy fast-path
 	// (cgroup already populated, vertex already announced) takes
 	// no goroutine. The deferred loop only spawns when this misses.
-	if j.tryMatch(cgroupID, evt) {
+	if j.tryMatch(ctx, cgroupID, evt) {
 		return
 	}
 
@@ -214,14 +230,40 @@ func (j *CgroupJoiner) handleCreate(ctx context.Context, evt CgroupCreateEvent) 
 		return
 	}
 
-	go j.deferredMatch(ctx, cgroupID, evt)
+	// Register an inflight entry so a concurrent handleRemove for
+	// this ContainerID can cancel the goroutine and wait for it to
+	// exit before doing its unlink walk.
+	pendingCtx, cancel := context.WithCancel(ctx)
+	pending := &pendingDeferredMatch{
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+
+	// runc reuses container IDs across builds (rare but possible). If a
+	// previous deferred match for the same ID is still in flight, cancel
+	// it before replacing — leaving two goroutines racing for the same
+	// ContainerID would re-introduce the leak we're trying to fix.
+	if prev, loaded := j.inflight.Swap(evt.ContainerID, pending); loaded {
+		pp := prev.(*pendingDeferredMatch)
+		pp.cancel()
+		<-pp.done
+	}
+
+	go func() {
+		defer close(pending.done)
+		defer j.inflight.CompareAndDelete(evt.ContainerID, pending)
+
+		j.deferredMatch(pendingCtx, cgroupID, evt)
+	}()
 }
 
 // tryMatch performs one read-procs + read-cmdline + match-pending
-// attempt. Returns true if a binding was linked (success), false on
-// any miss (procs empty, cmdline unreadable, no pending vertex).
-// The deferred loop calls this on each tick.
-func (j *CgroupJoiner) tryMatch(cgroupID uint64, evt CgroupCreateEvent) bool {
+// attempt. Returns true if a binding was linked (success) OR if ctx
+// has been cancelled by a remove fired during the retry window — in
+// either case the caller's retry loop should stop. Returns false on a
+// real miss (procs empty, cmdline unreadable, no pending vertex), so
+// the retry loop keeps trying.
+func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt CgroupCreateEvent) bool {
 	pid, err := readFirstPID(evt.CgroupPath)
 	if err != nil {
 		return false
@@ -234,6 +276,14 @@ func (j *CgroupJoiner) tryMatch(cgroupID uint64, evt CgroupCreateEvent) bool {
 
 	pending := j.registry.PendingVertices()
 	matches := matchPendingByCmdline(pending, cmdline)
+
+	// Final check just before committing: if a remove event for this
+	// container fired during the retry window, ctx is now cancelled and
+	// we must NOT write a binding. handleRemove will have run its
+	// unlink walk against an empty index — no second sweep needed.
+	if len(matches) > 0 && ctx.Err() != nil {
+		return true
+	}
 
 	switch len(matches) {
 	case 0:
@@ -312,7 +362,7 @@ func (j *CgroupJoiner) deferredMatch(ctx context.Context, cgroupID uint64, evt C
 		case <-tick.C:
 		}
 
-		if j.tryMatch(cgroupID, evt) {
+		if j.tryMatch(ctx, cgroupID, evt) {
 			return
 		}
 
@@ -329,6 +379,18 @@ func (j *CgroupJoiner) deferredMatch(ctx context.Context, cgroupID uint64, evt C
 }
 
 func (j *CgroupJoiner) handleRemove(evt CgroupRemoveEvent) {
+	// First, cancel any in-flight deferred match for this container
+	// and wait for it to exit. Without this, a goroutine that wins
+	// its retry race AFTER we walk the index below would resurrect a
+	// binding for a runc container that's already gone — the remove
+	// event would never fire again, so the stale binding would
+	// persist until process exit.
+	if v, ok := j.inflight.LoadAndDelete(evt.ContainerID); ok {
+		pending := v.(*pendingDeferredMatch)
+		pending.cancel()
+		<-pending.done
+	}
+
 	// Resolve the cgroup id by walking the index — the path's
 	// inode is already gone by the time the remove event fires,
 	// so a fresh stat would either fail or return a recycled

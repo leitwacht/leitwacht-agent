@@ -167,11 +167,21 @@ type Enforcer struct {
 	pid    int
 	logger *slog.Logger
 
-	ctx            *NetnsContext // back-ref to shared netns context
-	cgroupLink     CgroupLink    // this container's cgroup attachment
-	cgroupID       uint64        // for attribution + cgroupRecorders key
-	recorder       *ViolationRecorder
-	dnsPIDCgroupID uint64 // cgroup ID registered with DNS PID tracker (0 = not registered)
+	ctx        *NetnsContext // back-ref to shared netns context
+	cgroupLink CgroupLink    // this container's cgroup attachment
+	cgroupID   uint64        // for attribution + cgroupRecorders key
+	recorder   *ViolationRecorder
+
+	// sockAttrCgroupIDs are the cgroup_ids registered with the LSM
+	// sock_attr filter. Includes the BPF attach point's inode plus
+	// any stripped /init leaf (Docker systemd-driver containers
+	// report leaf cgroup_id via bpf_get_current_cgroup_id() rather
+	// than the attach point's inode, so both must be admitted).
+	sockAttrCgroupIDs []uint64
+
+	// dnsPIDCgroupIDs are the cgroup_ids registered with the DNS
+	// PID tracker. Same shape and same reason as sockAttrCgroupIDs.
+	dnsPIDCgroupIDs []uint64
 
 	// Per-container packet bucket flush goroutine.
 	packetFlushCancel context.CancelFunc
@@ -817,6 +827,12 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 		}
 	}
 
+	// Remember the original (leaf) path before scope-stripping so we
+	// can register its cgroup_id in the LSM and DNS-PID maps. Both
+	// BPF programs read bpf_get_current_cgroup_id() which returns
+	// the leaf, not the attach point — admitting only the scope id
+	// would miss the main process's own events.
+	originalCgroupPath := cgroupPath
 	cgroupPath = containerScopeCgroup(cgroupPath)
 
 	info.Action = pol.Action
@@ -861,38 +877,73 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 	nctx.refcount++
 	m.mu.Unlock()
 
-	// Register cgroup with DNS PID tracker.
-	var dnsPIDCgroupID uint64
-
-	if m.dnsPIDTracker != nil {
-		addedID, addErr := m.dnsPIDTracker.AddCgroup(cgroupPath)
-		if addErr != nil {
-			m.logger.Warn("dns pid tracker: failed to add cgroup", "error", addErr)
-		} else {
-			dnsPIDCgroupID = addedID
-		}
+	// Cgroup IDs to register in the LSM + DNS-PID BPF maps. Always
+	// includes the BPF attach point (scope) inode. When scope-stripping
+	// was applied we also add the original /init leaf so the main
+	// process's own events pass both gates (it reports leaf cgroup_id
+	// from the kernel, not the attach point's).
+	relevantPaths := []string{cgroupPath}
+	if originalCgroupPath != cgroupPath {
+		relevantPaths = append(relevantPaths, originalCgroupPath)
 	}
 
-	// Register cgroup with sock_attr LSM filter so its sockets populate
-	// sk_storage. No-op when LSM attach failed at agent startup (degraded
-	// mode — egress falls back to bpf_get_current_* for attribution).
-	sockAttrErr := nctx.ebpf.AddSockKnownCgroup(cgID)
-	if sockAttrErr != nil {
-		m.logger.Warn("sock_attr: failed to register cgroup",
-			"cgroup_id", cgID, "error", sockAttrErr)
+	var (
+		dnsPIDCgroupIDs   []uint64
+		sockAttrCgroupIDs []uint64
+	)
+
+	for _, p := range relevantPaths {
+		// Register cgroup with DNS PID tracker.
+		if m.dnsPIDTracker != nil {
+			addedID, addErr := m.dnsPIDTracker.AddCgroup(p)
+			if addErr != nil {
+				m.logger.Warn("dns pid tracker: failed to add cgroup", "path", p, "error", addErr)
+			} else {
+				dnsPIDCgroupIDs = append(dnsPIDCgroupIDs, addedID)
+			}
+		}
+
+		// Register cgroup with sock_attr LSM filter so its sockets
+		// populate sk_storage. No-op when LSM attach failed at agent
+		// startup (degraded mode — egress falls back to
+		// bpf_get_current_* for attribution).
+		pathID := cgID
+
+		if p != cgroupPath {
+			pid, idErr := m.platform.CgroupID(p)
+			if idErr != nil {
+				m.logger.Warn("sock_attr: failed to stat leaf cgroup",
+					"path", p, "error", idErr)
+
+				continue
+			}
+
+			pathID = pid
+		}
+
+		sockAttrErr := nctx.ebpf.AddSockKnownCgroup(pathID)
+		if sockAttrErr != nil {
+			m.logger.Warn("sock_attr: failed to register cgroup",
+				"cgroup_id", pathID, "error", sockAttrErr)
+
+			continue
+		}
+
+		sockAttrCgroupIDs = append(sockAttrCgroupIDs, pathID)
 	}
 
 	e := &Enforcer{
-		info:           info,
-		policy:         pol,
-		cgroup:         cgroupPath,
-		pid:            pid,
-		logger:         m.logger.With("container_id", info.ContainerID[:12]),
-		ctx:            nctx,
-		cgroupLink:     cgroupLink,
-		cgroupID:       cgID,
-		recorder:       recorder,
-		dnsPIDCgroupID: dnsPIDCgroupID,
+		info:              info,
+		policy:            pol,
+		cgroup:            cgroupPath,
+		pid:               pid,
+		logger:            m.logger.With("container_id", info.ContainerID[:12]),
+		ctx:               nctx,
+		cgroupLink:        cgroupLink,
+		cgroupID:          cgID,
+		recorder:          recorder,
+		sockAttrCgroupIDs: sockAttrCgroupIDs,
+		dnsPIDCgroupIDs:   dnsPIDCgroupIDs,
 	}
 
 	// attach_path: ground-truth signal for "are we doing single pod-level
@@ -1385,16 +1436,21 @@ func (m *Manager) Detach(containerID string) *DetachResult {
 	delete(nctx.pids, containerID)
 	nctx.mu.Unlock()
 
-	// Remove cgroup from DNS PID tracker.
-	if m.dnsPIDTracker != nil && e.dnsPIDCgroupID != 0 {
-		m.dnsPIDTracker.RemoveCgroup(e.dnsPIDCgroupID)
+	// Remove cgroups from DNS PID tracker (scope + any leaf
+	// registered alongside it during scope-stripping).
+	if m.dnsPIDTracker != nil {
+		for _, id := range e.dnsPIDCgroupIDs {
+			m.dnsPIDTracker.RemoveCgroup(id)
+		}
 	}
 
-	// Remove cgroup from sock_attr LSM filter. Existing sk_storage
-	// entries for that cgroup's sockets stay valid until the kernel
+	// Remove cgroups from sock_attr LSM filter. Existing sk_storage
+	// entries for those cgroups' sockets stay valid until the kernel
 	// destroys each socket — the filter just stops accepting new
 	// captures.
-	nctx.ebpf.RemoveSockKnownCgroup(e.cgroupID)
+	for _, id := range e.sockAttrCgroupIDs {
+		nctx.ebpf.RemoveSockKnownCgroup(id)
+	}
 
 	if teardown {
 		// Last container in the pod — tear down the shared context.

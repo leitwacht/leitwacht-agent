@@ -84,10 +84,10 @@ func Load() (*Config, error) {
 		// must point this at their own resolver — typically the kube-
 		// dns ClusterIP on K8s or the host's recursive resolver on
 		// bare metal.
-		DNSUpstream:  os.Getenv("LEITWACHT_CE_DNS_UPSTREAM"),
-		TrustedCIDRs: os.Getenv("LEITWACHT_CE_TRUSTED_CIDRS"),
-		HoneypotDir:  envOr("LEITWACHT_CE_HONEYPOT_DIR", "/var/lib/leitwacht/honeypot"),
-		PromAddr:     envOr("LEITWACHT_CE_PROM_ADDR", ":9090"),
+		DNSUpstream:         os.Getenv("LEITWACHT_CE_DNS_UPSTREAM"),
+		TrustedCIDRs:        os.Getenv("LEITWACHT_CE_TRUSTED_CIDRS"),
+		HoneypotDir:         envOr("LEITWACHT_CE_HONEYPOT_DIR", "/var/lib/leitwacht/honeypot"),
+		PromAddr:            envOr("LEITWACHT_CE_PROM_ADDR", ":9090"),
 		WebhookURL:          os.Getenv("LEITWACHT_CE_WEBHOOK_URL"),
 		WebhookAuth:         os.Getenv("LEITWACHT_CE_WEBHOOK_AUTH"),
 		BuildkitGRPCAddr:    os.Getenv("LEITWACHT_CE_BUILDKIT_GRPC_ADDR"),

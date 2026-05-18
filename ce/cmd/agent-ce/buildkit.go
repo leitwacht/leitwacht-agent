@@ -5,6 +5,8 @@ package main
 import (
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -60,7 +62,8 @@ func startBuildKitAttribution(ctx context.Context, cfg *config.Config, log *slog
 	// fine, because no cgroup bindings exist yet anyway.
 	enforcer.SetBuildKitLookup(registry.LookupByCgroupID)
 
-	cgroupPaths := splitTrim(cfg.BuildkitCgroupPaths, ",")
+	rawPatterns := splitTrim(cfg.BuildkitCgroupPaths, ",")
+	cgroupPaths := expandCgroupGlobs(rawPatterns, log)
 	if len(cgroupPaths) > 0 {
 		source := enforcer.NewInotifyCgroupSource(cgroupPaths)
 		joiner := enforcer.NewCgroupJoiner(registry, source, log)
@@ -74,7 +77,13 @@ func startBuildKitAttribution(ctx context.Context, cfg *config.Config, log *slog
 
 		log.Info("buildkit attribution active",
 			"grpc_addr", cfg.BuildkitGRPCAddr,
-			"cgroup_paths", strings.Join(cgroupPaths, ","),
+			"cgroup_patterns", strings.Join(rawPatterns, ","),
+			"cgroup_paths_resolved", strings.Join(cgroupPaths, ","),
+		)
+	} else if len(rawPatterns) > 0 {
+		log.Warn("buildkit attribution: cgroup patterns supplied but no paths matched; cgroup-join disabled",
+			"grpc_addr", cfg.BuildkitGRPCAddr,
+			"cgroup_patterns", strings.Join(rawPatterns, ","),
 		)
 	} else {
 		log.Warn("buildkit attribution active without cgroup-join "+
@@ -84,4 +93,78 @@ func startBuildKitAttribution(ctx context.Context, cfg *config.Config, log *slog
 			"grpc_addr", cfg.BuildkitGRPCAddr,
 		)
 	}
+}
+
+// expandCgroupGlobs walks each configured cgroup pattern and resolves
+// it to concrete paths via filepath.Glob, deduplicating the result.
+// Plain (non-glob) paths flow through unchanged when they exist; a
+// non-existent plain path is logged at WARN but otherwise dropped.
+// Glob patterns that match zero paths log at WARN (operators tend to
+// notice "no buildkitd seen yet" better than a silent skip).
+//
+// Operators in K8s pass shapes like:
+//
+//	/sys/fs/cgroup/kubepods.slice/**/buildkit
+//	/sys/fs/cgroup/system.slice/docker-*.scope/buildkit
+//
+// The Go stdlib glob supports `*` per path component but not the
+// `**` operator. We approximate `**` by treating it as `*` per
+// component during pattern walk: callers that want deep wildcards
+// should write a `*` per directory level (e.g.,
+// `kubepods.slice/*/*/buildkit`) or use a wrapper that pre-expands.
+func expandCgroupGlobs(patterns []string, log *slog.Logger) []string {
+	if len(patterns) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(patterns))
+	out := make([]string, 0, len(patterns))
+
+	for _, p := range patterns {
+		if !strings.ContainsAny(p, "*?[") {
+			info, err := os.Stat(p)
+			if err != nil || !info.IsDir() {
+				log.Warn("buildkit cgroup path missing or not a directory; skipping",
+					"path", p, "error", err)
+
+				continue
+			}
+
+			if _, dup := seen[p]; !dup {
+				seen[p] = struct{}{}
+				out = append(out, p)
+			}
+
+			continue
+		}
+
+		matches, err := filepath.Glob(p)
+		if err != nil {
+			log.Warn("buildkit cgroup glob is malformed; skipping",
+				"pattern", p, "error", err)
+
+			continue
+		}
+
+		if len(matches) == 0 {
+			log.Warn("buildkit cgroup glob matched zero paths",
+				"pattern", p)
+
+			continue
+		}
+
+		for _, m := range matches {
+			info, err := os.Stat(m)
+			if err != nil || !info.IsDir() {
+				continue
+			}
+
+			if _, dup := seen[m]; !dup {
+				seen[m] = struct{}{}
+				out = append(out, m)
+			}
+		}
+	}
+
+	return out
 }

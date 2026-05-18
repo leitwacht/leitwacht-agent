@@ -97,6 +97,31 @@ start_agent() {
       fail "agent exited before /healthz responded"
     fi
   done
+
+  # /healthz is up well before the docker-events subscription is live
+  # (cold eBPF load + recovery of any existing managed containers can
+  # add ~300-500ms between healthz-ready and event-stream-subscribed).
+  # Cases that `docker run` immediately after this returns race the
+  # event stream and miss the new container — observed flake on the
+  # scope_label case when an unrelated managed=true container was
+  # already running at agent start. Wait for the explicit marker
+  # logged just before the agent enters its event loop.
+  n=0
+  until grep -q '"starting container event stream"' "$AGENT_LOG" 2>/dev/null; do
+    sleep 0.1
+    n=$((n+1))
+    if (( n > 100 )); then
+      log "agent /healthz up but event stream never subscribed; tail of log:"
+      tail -n 40 "$AGENT_LOG" >&2 || true
+      fail "agent event stream timeout"
+    fi
+    if ! kill -0 "$AGENT_PID" 2>/dev/null; then
+      log "agent died after /healthz but before event stream subscribed; full log:"
+      cat "$AGENT_LOG" >&2 || true
+      fail "agent exited before event stream subscribed"
+    fi
+  done
+
   log "agent ready (pid=$AGENT_PID)"
 }
 

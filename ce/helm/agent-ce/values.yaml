@@ -118,6 +118,46 @@ eventBuffer: 64
 netnsGrace: 30s
 bucketInterval: 5m
 
+# BuildKit step attribution.
+#
+# When grpcAddr is set, the agent subscribes to a buildkitd Control
+# gRPC endpoint and stamps each egress event with the BuildKit
+# session ref + vertex digest + Dockerfile RUN string. Per-row CI
+# routing requires the CI runner to inject
+# `--build-arg LEITWACHT_CI_*=...` at buildx invocation time — see
+# docs/BUILDKIT_PERSISTENT_K8S.md for the full setup.
+#
+# Empty grpcAddr disables the whole subsystem; the agent behaves
+# exactly as it did before BuildKit attribution existed.
+buildkit:
+  # buildkitd Control gRPC address (tcp://host:port or unix:///path).
+  # Make sure the buildkitd NetworkPolicy allows ingress on this
+  # port from the agent's namespace.
+  grpcAddr: ""
+
+  # Cgroup parent paths to watch for RUN-container creates. Glob
+  # patterns expand once at agent startup (one `*` per directory
+  # level — Go stdlib filepath.Glob shape, `**` is NOT supported).
+  # Typical K8s shape:
+  #   - /sys/fs/cgroup/kubepods.slice/*/*/buildkit
+  # Typical bare-metal Docker shape:
+  #   - /sys/fs/cgroup/system.slice/docker-*.scope/buildkit
+  cgroupPaths: []
+
+  # When true, refuse Solve sessions whose FrontendAttrs lack any
+  # of requiredAttrs. Refused sessions have their RUN cgroups
+  # SIGKILLed at runc-create via cgroup.kill. Roll out in two
+  # phases: start with false while wrapping pipelines, then flip
+  # to true once unattributed builds have stopped appearing in
+  # the metrics.
+  requireCIMetadata: false
+
+  # Plain CI env-var names (the agent adds the `build-arg:` prefix
+  # internally). The default — just project_path — is the minimum
+  # the server needs for routing.
+  requiredAttrs:
+    - LEITWACHT_CI_PROJECT_PATH
+
 # Logging.
 logLevel: info
 

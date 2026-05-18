@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+#
+# leitwacht-buildx — wrap `docker buildx build` and inject CI metadata
+# as build-args so the leitwacht egress agent can attribute each
+# Solve session to the correct CI job.
+#
+# Usage:
+#   leitwacht-buildx build [docker-buildx-build-args...]
+#
+# Non-build subcommands (`create`, `ls`, `inspect`, `rm`, ...) pass
+# through to `docker buildx` unchanged.
+#
+# Reads CI_PROJECT_PATH, CI_JOB_ID, CI_PIPELINE_ID, CI_JOB_NAME,
+# CI_JOB_STAGE, CI_COMMIT_REF_NAME, CI_JOB_URL, CI_PIPELINE_SOURCE
+# from the environment. Each non-empty value becomes a
+# --build-arg LEITWACHT_CI_<key>=<value>. Existing build-args on the
+# command line stay; if the caller already set a LEITWACHT_CI_*
+# build-arg, the caller's value wins.
+#
+# Drop into a CI build image:
+#
+#   curl -fsSL https://gitlab.com/leitwacht/leitwacht-agent/-/raw/main/tools/leitwacht-buildx \
+#     -o /usr/local/bin/leitwacht-buildx
+#   chmod +x /usr/local/bin/leitwacht-buildx
+#
+# See docs/BUILDKIT_PERSISTENT_K8S.md for the full deployment guide.
+
+set -euo pipefail
+
+# Pass-through for non-build subcommands.
+if [[ "${1:-}" != "build" ]]; then
+    exec docker buildx "$@"
+fi
+shift
+
+# Map CI env-var → build-arg key. Format: "<ci-env-var>:<build-arg-key>".
+# CI_COMMIT_REF_NAME maps to GIT_REF to keep the build-arg name
+# consistent with the violation field on the leitwacht side.
+mapping=(
+    CI_PROJECT_PATH:LEITWACHT_CI_PROJECT_PATH
+    CI_JOB_ID:LEITWACHT_CI_JOB_ID
+    CI_PIPELINE_ID:LEITWACHT_CI_PIPELINE_ID
+    CI_JOB_NAME:LEITWACHT_CI_JOB_NAME
+    CI_JOB_STAGE:LEITWACHT_CI_JOB_STAGE
+    CI_COMMIT_REF_NAME:LEITWACHT_CI_GIT_REF
+    CI_JOB_URL:LEITWACHT_CI_JOB_URL
+    CI_PIPELINE_SOURCE:LEITWACHT_CI_PIPELINE_SOURCE
+)
+
+inject=()
+for pair in "${mapping[@]}"; do
+    src="${pair%%:*}"
+    dst="${pair##*:}"
+    val="${!src:-}"
+
+    if [[ -n "$val" ]]; then
+        inject+=(--build-arg "$dst=$val")
+    fi
+done
+
+# User-supplied args come AFTER injected ones, so a caller-supplied
+# `--build-arg LEITWACHT_CI_PROJECT_PATH=...` overrides ours (BuildKit
+# keeps the last-set build-arg).
+exec docker buildx build "${inject[@]}" "$@"

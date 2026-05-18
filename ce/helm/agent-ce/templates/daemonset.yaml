@@ -113,6 +113,29 @@ spec:
               value: {{ .Values.bucketInterval | quote }}
             - name: LEITWACHT_CE_LOG_LEVEL
               value: {{ .Values.logLevel | quote }}
+            {{- with .Values.buildkit }}
+            {{- if .grpcAddr }}
+            # BuildKit attribution is gated on grpcAddr being set —
+            # without an address there's nothing to subscribe to, so
+            # every related env var is omitted (the agent's
+            # startBuildKitAttribution short-circuits on empty addr
+            # anyway, this just keeps the pod env clean).
+            - name: LEITWACHT_CE_BUILDKIT_GRPC_ADDR
+              value: {{ .grpcAddr | quote }}
+            {{- if .cgroupPaths }}
+            - name: LEITWACHT_CE_BUILDKIT_CGROUP_PATHS
+              value: {{ join "," .cgroupPaths | quote }}
+            {{- end }}
+            {{- if .requireCIMetadata }}
+            - name: LEITWACHT_CE_BUILDKIT_REQUIRE_CI_METADATA
+              value: "true"
+            {{- if .requiredAttrs }}
+            - name: LEITWACHT_CE_BUILDKIT_REQUIRED_ATTRS
+              value: {{ join "," .requiredAttrs | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             - name: HOSTNAME_OVERRIDE
               valueFrom:
                 fieldRef:

@@ -248,6 +248,14 @@ func (j *CgroupJoiner) tryMatch(cgroupID uint64, evt CgroupCreateEvent) bool {
 			FrontendAttrs: m.FrontendAttrs,
 		})
 
+		j.logger.Info("buildkit cgroup linked",
+			"cgroup_id", cgroupID,
+			"container_id", evt.ContainerID,
+			"session_ref", m.SessionRef,
+			"vertex_digest", m.VertexDigest,
+			"vertex_name", m.VertexName,
+		)
+
 		return true
 	default:
 		// Tiebreaker: environ. Read /proc/<pid>/environ and pick

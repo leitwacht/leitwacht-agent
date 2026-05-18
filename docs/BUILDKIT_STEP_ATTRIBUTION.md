@@ -166,12 +166,12 @@ field.
 
 ### Deployment changes
 
-The current `buildkitd-cerberus-iot` NetworkPolicy blocks ingress
-except from the gitlab-runner namespace. Two options:
+A typical buildkitd Deployment NetworkPolicy blocks ingress except
+from the gitlab-runner namespace. Two options:
 
 1. **Widen the NetworkPolicy** to also allow ingress from the
-   leitwacht-agent namespace (recommended; one-line change in
-   `scholtz-k8s-gitops`).
+   leitwacht-agent namespace (recommended; one-line change in the
+   operator's gitops repo).
 2. **Run the BuildKit watcher as a sidecar** in the buildkitd pod
    itself. Lower attack surface (no widened NetworkPolicy) but
    couples agent and buildkitd pod lifecycles.
@@ -255,7 +255,7 @@ when ambiguous) — best resolved by trying it and iterating.
 - New agent config keys: `BUILDKIT_GRPC_ADDR`,
   `BUILDKIT_GRPC_TLS_CA_FILE` (optional, for hardened deployments).
 - Helm chart values for both agent and EE server.
-- NetworkPolicy update in `scholtz-k8s-gitops`.
+- NetworkPolicy update in the operator's gitops repo.
 - `docs/EVENT_FLOW.md` updated.
 - New page in landing-page docs: "BuildKit step attribution".
 

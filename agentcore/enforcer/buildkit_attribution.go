@@ -93,7 +93,7 @@ type AmbiguousCandidate struct {
 }
 
 // Reserved FrontendAttrs build-arg keys the agent reads to override
-// per-row CI fields. The customer's CI runner passes these via
+// per-row CI fields. The CI runner passes these via
 // `docker buildx build --build-arg LEITWACHT_CI_PROJECT_PATH=...` so
 // the agent can attribute each Solve session to its CI job rather
 // than to the (shared) buildkitd container's own labels. BuildKit

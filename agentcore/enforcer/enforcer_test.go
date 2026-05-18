@@ -211,6 +211,47 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError}))
 }
 
+func TestContainerScopeCgroup(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{
+			name: "docker systemd driver strips /init",
+			in:   "/sys/fs/cgroup/system.slice/docker-abc.scope/init",
+			want: "/sys/fs/cgroup/system.slice/docker-abc.scope",
+		},
+		{
+			name: "containerd leaf is unchanged",
+			in:   "/sys/fs/cgroup/system.slice/containerd.service/kubepods/pod-x/container-y",
+			want: "/sys/fs/cgroup/system.slice/containerd.service/kubepods/pod-x/container-y",
+		},
+		{
+			name: "k8s leaf is unchanged",
+			in:   "/sys/fs/cgroup/kubepods/besteffort/pod-x/container-y",
+			want: "/sys/fs/cgroup/kubepods/besteffort/pod-x/container-y",
+		},
+		{
+			name: "root /init is preserved (no walk-up to empty)",
+			in:   "/init",
+			want: "/init",
+		},
+		{
+			name: "init in middle of path is unaffected",
+			in:   "/sys/fs/cgroup/init.scope/foo",
+			want: "/sys/fs/cgroup/init.scope/foo",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := containerScopeCgroup(tc.in)
+			if got != tc.want {
+				t.Errorf("containerScopeCgroup(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestAttachDetachHappyPath(t *testing.T) {
 	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
 	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})

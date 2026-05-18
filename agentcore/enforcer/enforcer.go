@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +17,31 @@ import (
 // agentMark is the fwmark set on the proxy's upstream DNS sockets
 // (via SO_MARK) so nftables can skip redirect for those packets.
 const agentMark = 0x5E17
+
+// containerScopeCgroup adjusts a process-cgroup path so the BPF
+// program attaches at the container's outer scope rather than at an
+// inner /init sub-cgroup.
+//
+// Docker with the systemd cgroup driver on cgroup v2 places the
+// container's main PID in .../docker-<id>.scope/init/. Any sub-cgroup
+// the container creates internally (e.g., buildkitd's per-RUN runc
+// cgroup at .scope/buildkit/<id>/) is a SIBLING of /init, not a
+// descendant. BPF cgroup_skb programs attached to /init therefore
+// never see those sub-cgroups' egress.
+//
+// Walking up to the scope itself lets cgroup-v2's hierarchical BPF
+// inheritance reach every sub-cgroup the container creates. For
+// container runtimes that don't use a /init sub-cgroup (containerd
+// on cgroup v2, kubepods, rootless modes) the path is unchanged.
+func containerScopeCgroup(cgroupPath string) string {
+	const initSuffix = "/init"
+
+	if strings.HasSuffix(cgroupPath, initSuffix) && len(cgroupPath) > len(initSuffix) {
+		return cgroupPath[:len(cgroupPath)-len(initSuffix)]
+	}
+
+	return cgroupPath
+}
 
 var (
 	// ErrNetnsInodeZero is returned when the netns inode resolves to zero.
@@ -790,6 +816,8 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 			return nil, fmt.Errorf("get cgroup path: %w", err)
 		}
 	}
+
+	cgroupPath = containerScopeCgroup(cgroupPath)
 
 	info.Action = pol.Action
 	info.StartedAt = time.Now()

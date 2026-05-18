@@ -82,6 +82,46 @@ type AmbiguousCandidate struct {
 	VertexName   string
 }
 
+// Reserved FrontendAttrs build-arg keys the agent reads to override
+// per-row CI fields. The customer's CI runner passes these via
+// `docker buildx build --build-arg LEITWACHT_CI_PROJECT_PATH=...` so
+// the agent can attribute each Solve session to its CI job rather
+// than to the (shared) buildkitd container's own labels. BuildKit
+// prefixes build-args with "build-arg:" in the FrontendAttrs map.
+const (
+	frontendAttrBuildArgPrefix = "build-arg:"
+
+	FrontendAttrKeyProjectPath = frontendAttrBuildArgPrefix + "LEITWACHT_CI_PROJECT_PATH"
+	FrontendAttrKeyJobID       = frontendAttrBuildArgPrefix + "LEITWACHT_CI_JOB_ID"
+	FrontendAttrKeyPipelineID  = frontendAttrBuildArgPrefix + "LEITWACHT_CI_PIPELINE_ID"
+	FrontendAttrKeyJobName     = frontendAttrBuildArgPrefix + "LEITWACHT_CI_JOB_NAME"
+	FrontendAttrKeyJobStage    = frontendAttrBuildArgPrefix + "LEITWACHT_CI_JOB_STAGE"
+	FrontendAttrKeyGitRef      = frontendAttrBuildArgPrefix + "LEITWACHT_CI_GIT_REF"
+	FrontendAttrKeyJobURL      = frontendAttrBuildArgPrefix + "LEITWACHT_CI_JOB_URL"
+)
+
+// CIOverrideFromFrontendAttrs extracts the per-row CI override fields
+// the agent stamps onto egress violations. Returns zero values when
+// the attrs map carries none of the reserved keys; callers should
+// branch on whether any field is non-empty to decide if an override
+// applies. Cheap: 7 map lookups; called per egress event on the
+// BuildKit-attributed hot path.
+func CIOverrideFromFrontendAttrs(attrs map[string]string) (projectPath, jobID, pipelineID, jobName, jobStage, gitRef, jobURL string) {
+	if len(attrs) == 0 {
+		return
+	}
+
+	projectPath = attrs[FrontendAttrKeyProjectPath]
+	jobID = attrs[FrontendAttrKeyJobID]
+	pipelineID = attrs[FrontendAttrKeyPipelineID]
+	jobName = attrs[FrontendAttrKeyJobName]
+	jobStage = attrs[FrontendAttrKeyJobStage]
+	gitRef = attrs[FrontendAttrKeyGitRef]
+	jobURL = attrs[FrontendAttrKeyJobURL]
+
+	return
+}
+
 // buildKitLookup is the hot-path cgroup-to-binding hook called by
 // the eBPF event handler on every egress packet. The no-op default
 // keeps non-BuildKit deployments cost-free; the SessionRegistry's

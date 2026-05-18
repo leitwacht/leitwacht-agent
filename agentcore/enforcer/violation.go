@@ -45,6 +45,21 @@ type Violation struct {
 	BuildVertexName          string               `json:"build_vertex_name,omitempty"`
 	BuildAmbiguous           bool                 `json:"build_ambiguous,omitempty"`
 	BuildAmbiguousCandidates []AmbiguousCandidate `json:"build_ambiguous_candidates,omitempty"`
+
+	// Per-row CI override fields, derived from the BuildKit session's
+	// FrontendAttrs (build-args prefixed LEITWACHT_CI_*). Populated
+	// at egress time when the binding's FrontendAttrs carry these
+	// keys. When a persistent buildkitd serves many CI jobs from one
+	// watched container, the report-level identity belongs to the
+	// buildkitd pod, not the individual job — these fields let each
+	// row attribute to its real CI job at the server.
+	BuildProjectPath string `json:"build_project_path,omitempty"`
+	BuildJobID       string `json:"build_job_id,omitempty"`
+	BuildPipelineID  string `json:"build_pipeline_id,omitempty"`
+	BuildJobName     string `json:"build_job_name,omitempty"`
+	BuildJobStage    string `json:"build_job_stage,omitempty"`
+	BuildGitRef      string `json:"build_git_ref,omitempty"`
+	BuildJobURL      string `json:"build_job_url,omitempty"`
 }
 
 // DNSActivityEntry tracks DNS queries bucketed by (domain, query_type)

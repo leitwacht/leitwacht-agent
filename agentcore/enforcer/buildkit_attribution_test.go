@@ -501,6 +501,63 @@ func TestLookupBuildKitBinding_WiresThroughRegistry(t *testing.T) {
 	}
 }
 
+func TestCIOverrideFromFrontendAttrs(t *testing.T) {
+	t.Run("empty attrs return zero values", func(t *testing.T) {
+		p, j, pi, n, s, g, u := CIOverrideFromFrontendAttrs(nil)
+		if p != "" || j != "" || pi != "" || n != "" || s != "" || g != "" || u != "" {
+			t.Errorf("got non-zero values from nil attrs")
+		}
+	})
+
+	t.Run("non-CI attrs return zero values", func(t *testing.T) {
+		attrs := map[string]string{
+			"build-arg:HTTP_PROXY": "proxy.example.com",
+			"target":               "build",
+			"filename":             "Dockerfile",
+		}
+		p, j, _, _, _, _, _ := CIOverrideFromFrontendAttrs(attrs)
+		if p != "" || j != "" {
+			t.Errorf("got CI fields from unrelated attrs")
+		}
+	})
+
+	t.Run("LEITWACHT_CI_* attrs project through", func(t *testing.T) {
+		attrs := map[string]string{
+			"build-arg:LEITWACHT_CI_PROJECT_PATH": "team/alpha",
+			"build-arg:LEITWACHT_CI_JOB_ID":       "1001",
+			"build-arg:LEITWACHT_CI_PIPELINE_ID":  "pl-1001",
+			"build-arg:LEITWACHT_CI_JOB_NAME":     "build-alpha",
+			"build-arg:LEITWACHT_CI_JOB_STAGE":    "build",
+			"build-arg:LEITWACHT_CI_GIT_REF":      "refs/heads/main",
+			"build-arg:LEITWACHT_CI_JOB_URL":      "https://example.gitlab/team/alpha/-/jobs/1001",
+			"build-arg:OTHER_VAR":                 "ignored",
+		}
+
+		p, j, pi, n, s, g, u := CIOverrideFromFrontendAttrs(attrs)
+		if p != "team/alpha" {
+			t.Errorf("project_path = %q", p)
+		}
+		if j != "1001" {
+			t.Errorf("job_id = %q", j)
+		}
+		if pi != "pl-1001" {
+			t.Errorf("pipeline_id = %q", pi)
+		}
+		if n != "build-alpha" {
+			t.Errorf("job_name = %q", n)
+		}
+		if s != "build" {
+			t.Errorf("job_stage = %q", s)
+		}
+		if g != "refs/heads/main" {
+			t.Errorf("git_ref = %q", g)
+		}
+		if u != "https://example.gitlab/team/alpha/-/jobs/1001" {
+			t.Errorf("job_url = %q", u)
+		}
+	})
+}
+
 // TestBuildKitAttribution_FullChain composes every agent-side component
 // in one in-process test: fake BuildKit Control gRPC → AttributionWatcher
 // (Phase 1) → SessionRegistry → LinkCgroup (Phase 2 join layer) →

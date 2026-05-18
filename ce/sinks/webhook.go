@@ -208,4 +208,3 @@ func (w *Webhook) post(body any) {
 		return
 	}
 }
-

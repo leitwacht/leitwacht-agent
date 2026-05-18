@@ -519,10 +519,10 @@ func waitFor(t *testing.T, timeout time.Duration, pred func() bool) {
 
 func TestStripScheme(t *testing.T) {
 	cases := map[string]string{
-		"tcp://host:1234":   "host:1234",
+		"tcp://host:1234":    "host:1234",
 		"unix:///run/x.sock": "unix:/run/x.sock",
-		"host:1234":         "host:1234",
-		"unix:/run/x.sock":  "unix:/run/x.sock",
+		"host:1234":          "host:1234",
+		"unix:/run/x.sock":   "unix:/run/x.sock",
 	}
 
 	for in, want := range cases {

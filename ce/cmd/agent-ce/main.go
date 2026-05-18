@@ -111,6 +111,13 @@ func main() {
 	}
 	log.Info("enforcer ready", "honeypot_lsm", mgr.LSMLoaded(), "max_concurrent", cfg.MaxConcurrentEnf)
 
+	// BuildKit step attribution. No-op when LEITWACHT_CE_BUILDKIT_GRPC_ADDR
+	// is empty (the default): the enforcer's egress path still calls
+	// LookupBuildKitBinding on every event, but the default hook
+	// returns (zero, false) so violations are emitted without build
+	// step fields — i.e., unchanged from pre-BuildKit behaviour.
+	startBuildKitAttribution(ctx, cfg, log)
+
 	// Watcher.
 	w, err := newWatcher(cfg, log)
 	if err != nil {

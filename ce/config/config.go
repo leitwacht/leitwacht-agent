@@ -48,6 +48,17 @@ type Config struct {
 	WebhookAuth    string // "Bearer ..." passed verbatim if non-empty
 	WebhookTimeout time.Duration
 
+	// BuildKit step attribution. Optional — empty BuildkitGRPCAddr
+	// disables the whole subsystem and the agent behaves exactly
+	// as it did before BuildKit attribution existed. When set, the
+	// agent subscribes to the buildkitd Control gRPC for build
+	// session/vertex metadata. BuildkitCgroupPaths is the
+	// comma-separated list of cgroup-parent directories to watch
+	// for RUN-container creates — usually the host-side path of
+	// buildkitd's per-build cgroup tree.
+	BuildkitGRPCAddr    string
+	BuildkitCgroupPaths string
+
 	// Logging.
 	LogLevel string
 }
@@ -77,9 +88,11 @@ func Load() (*Config, error) {
 		TrustedCIDRs: os.Getenv("LEITWACHT_CE_TRUSTED_CIDRS"),
 		HoneypotDir:  envOr("LEITWACHT_CE_HONEYPOT_DIR", "/var/lib/leitwacht/honeypot"),
 		PromAddr:     envOr("LEITWACHT_CE_PROM_ADDR", ":9090"),
-		WebhookURL:   os.Getenv("LEITWACHT_CE_WEBHOOK_URL"),
-		WebhookAuth:  os.Getenv("LEITWACHT_CE_WEBHOOK_AUTH"),
-		LogLevel:     envOr("LEITWACHT_CE_LOG_LEVEL", "info"),
+		WebhookURL:          os.Getenv("LEITWACHT_CE_WEBHOOK_URL"),
+		WebhookAuth:         os.Getenv("LEITWACHT_CE_WEBHOOK_AUTH"),
+		BuildkitGRPCAddr:    os.Getenv("LEITWACHT_CE_BUILDKIT_GRPC_ADDR"),
+		BuildkitCgroupPaths: os.Getenv("LEITWACHT_CE_BUILDKIT_CGROUP_PATHS"),
+		LogLevel:            envOr("LEITWACHT_CE_LOG_LEVEL", "info"),
 	}
 
 	var err error

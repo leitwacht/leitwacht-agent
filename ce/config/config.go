@@ -55,9 +55,30 @@ type Config struct {
 	// session/vertex metadata. BuildkitCgroupPaths is the
 	// comma-separated list of cgroup-parent directories to watch
 	// for RUN-container creates — usually the host-side path of
-	// buildkitd's per-build cgroup tree.
+	// buildkitd's per-build cgroup tree. Glob patterns are
+	// expanded at startup (one `*` per directory level).
 	BuildkitGRPCAddr    string
 	BuildkitCgroupPaths string
+
+	// BuildkitRequireCIMetadata, when true, makes the agent refuse
+	// any Solve session whose FrontendAttrs lack all of
+	// BuildkitRequiredAttrs. RUN cgroups linked to a refused session
+	// are SIGKILLed via cgroup.kill the moment they appear, so the
+	// build fails before any egress happens. Default false — back-
+	// compat. Recommended ON for the persistent K8s buildkitd
+	// pattern where every CI job is expected to inject CI metadata
+	// via --build-arg LEITWACHT_CI_*=...; turning this on prevents
+	// builds that skipped the metadata from running unattributed.
+	BuildkitRequireCIMetadata bool
+
+	// BuildkitRequiredAttrs is the comma-separated list of
+	// LEITWACHT_CI_* env keys a session's FrontendAttrs must carry
+	// to pass the kill-switch when BuildkitRequireCIMetadata=true.
+	// Empty means the default of "LEITWACHT_CI_PROJECT_PATH" — the
+	// minimum needed for server-side routing. Operators can require
+	// more (e.g., "LEITWACHT_CI_PROJECT_PATH,LEITWACHT_CI_JOB_ID")
+	// if they want stricter policy.
+	BuildkitRequiredAttrs string
 
 	// Logging.
 	LogLevel string
@@ -90,8 +111,9 @@ func Load() (*Config, error) {
 		PromAddr:            envOr("LEITWACHT_CE_PROM_ADDR", ":9090"),
 		WebhookURL:          os.Getenv("LEITWACHT_CE_WEBHOOK_URL"),
 		WebhookAuth:         os.Getenv("LEITWACHT_CE_WEBHOOK_AUTH"),
-		BuildkitGRPCAddr:    os.Getenv("LEITWACHT_CE_BUILDKIT_GRPC_ADDR"),
-		BuildkitCgroupPaths: os.Getenv("LEITWACHT_CE_BUILDKIT_CGROUP_PATHS"),
+		BuildkitGRPCAddr:      os.Getenv("LEITWACHT_CE_BUILDKIT_GRPC_ADDR"),
+		BuildkitCgroupPaths:   os.Getenv("LEITWACHT_CE_BUILDKIT_CGROUP_PATHS"),
+		BuildkitRequiredAttrs: os.Getenv("LEITWACHT_CE_BUILDKIT_REQUIRED_ATTRS"),
 		LogLevel:            envOr("LEITWACHT_CE_LOG_LEVEL", "info"),
 	}
 
@@ -110,6 +132,10 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	c.PromEnabled, err = envBool("LEITWACHT_CE_PROM_ENABLED", true)
+	if err != nil {
+		return nil, err
+	}
+	c.BuildkitRequireCIMetadata, err = envBool("LEITWACHT_CE_BUILDKIT_REQUIRE_CI_METADATA", false)
 	if err != nil {
 		return nil, err
 	}

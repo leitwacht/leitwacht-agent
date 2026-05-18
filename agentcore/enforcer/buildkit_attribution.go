@@ -51,6 +51,16 @@ type SessionRegistry struct {
 	// pushes, layer exports) that fires after the final vertex
 	// completes but before runc tears down the container.
 	completedTTL time.Duration
+
+	// requireCIMetadata, when true, marks a session as Unauthorized
+	// at RegisterSession time if any requiredAttrs key is missing
+	// from the session's FrontendAttrs. The cgroup-join layer kills
+	// (SIGKILL via cgroup.kill) RUN cgroups linked to unauthorized
+	// sessions before they can do any egress. When false (default)
+	// every session is authorized — back-compat for installations
+	// that haven't opted into hard policy enforcement yet.
+	requireCIMetadata bool
+	requiredAttrs     []string // FrontendAttrs keys, already prefixed (e.g. "build-arg:LEITWACHT_CI_PROJECT_PATH")
 }
 
 // CgroupBinding ties a kernel cgroup_id to the build session and
@@ -172,6 +182,13 @@ type SessionState struct {
 	FrontendAttrs map[string]string
 
 	Vertices map[string]*VertexState // keyed by digest
+
+	// Authorized is the kill-switch decision computed at
+	// RegisterSession time from the registry's require-CI-metadata
+	// policy. True when policy is disabled OR all required
+	// FrontendAttrs keys are present. False marks the session for
+	// cgroup-level termination by the join layer.
+	Authorized bool
 }
 
 // VertexState mirrors the fields the agent cares about from
@@ -278,6 +295,7 @@ func (r *SessionRegistry) PendingVertices() []PendingVertex {
 				VertexDigest:  v.Digest,
 				VertexName:    v.Name,
 				FrontendAttrs: cloneStringMap(s.FrontendAttrs),
+				Authorized:    s.Authorized,
 			})
 		}
 	}
@@ -286,13 +304,51 @@ func (r *SessionRegistry) PendingVertices() []PendingVertex {
 }
 
 // PendingVertex is the join-layer's view of an in-flight vertex.
-// Carries the human name (used for cmdline matching) and the
-// session's FrontendAttrs (used as the tiebreaker on collisions).
+// Carries the human name (used for cmdline matching), the session's
+// FrontendAttrs (used as the tiebreaker on collisions), and the
+// session's Authorized flag (kill-switch input for the join layer).
 type PendingVertex struct {
 	SessionRef    string
 	VertexDigest  string
 	VertexName    string
 	FrontendAttrs map[string]string
+	Authorized    bool
+}
+
+// SetCIRequirement configures the registry's kill-switch policy.
+// When require is true, sessions whose FrontendAttrs lack any of
+// requiredKeys (already FrontendAttrs-prefixed — typically
+// "build-arg:LEITWACHT_CI_PROJECT_PATH") are marked Unauthorized at
+// RegisterSession time; the cgroup-join layer then SIGKILLs their
+// RUN cgroups via cgroup.kill before any egress can happen. When
+// require is false (default), every session is authorized — no
+// behaviour change for installations that haven't opted in.
+//
+// Safe to call before AttributionWatcher.Run; should not be called
+// while sessions are actively being registered.
+func (r *SessionRegistry) SetCIRequirement(require bool, requiredKeys []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.requireCIMetadata = require
+	r.requiredAttrs = append([]string(nil), requiredKeys...) // defensive copy
+}
+
+// evaluateAuthorization checks whether the session's FrontendAttrs
+// satisfy the registry's require-CI-metadata policy. Returns true
+// when policy is disabled OR every required key has a non-empty
+// value in attrs. Caller must hold r.mu.
+func (r *SessionRegistry) evaluateAuthorization(attrs map[string]string) bool {
+	if !r.requireCIMetadata {
+		return true
+	}
+
+	for _, key := range r.requiredAttrs {
+		if attrs[key] == "" {
+			return false
+		}
+	}
+
+	return true
 }
 
 // RegisterSession records a STARTED event from ListenBuildHistory.
@@ -311,6 +367,7 @@ func (r *SessionRegistry) RegisterSession(ref string, startedAt time.Time, attrs
 		StartedAt:     startedAt,
 		FrontendAttrs: attrs,
 		Vertices:      make(map[string]*VertexState),
+		Authorized:    r.evaluateAuthorization(attrs),
 	}
 }
 
@@ -418,6 +475,7 @@ func (r *SessionRegistry) Snapshot() map[string]SessionState {
 			CompletedAt:   s.CompletedAt,
 			FrontendAttrs: cloneStringMap(s.FrontendAttrs),
 			Vertices:      make(map[string]*VertexState, len(s.Vertices)),
+			Authorized:    s.Authorized,
 		}
 
 		for digest, v := range s.Vertices {

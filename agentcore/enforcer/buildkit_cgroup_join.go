@@ -290,6 +290,32 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 		return false
 	case 1:
 		m := matches[0]
+
+		// Kill-switch: when the matched session was marked Unauthorized
+		// at register time (require-CI-metadata policy enabled and the
+		// session's FrontendAttrs lacked a required key), SIGKILL every
+		// process in this cgroup via cgroup.kill BEFORE writing a
+		// binding. The binding would be unused anyway since the runc
+		// child is about to die — and skipping LinkCgroup keeps the
+		// hot-path egress lookup miss-rate accurate to the kill
+		// (LookupBuildKitBinding stays empty for this cgroup, so any
+		// in-flight packet attributes as unattributed; the eBPF
+		// recorder's fallback handles it).
+		if !m.Authorized {
+			j.killCgroup(evt.CgroupPath)
+
+			j.logger.Warn("buildkit cgroup killed: session missing required CI attribution",
+				"cgroup_id", cgroupID,
+				"container_id", evt.ContainerID,
+				"cgroup_path", evt.CgroupPath,
+				"session_ref", m.SessionRef,
+				"vertex_digest", m.VertexDigest,
+				"vertex_name", m.VertexName,
+			)
+
+			return true
+		}
+
 		j.registry.LinkCgroup(cgroupID, CgroupBinding{
 			SessionRef:    m.SessionRef,
 			VertexDigest:  m.VertexDigest,
@@ -594,4 +620,29 @@ func candidatesFromMatches(matches []PendingVertex) []AmbiguousCandidate {
 	}
 
 	return out
+}
+
+// killCgroup SIGKILLs every process in the given cgroup directory by
+// writing "1" to its cgroup.kill file (cgroup v2). Used by the
+// kill-switch path when the cgroup is linked to an Unauthorized
+// session. Errors are logged at warn level but not propagated — a
+// missing cgroup.kill (cgroup v1, or a transient cgroup that was
+// removed between detection and kill) is a no-op; nothing we'd want
+// to retry.
+//
+// The cgroup.kill primitive is a single-write atomic operation: the
+// kernel signals every process in the cgroup AND every descendant
+// cgroup. No race with runc tearing down children; no leftover
+// processes. Requires write permission on the cgroup file (agent
+// runs as root → fine).
+func (j *CgroupJoiner) killCgroup(cgroupPath string) {
+	const killFile = "cgroup.kill"
+
+	err := os.WriteFile(filepath.Join(cgroupPath, killFile), []byte("1"), 0)
+	if err != nil {
+		j.logger.Warn("cgroup.kill write failed",
+			"path", cgroupPath,
+			"error", err,
+		)
+	}
 }

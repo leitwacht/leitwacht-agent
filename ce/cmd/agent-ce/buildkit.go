@@ -48,6 +48,15 @@ func startBuildKitAttribution(ctx context.Context, cfg *config.Config, log *slog
 
 	registry := enforcer.NewSessionRegistry(buildKitSessionTTL)
 
+	if cfg.BuildkitRequireCIMetadata {
+		required := resolveRequiredAttrs(cfg.BuildkitRequiredAttrs)
+		registry.SetCIRequirement(true, required)
+
+		log.Info("buildkit kill-switch active: refusing sessions without required CI metadata",
+			"required_attrs", strings.Join(required, ","),
+		)
+	}
+
 	watcher := enforcer.NewAttributionWatcher(cfg.BuildkitGRPCAddr, registry, log)
 
 	go func() {
@@ -93,6 +102,28 @@ func startBuildKitAttribution(ctx context.Context, cfg *config.Config, log *slog
 			"grpc_addr", cfg.BuildkitGRPCAddr,
 		)
 	}
+}
+
+// resolveRequiredAttrs turns the comma-separated
+// LEITWACHT_CE_BUILDKIT_REQUIRED_ATTRS env value into the
+// FrontendAttrs-prefixed key list the SessionRegistry expects.
+// Empty input falls back to the safe minimum (just project_path —
+// the routing key on the server). Keys are uppercased + trimmed and
+// the "build-arg:" prefix is added so callers pass plain names like
+// "LEITWACHT_CI_PROJECT_PATH".
+func resolveRequiredAttrs(raw string) []string {
+	plain := splitTrim(raw, ",")
+	if len(plain) == 0 {
+		plain = []string{"LEITWACHT_CI_PROJECT_PATH"}
+	}
+
+	out := make([]string, 0, len(plain))
+	for _, k := range plain {
+		k = strings.ToUpper(k)
+		out = append(out, "build-arg:"+k)
+	}
+
+	return out
 }
 
 // expandCgroupGlobs walks each configured cgroup pattern and resolves

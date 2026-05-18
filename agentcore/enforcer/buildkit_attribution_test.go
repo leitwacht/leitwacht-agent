@@ -3,6 +3,7 @@ package enforcer
 import (
 	"context"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,114 @@ import (
 )
 
 // ---------------- SessionRegistry pure-data tests ----------------
+
+func TestSessionRegistry_AuthorizationDefaultsTrue(t *testing.T) {
+	r := NewSessionRegistry(0)
+	r.RegisterSession("r1", time.Unix(1000, 0), nil)
+
+	snap := r.Snapshot()
+	if !snap["r1"].Authorized {
+		t.Fatal("default policy should mark every session Authorized")
+	}
+}
+
+func TestSessionRegistry_AuthorizationGateOnRequiredAttrs(t *testing.T) {
+	r := NewSessionRegistry(0)
+	r.SetCIRequirement(true, []string{
+		"build-arg:LEITWACHT_CI_PROJECT_PATH",
+		"build-arg:LEITWACHT_CI_JOB_ID",
+	})
+
+	cases := []struct {
+		name  string
+		attrs map[string]string
+		want  bool
+	}{
+		{
+			name: "all required keys present → authorized",
+			attrs: map[string]string{
+				"build-arg:LEITWACHT_CI_PROJECT_PATH": "team/alpha",
+				"build-arg:LEITWACHT_CI_JOB_ID":       "1001",
+				"build-arg:OTHER":                     "ignored",
+			},
+			want: true,
+		},
+		{
+			name: "missing project_path → unauthorized",
+			attrs: map[string]string{
+				"build-arg:LEITWACHT_CI_JOB_ID": "1001",
+			},
+			want: false,
+		},
+		{
+			name: "missing job_id → unauthorized",
+			attrs: map[string]string{
+				"build-arg:LEITWACHT_CI_PROJECT_PATH": "team/alpha",
+			},
+			want: false,
+		},
+		{
+			name: "empty value for required key → unauthorized",
+			attrs: map[string]string{
+				"build-arg:LEITWACHT_CI_PROJECT_PATH": "",
+				"build-arg:LEITWACHT_CI_JOB_ID":       "1001",
+			},
+			want: false,
+		},
+		{
+			name:  "nil attrs map → unauthorized",
+			attrs: nil,
+			want:  false,
+		},
+	}
+
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := "r" + strconv.Itoa(i)
+			r.RegisterSession(ref, time.Unix(1000, 0), tc.attrs)
+
+			snap := r.Snapshot()
+			got := snap[ref].Authorized
+			if got != tc.want {
+				t.Errorf("Authorized = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSessionRegistry_AuthorizationPropagatesToPendingVertices(t *testing.T) {
+	r := NewSessionRegistry(0)
+	r.SetCIRequirement(true, []string{"build-arg:LEITWACHT_CI_PROJECT_PATH"})
+
+	// Unauthorized session.
+	r.RegisterSession("r1", time.Unix(1000, 0), map[string]string{
+		"build-arg:OTHER": "value",
+	})
+	r.UpsertVertex("r1", VertexState{Digest: "d1", Name: "[1/1] RUN bad", StartedAt: time.Unix(1010, 0)})
+
+	// Authorized session.
+	r.RegisterSession("r2", time.Unix(1001, 0), map[string]string{
+		"build-arg:LEITWACHT_CI_PROJECT_PATH": "team/ok",
+	})
+	r.UpsertVertex("r2", VertexState{Digest: "d2", Name: "[1/1] RUN good", StartedAt: time.Unix(1011, 0)})
+
+	pending := r.PendingVertices()
+	if len(pending) != 2 {
+		t.Fatalf("got %d pending, want 2", len(pending))
+	}
+
+	bySession := map[string]bool{}
+	for _, p := range pending {
+		bySession[p.SessionRef] = p.Authorized
+	}
+
+	if bySession["r1"] {
+		t.Errorf("r1 pending.Authorized = true, want false")
+	}
+	if !bySession["r2"] {
+		t.Errorf("r2 pending.Authorized = false, want true")
+	}
+}
 
 func TestSessionRegistry_RegisterAndSnapshot(t *testing.T) {
 	r := NewSessionRegistry(0)

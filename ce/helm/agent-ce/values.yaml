@@ -158,6 +158,15 @@ buildkit:
   requiredAttrs:
     - LEITWACHT_CI_PROJECT_PATH
 
+  # Opt out of the cgroup_skb attach at /sys/fs/cgroup/buildkit/<...>.
+  # The session/vertex registry + watcher still run, but the agent
+  # does NOT observe RUN-step egress, which disables per-RUN-step
+  # enforcement of egress policy. Set true when the cgroup_skb
+  # attach isn't supported in your kernel/runtime combo (cgroup v1,
+  # exotic namespacing) and you'd rather degrade gracefully than
+  # block agent startup.
+  disableCgroupAttach: false
+
 # Logging.
 logLevel: info
 

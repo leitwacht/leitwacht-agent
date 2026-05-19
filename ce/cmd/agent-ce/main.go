@@ -116,7 +116,26 @@ func main() {
 	// LookupBuildKitBinding on every event, but the default hook
 	// returns (zero, false) so violations are emitted without build
 	// step fields — i.e., unchanged from pre-BuildKit behaviour.
-	startBuildKitAttribution(ctx, cfg, log)
+	//
+	// The call needs mgr.ReportFunc set, so it runs after the manager
+	// is wired up (line below). Returned attach is closed on shutdown.
+	if mgr.BucketInterval > 0 {
+		mgr.ReportFunc = multi.ReportAsync
+	}
+
+	buildKitAttach, err := startBuildKitAttribution(ctx, cfg, log, mgr)
+	if err != nil {
+		log.Error("start buildkit attribution", "error", err)
+		os.Exit(1)
+	}
+
+	if buildKitAttach != nil {
+		defer func() {
+			if err := buildKitAttach.Close(); err != nil {
+				log.Warn("buildkit egress attach close", "error", err)
+			}
+		}()
+	}
 
 	// Watcher.
 	w, err := newWatcher(cfg, log)
@@ -141,10 +160,6 @@ func main() {
 		Logger:             log,
 		DefaultAction:      cfg.DefaultAction,
 		UnknownProjectMode: unknownMode,
-	}
-
-	if mgr.BucketInterval > 0 {
-		mgr.ReportFunc = multi.ReportAsync
 	}
 
 	wireHoneypotKill(mgr, w, multi, log)

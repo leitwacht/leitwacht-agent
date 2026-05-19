@@ -80,6 +80,22 @@ type Config struct {
 	// if they want stricter policy.
 	BuildkitRequiredAttrs string
 
+	// BuildkitDisableCgroupAttach, when true, skips the manager-side
+	// eBPF attach at the BuildKit RUN-step cgroup parents. The agent
+	// still subscribes to buildkitd's Control gRPC and tracks
+	// sessions + vertices in the registry, but no egress observation
+	// happens for RUN-step processes — which means no per-RUN-step
+	// attribution and no kill-switch enforcement on egress.
+	//
+	// Operators set this when running on a kernel/runtime combo
+	// where attaching cgroup_skb at /sys/fs/cgroup/buildkit fails
+	// (e.g. cgroup v1, container-isolated cgroup namespaces) and
+	// they prefer observability-only mode over startup errors. The
+	// kill-switch on missing CI metadata (BuildkitRequireCIMetadata)
+	// still functions because it acts at registry time, not at
+	// cgroup-attach time.
+	BuildkitDisableCgroupAttach bool
+
 	// Logging.
 	LogLevel string
 }
@@ -136,6 +152,10 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	c.BuildkitRequireCIMetadata, err = envBool("LEITWACHT_CE_BUILDKIT_REQUIRE_CI_METADATA", false)
+	if err != nil {
+		return nil, err
+	}
+	c.BuildkitDisableCgroupAttach, err = envBool("LEITWACHT_CE_BUILDKIT_DISABLE_CGROUP_ATTACH", false)
 	if err != nil {
 		return nil, err
 	}

@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -41,9 +42,18 @@ const buildKitSessionTTL = 2 * time.Minute
 // but no cgroup paths, the registry tracks sessions and vertices but
 // egress events stay unattributed at the cgroup level — useful for
 // confirming Phase 1 wiring before tuning the path.
-func startBuildKitAttribution(ctx context.Context, cfg *config.Config, log *slog.Logger) {
+//
+// Returns the BuildKitEgressAttach (or nil when not started) so main()
+// can Close() it during shutdown. Returning nil-error nil-attach is
+// the documented "feature disabled" outcome.
+func startBuildKitAttribution(
+	ctx context.Context,
+	cfg *config.Config,
+	log *slog.Logger,
+	mgr *enforcer.Manager,
+) (*enforcer.BuildKitEgressAttach, error) {
 	if cfg.BuildkitGRPCAddr == "" {
-		return
+		return nil, nil //nolint:nilnil // documented disable
 	}
 
 	registry := enforcer.NewSessionRegistry(buildKitSessionTTL)
@@ -73,7 +83,9 @@ func startBuildKitAttribution(ctx context.Context, cfg *config.Config, log *slog
 
 	rawPatterns := splitTrim(cfg.BuildkitCgroupPaths, ",")
 	cgroupPaths := expandCgroupGlobs(rawPatterns, log)
-	if len(cgroupPaths) > 0 {
+
+	switch {
+	case len(cgroupPaths) > 0:
 		source := enforcer.NewInotifyCgroupSource(cgroupPaths)
 		joiner := enforcer.NewCgroupJoiner(registry, source, log)
 
@@ -89,12 +101,12 @@ func startBuildKitAttribution(ctx context.Context, cfg *config.Config, log *slog
 			"cgroup_patterns", strings.Join(rawPatterns, ","),
 			"cgroup_paths_resolved", strings.Join(cgroupPaths, ","),
 		)
-	} else if len(rawPatterns) > 0 {
+	case len(rawPatterns) > 0:
 		log.Warn("buildkit attribution: cgroup patterns supplied but no paths matched; cgroup-join disabled",
 			"grpc_addr", cfg.BuildkitGRPCAddr,
 			"cgroup_patterns", strings.Join(rawPatterns, ","),
 		)
-	} else {
+	default:
 		log.Warn("buildkit attribution active without cgroup-join "+
 			"(LEITWACHT_CE_BUILDKIT_CGROUP_PATHS is empty); "+
 			"sessions and vertices will be tracked but egress events "+
@@ -102,6 +114,49 @@ func startBuildKitAttribution(ctx context.Context, cfg *config.Config, log *slog
 			"grpc_addr", cfg.BuildkitGRPCAddr,
 		)
 	}
+
+	// Cgroup-level egress attach. The joiner above populates the
+	// SessionRegistry with cgroup_id → vertex bindings; the attach
+	// loads a manager-owned eBPF egress filter at the same cgroup
+	// parents so RUN-step traffic actually reaches LookupBuildKitBinding
+	// in the ringbuf reader.
+	//
+	// Opt-out (LEITWACHT_CE_BUILDKIT_DISABLE_CGROUP_ATTACH=true):
+	// keeps the registry/watcher/joiner running but skips the eBPF
+	// load. Effectively disables BuildKit egress observation + future
+	// enforcement; useful when the cgroup_skb attach isn't supported
+	// (cgroup v1, exotic namespacing) and the operator prefers
+	// session/vertex tracking only over a startup error.
+	if cfg.BuildkitDisableCgroupAttach {
+		log.Info("buildkit cgroup-level attach disabled by config; sessions tracked, egress unobserved",
+			"reason", "LEITWACHT_CE_BUILDKIT_DISABLE_CGROUP_ATTACH=true",
+		)
+
+		return nil, nil //nolint:nilnil // documented disable
+	}
+
+	if len(cgroupPaths) == 0 {
+		return nil, nil //nolint:nilnil // nothing to attach to
+	}
+
+	attach, err := enforcer.StartBuildKitEgressAttach(
+		ctx,
+		mgr.Platform(),
+		cgroupPaths,
+		log,
+		mgr.ReportFunc,
+		mgr.BucketInterval,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("buildkit egress attach: %w", err)
+	}
+
+	log.Info("buildkit egress attach active",
+		"cgroup_paths", strings.Join(cgroupPaths, ","),
+		"bucket_interval", mgr.BucketInterval,
+	)
+
+	return attach, nil
 }
 
 // resolveRequiredAttrs turns the comma-separated

@@ -254,6 +254,13 @@ type Manager struct {
 	EnvNamesFn func(pid int) []string
 }
 
+// Platform returns the Platform implementation this manager was
+// constructed with. Used by the BuildKit egress attach to load its own
+// EBPFHandle without piping the platform through main() separately.
+func (m *Manager) Platform() Platform {
+	return m.platform
+}
+
 // NewManager creates an enforcement manager with the given configuration.
 func NewManager(
 	logger *slog.Logger, maxConcurrent int, upstreams []string,

@@ -134,6 +134,10 @@ spec:
               value: {{ join "," .requiredAttrs | quote }}
             {{- end }}
             {{- end }}
+            {{- if .disableCgroupAttach }}
+            - name: LEITWACHT_CE_BUILDKIT_DISABLE_CGROUP_ATTACH
+              value: "true"
+            {{- end }}
             {{- end }}
             {{- end }}
             - name: HOSTNAME_OVERRIDE

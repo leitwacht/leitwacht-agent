@@ -28,14 +28,14 @@ type fakePlatform struct {
 	// to inode = uint64(pid), so each pid is its own netns by default.
 	netnsByPID map[int]uint64
 
-	boundAddr               string
-	redirectSetup           bool
-	redirectRemoved         bool
-	ebpfLoaded              bool
-	ebpfClosed              bool
-	ringbufStarted          bool
-	allowedIPs              []string
-	deniedIPs               []string
+	boundAddr       string
+	redirectSetup   bool
+	redirectRemoved bool
+	ebpfLoaded      bool
+	ebpfClosed      bool
+	ringbufStarted  bool
+	allowedIPs      []string
+	deniedIPs       []string
 	loadCount       int
 	cgroupIDCounter atomic.Uint64
 }

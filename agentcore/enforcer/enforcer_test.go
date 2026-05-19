@@ -36,11 +36,8 @@ type fakePlatform struct {
 	ringbufStarted          bool
 	allowedIPs              []string
 	deniedIPs               []string
-	loadCount               int
-	cgroupIDCounter         atomic.Uint64
-	buildkitFirewallSetup   bool
-	buildkitFirewallRemoved bool
-	buildkitFirewallErr     error
+	loadCount       int
+	cgroupIDCounter atomic.Uint64
 }
 
 func (f *fakePlatform) GetCgroupPath(_ int) (string, error) {
@@ -97,18 +94,6 @@ func (f *fakePlatform) CgroupID(_ string) (uint64, error) {
 
 func (f *fakePlatform) DialUpstreamInNetns(_ int, _ string, _ int) (*net.UDPConn, error) {
 	return nil, nil //nolint:nilnil // fake: Docker upstream not needed in unit tests
-}
-
-func (f *fakePlatform) SetupBuildkitDNSFirewall(_ net.IP) error {
-	f.buildkitFirewallSetup = true
-
-	return f.buildkitFirewallErr
-}
-
-func (f *fakePlatform) RemoveBuildkitDNSFirewall() error {
-	f.buildkitFirewallRemoved = true
-
-	return nil
 }
 
 // fakeEBPFHandle tracks calls for verification.

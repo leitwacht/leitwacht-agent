@@ -224,9 +224,6 @@ type Manager struct {
 	// DNS PID tracker (global kprobe, per-container cgroup registration).
 	dnsPIDTracker *DNSPIDTracker
 
-	// BuildKit monitor (global, attach-once at startup).
-	buildkit *BuildkitMonitor
-
 	// Honeypot LSM (global, not per-container).
 	// Fields used by honeypot_linux.go; appear unused on non-linux builds.
 	honeypotCfg       HoneypotConfig
@@ -275,11 +272,6 @@ func NewManager(
 		cgroupToContainer: make(map[uint64]string),
 		shutdownCh:        make(chan struct{}),
 	}
-}
-
-// SetBuildkit configures the BuildKit monitor. Must be called before any Attach calls.
-func (m *Manager) SetBuildkit(bm *BuildkitMonitor) {
-	m.buildkit = bm
 }
 
 // Attach sets up enforcement for a container. Sibling containers in the same
@@ -597,7 +589,6 @@ func (m *Manager) finalizeAttach(info ContainerInfo, e *Enforcer, nctx *NetnsCon
 		nctx.mu.Unlock()
 	}
 
-	m.attachBuildkit(info.ContainerID, nctx, e)
 	m.startPacketBucketReporter(e)
 	m.startDNSBucketReporter(info, nctx)
 	m.AttachHoneypot(info.ContainerID, e.cgroup)
@@ -979,57 +970,6 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 	)
 
 	return e, nil
-}
-
-// attachBuildkit attaches the buildkit cgroup to the job's eBPF program and
-// registers the buildkit cgroupID in the netns context's recorder map.
-// Non-fatal: failures are logged but don't prevent job enforcement.
-func (m *Manager) attachBuildkit(containerID string, nctx *NetnsContext, e *Enforcer) {
-	if m.buildkit == nil {
-		return
-	}
-
-	// Only attach buildkit for containers with project attribution (build containers).
-	if e.info.ProjectPath == "" {
-		return
-	}
-
-	// DNS proxy queries must land on sharedDNSRecorder — that's the recorder the
-	// bucket reporter snapshots for DNS activity. Packet drops stay on the
-	// per-container recorder via cgroupRecorders below.
-	attached, err := m.buildkit.AttachJob(containerID, nctx.ebpf, nctx.sharedDNSRecorder, e.policy)
-	if err != nil {
-		m.logger.Warn("buildkit attach failed", "error", err)
-
-		return
-	}
-
-	if !attached {
-		return
-	}
-
-	// Register buildkit cgroupID in the netns context so the ring buffer reader
-	// can attribute buildkit packet drops to this job's recorder.
-	nctx.mu.Lock()
-	nctx.cgroupRecorders[m.buildkit.CgroupID()] = e.recorder
-	nctx.mu.Unlock()
-}
-
-// detachBuildkit begins buildkit drain and unregisters from cgroupRecorders.
-func (m *Manager) detachBuildkit(containerID string, nctx *NetnsContext) {
-	if m.buildkit == nil {
-		return
-	}
-
-	m.buildkit.DetachJob(containerID)
-
-	// Unregister buildkit cgroupID from the recorder map.
-	// The drain timer in BuildkitMonitor keeps the cgroup link alive —
-	// the recorder entry is removed here to prevent misattribution if a
-	// new job starts before drain completes (the new job will re-register).
-	nctx.mu.Lock()
-	delete(nctx.cgroupRecorders, m.buildkit.CgroupID())
-	nctx.mu.Unlock()
 }
 
 // inheritProjectInfo returns an info value where project-attribution
@@ -1422,9 +1362,6 @@ func (m *Manager) Detach(containerID string) *DetachResult {
 		violations = append(violations, dnsViolations...)
 	}
 
-	// Begin buildkit drain (keeps cgroup link + recorder alive for tail traffic).
-	m.detachBuildkit(containerID, nctx)
-
 	// Close this container's cgroup link.
 	if e.cgroupLink != nil {
 		_ = e.cgroupLink.Close()
@@ -1557,11 +1494,6 @@ func (m *Manager) DetachAll() []*DetachResult {
 		}
 
 		m.teardownNetnsContext(nctx)
-	}
-
-	// Close buildkit monitor after all enforcers are detached.
-	if m.buildkit != nil {
-		m.buildkit.Close()
 	}
 
 	// Bound shutdown by BucketInterval (or a sane floor) so in-flight

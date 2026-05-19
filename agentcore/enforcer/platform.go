@@ -48,17 +48,6 @@ type Platform interface {
 	// container's netns, marked with SO_MARK to bypass nftables redirect.
 	// Used for Docker DNS chaining. Returns nil, nil when not needed.
 	DialUpstreamInNetns(pid int, addr string, mark int) (*net.UDPConn, error)
-
-	// SetupBuildkitDNSFirewall installs host-netns nftables rules that drop
-	// non-loopback traffic destined for the BuildKit DNS proxy on port 53.
-	// Required when the proxy binds on a routable IP to prevent open-resolver
-	// abuse and eBPF allow-map poisoning by off-host queriers. Returns nil
-	// (no-op) for loopback/unspecified binds.
-	SetupBuildkitDNSFirewall(listenIP net.IP) error
-
-	// RemoveBuildkitDNSFirewall tears down rules installed by
-	// SetupBuildkitDNSFirewall. Safe to call if nothing was installed.
-	RemoveBuildkitDNSFirewall() error
 }
 
 // EBPFHandle represents a loaded eBPF program with its maps.

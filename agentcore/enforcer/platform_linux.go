@@ -134,29 +134,6 @@ func (p *LinuxPlatform) RemoveDNSRedirect(pid int) error {
 	return nil
 }
 
-// SetupBuildkitDNSFirewall installs host-netns nftables rules to drop off-host
-// traffic destined for the BuildKit DNS proxy on port 53. Runs in the agent's
-// default (host) netns — nftables.New() with no options binds to the current
-// namespace, which is host for the agent process.
-func (p *LinuxPlatform) SetupBuildkitDNSFirewall(listenIP net.IP) error {
-	conn, err := nftables.New()
-	if err != nil {
-		return fmt.Errorf("create nftables conn: %w", err)
-	}
-
-	return setupBuildkitDNSFirewall(conn, listenIP, p.Logger)
-}
-
-// RemoveBuildkitDNSFirewall tears down the host-netns firewall table.
-func (p *LinuxPlatform) RemoveBuildkitDNSFirewall() error {
-	conn, err := nftables.New()
-	if err != nil {
-		return fmt.Errorf("create nftables conn: %w", err)
-	}
-
-	return removeBuildkitDNSFirewall(conn)
-}
-
 // DialUpstreamInNetns creates a marked UDP connection to addr inside the container's netns.
 // The SO_MARK prevents nftables from redirecting the proxy's own upstream queries.
 func (p *LinuxPlatform) DialUpstreamInNetns(pid int, addr string, mark int) (*net.UDPConn, error) {

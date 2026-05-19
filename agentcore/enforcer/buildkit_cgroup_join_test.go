@@ -711,6 +711,88 @@ func TestCgroupJoiner_KillsOnDenyVertexPattern(t *testing.T) {
 	<-done
 }
 
+// TestCgroupJoiner_KillsOnDenyVertexPatternAmbiguous covers the
+// fail-closed branch: when two candidate vertices collide on the
+// same RUN cmdline, the case-1 deny check is skipped. The default
+// branch must walk the candidate list and kill the cgroup if any
+// vertex_name matches a deny pattern — otherwise an attacker who
+// engineers a duplicate vertex name on a benign concurrent session
+// slips past the policy.
+func TestCgroupJoiner_KillsOnDenyVertexPatternAmbiguous(t *testing.T) {
+	root := t.TempDir()
+	reg := NewSessionRegistry(time.Minute)
+
+	deny := regexp.MustCompile(`RUN npm install`)
+	reg.SetBuildVertexDenyPatterns([]*regexp.Regexp{deny})
+
+	// Two concurrent sessions both running the same RUN — the join
+	// layer sees the same cmdline match two candidates. matchPending
+	// returns both; control lands in the default (multi-candidate)
+	// branch. Both vertex names match the deny pattern, so the
+	// fail-closed kill must fire regardless of which candidate the
+	// tiebreaker would have picked.
+	reg.RegisterSession("rProjectA", time.Unix(1000, 0), map[string]string{
+		FrontendAttrKeyProjectPath: "team/alpha",
+	})
+	reg.UpsertVertex("rProjectA", VertexState{
+		Digest:    "dA",
+		Name:      "[stage 2/5] RUN npm install",
+		StartedAt: time.Unix(1010, 0),
+	})
+
+	reg.RegisterSession("rProjectB", time.Unix(1000, 0), map[string]string{
+		FrontendAttrKeyProjectPath: "team/bravo",
+	})
+	reg.UpsertVertex("rProjectB", VertexState{
+		Digest:    "dB",
+		Name:      "[stage 5/8] RUN npm install",
+		StartedAt: time.Unix(1010, 0),
+	})
+
+	// cmdline "npm install" hits both vertices — matchPendingByCmdline
+	// returns 2, forcing the default (ambiguous-candidates) branch.
+	cgroupPath := stageCgroup(t, root, "ctr-amb", 8888, "/bin/sh\x00-c\x00npm install\x00")
+	killFile := filepath.Join(cgroupPath, "cgroup.kill")
+
+	if err := os.WriteFile(killFile, nil, 0o600); err != nil {
+		t.Fatalf("stage cgroup.kill: %v", err)
+	}
+
+	source := newFakeEventSource()
+	statFn := func(_ string) (uint64, error) { return 8888, nil }
+
+	j := NewCgroupJoiner(reg, source, nil,
+		WithProcRoot(filepath.Join(root, "proc")),
+		WithStatFn(statFn),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		_ = j.Run(ctx)
+
+		close(done)
+	}()
+
+	source.creates <- CgroupCreateEvent{ContainerID: "ctr-amb", CgroupPath: cgroupPath}
+
+	waitFor(t, time.Second, func() bool {
+		data, err := os.ReadFile(killFile)
+
+		return err == nil && string(data) == "1"
+	})
+
+	// No binding — the kill replaces both link paths.
+	if _, ok := reg.LookupByCgroupID(8888); ok {
+		t.Fatal("ambiguous-candidate deny match wrote a binding instead of just killing")
+	}
+
+	cancel()
+	<-done
+}
+
 // TestSessionRegistry_MatchesDenyVertexPattern is a focused unit test
 // for the pattern-matching helper itself, independent of the joiner's
 // event-loop wiring.

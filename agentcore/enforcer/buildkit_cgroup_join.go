@@ -355,6 +355,31 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 
 		return true
 	default:
+		// Fail-closed deny-vertex check: when the join can't pick one
+		// candidate, any candidate whose vertex_name matches a deny
+		// pattern kills the cgroup. An attacker who engineers a
+		// duplicate vertex name on a benign session would otherwise
+		// slip past the case-1 check by landing in ambiguous-link
+		// territory. Run this BEFORE the tiebreaker so the kill
+		// also catches the refined-to-one outcome below.
+		for i := range matches {
+			if j.registry.MatchesDenyVertexPattern(matches[i].VertexName) {
+				j.killCgroup(evt.CgroupPath)
+
+				j.logger.Warn("buildkit cgroup killed: ambiguous candidate matched a deny policy pattern",
+					"cgroup_id", cgroupID,
+					"container_id", evt.ContainerID,
+					"cgroup_path", evt.CgroupPath,
+					"session_ref", matches[i].SessionRef,
+					"vertex_digest", matches[i].VertexDigest,
+					"vertex_name", matches[i].VertexName,
+					"candidates", len(matches),
+				)
+
+				return true
+			}
+		}
+
 		// Tiebreaker: environ. Read /proc/<pid>/environ and pick
 		// the candidate whose FrontendAttrs values appear in the
 		// process environment. Falls through to ambiguous if the

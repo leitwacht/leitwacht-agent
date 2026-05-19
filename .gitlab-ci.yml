@@ -33,14 +33,23 @@ stages:
   - mirror
 
 variables:
-  GO_VERSION: "1.26"
+  # All upstream images are SHA-pinned by manifest-list digest so a
+  # registry-side tag swap cannot silently substitute the runtime. Refresh
+  # procedure: `skopeo inspect --no-tags docker://<image>:<tag>` to read
+  # the current digest, then bump the @sha256 here. Bump the human-
+  # readable :<tag> alongside so the file still tells you what version
+  # you're on at a glance.
+  GO_VERSION: "1.26.3"
+  GO_IMAGE: "golang:1.26.3@sha256:313faae491b410a35402c05d35e7518ae99103d957308e940e1ae2cfa0aac29b"
+  GO_BOOKWORM_IMAGE: "golang:1.26.3-bookworm@sha256:252599aeb51ad60b83e4d8821802068127c528c707cb7dd7afd93be057c6011c"
+  ALPINE_IMAGE: "alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d"
+  CRANE_IMAGE: "gcr.io/go-containerregistry/crane:v0.20.3@sha256:fc86bcad43a000c2a1ca926a1e167db26c053cebc3fa5d14285c72773fb8c11d"
   REGISTRY: "${CI_REGISTRY_IMAGE}"
   INITC_IMAGE: "${CI_REGISTRY_IMAGE}/leitwacht-initc"
   AGENT_CE_IMAGE: "${CI_REGISTRY_IMAGE}/agent-ce"
   # buildctl client (the persistent rootful buildkitd lives in the
   # cluster; CI talks to it over gRPC, see .build_image stage).
-  # Pin-by-tag for now; switch to digest pin once dogfood proves stable.
-  BUILDKIT_IMAGE: "moby/buildkit:v0.18.2"
+  BUILDKIT_IMAGE: "moby/buildkit:v0.18.2@sha256:86c0ad9d1137c186e9d455912167df20e530bdf7f7c19de802e892bb8ca16552"
   BUILDKITD_ADDR: "tcp://buildkitd.buildkitd-cerberus-iot.svc.cluster.local:1234"
   # Quay.io mirror destinations (set via project secrets QUAY_USER /
   # QUAY_TOKEN). Empty values disable the mirror stage.
@@ -50,14 +59,22 @@ variables:
   # to match the release artefact at SEMREL_VERSION on GitHub.
   SEMREL_VERSION: "v2.31.0"
   SEMREL_SHA256: "b8f518b1aeb1d1742f4e6e91a179b707cea4309a64fe3854f465bf724f04f6d3"
+  # Reproducible builds + refuse-on-go.sum-drift. -trimpath strips host
+  # paths from binaries; -mod=readonly fails the build instead of
+  # silently rewriting go.sum on dependency-graph shifts.
+  GOFLAGS: "-trimpath -mod=readonly"
 
 default:
-  image: golang:${GO_VERSION}
+  image: ${GO_IMAGE}
 
 # ---------------------------------------------------------------- LINT
 lint:
   stage: lint
   script:
+    # Verify the module graph hasn't drifted since go.sum was committed,
+    # then run the usual static checks.
+    - go mod download
+    - go mod verify
     - go vet ./...
     - test -z "$(gofmt -l .)" || (echo "gofmt found issues — run 'gofmt -w .' locally"; gofmt -l .; exit 1)
 
@@ -68,7 +85,7 @@ lint:
 # output — local regen with a different toolchain will mismatch on purpose.
 check-ebpf-drift:
   stage: lint
-  image: golang:${GO_VERSION}-bookworm
+  image: ${GO_BOOKWORM_IMAGE}
   script:
     - apt-get update -qq && apt-get install -y --no-install-recommends clang libbpf-dev llvm
     - make check-ebpf-drift
@@ -77,6 +94,8 @@ check-ebpf-drift:
 test:
   stage: test
   script:
+    - go mod download
+    - go mod verify
     - go test -race -count=1 -tags=linux ./...
 
 # ------------------------------------------------------------ RELEASE
@@ -91,7 +110,7 @@ test:
 # cannot push tags on gitlab.com SaaS.
 semantic-release:
   stage: release
-  image: alpine:3.20
+  image: ${ALPINE_IMAGE}
   variables:
     GIT_STRATEGY: clone
     GIT_DEPTH: 0
@@ -256,8 +275,11 @@ build-agent-ce:
   # alpine ships cosign in its community repo; using alpine instead of
   # gcr.io/projectsigstore/cosign because the upstream cosign image is
   # fully distroless (no shell), and GitLab Runner's k8s executor needs
-  # /bin/sh inside the build container to host the script.
-  image: alpine:3.21
+  # /bin/sh inside the build container to host the script. The alpine
+  # base is SHA-pinned (ALPINE_IMAGE); the cosign package version still
+  # drifts with the community repo — accept and re-audit on Alpine
+  # major bumps.
+  image: ${ALPINE_IMAGE}
   variables:
     COSIGN_YES: "true"
   id_tokens:
@@ -297,7 +319,8 @@ sign-agent-ce:
   stage: sbom
   # alpine ships syft in its community repo; using alpine instead of
   # anchore/syft (also distroless) so the k8s executor has a shell.
-  image: alpine:3.21
+  # ALPINE_IMAGE pins the base; the syft package version still drifts.
+  image: ${ALPINE_IMAGE}
   variables:
     # syft reads these to authenticate against the GitLab Container
     # Registry when scanning the just-built image. cosign jobs handle
@@ -330,7 +353,7 @@ sbom-agent-ce:
 
 .attach_sbom:
   stage: sbom
-  image: alpine:3.21
+  image: ${ALPINE_IMAGE}
   variables:
     COSIGN_YES: "true"
   id_tokens:
@@ -371,7 +394,7 @@ attach-sbom-agent-ce:
 .mirror_image:
   stage: mirror
   image:
-    name: gcr.io/go-containerregistry/crane:v0.20.2
+    name: ${CRANE_IMAGE}
     entrypoint: [""]
   rules:
     - if: $CI_COMMIT_TAG && $QUAY_TOKEN

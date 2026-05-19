@@ -28,11 +28,30 @@ For each `docker buildx build` your CI runners send to buildkitd:
 ## Trust model
 
 This configuration assumes **one buildkitd Deployment serves one
-leitwacht org**. Anyone who can submit a `Solve` to that buildkitd can
-claim any project path inside the org; the agent honours the claim.
-Multi-tenant attribution that validates client identity per session
-(JWT-carrying build-arg) is a follow-on; until then deploy one
-buildkitd per org.
+leitwacht org**. Anyone who can submit a `Solve` to that buildkitd
+can submit a build claiming any project path; the agent stamps the
+claim onto egress events.
+
+What stops cross-project spoofing inside the same org is the
+**server-side JWT-strict mode**. When the CI runner sends a
+`ci_job_jwt` (the GitLab OIDC token) with the violation report, the
+server's per-row attribution path requires `BuildStepAttribution
+.project_path` to match the JWT's `project_path` claim. A buildkitd
+session that declares `LEITWACHT_CI_PROJECT_PATH=foo` but whose
+report carries a JWT signed for project `bar` has its per-row
+override rejected — the row falls back to the report-level identity
+(also JWT-authoritative). This closes the same-org spoof window the
+earlier trust-model copy flagged as a follow-on.
+
+Mode summary:
+
+| Auth path the report takes | Per-row `project_path` override |
+| --- | --- |
+| Verified `ci_job_jwt` (happy path) | Must equal JWT `project_path`; else rejected |
+| Env-trust (no JWT, JWKS-fallback) | Allowed if it resolves under the same org |
+
+Env-trust only kicks in for legacy CE agents and during JWKS
+transients; everything else routes through strict mode.
 
 ## Operator setup
 

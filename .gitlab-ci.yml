@@ -37,6 +37,11 @@ variables:
   REGISTRY: "${CI_REGISTRY_IMAGE}"
   INITC_IMAGE: "${CI_REGISTRY_IMAGE}/leitwacht-initc"
   AGENT_CE_IMAGE: "${CI_REGISTRY_IMAGE}/agent-ce"
+  # buildctl client (the persistent rootful buildkitd lives in the
+  # cluster; CI talks to it over gRPC, see .build_image stage).
+  # Pin-by-tag for now; switch to digest pin once dogfood proves stable.
+  BUILDKIT_IMAGE: "moby/buildkit:v0.18.2"
+  BUILDKITD_ADDR: "tcp://buildkitd.buildkitd-cerberus-iot.svc.cluster.local:1234"
   # Quay.io mirror destinations (set via project secrets QUAY_USER /
   # QUAY_TOKEN). Empty values disable the mirror stage.
   QUAY_INITC_IMAGE: "quay.io/leitwacht/leitwacht-initc"
@@ -114,15 +119,24 @@ semantic-release:
     - if: $CI_COMMIT_BRANCH == "main" && $CI_PIPELINE_SOURCE == "push"
 
 # --------------------------------------------------------------- BUILD
-# Kaniko is used instead of docker:dind so we don't need a privileged
-# runner. Each image is built in parallel and gets the full tag
-# ladder. The sha-X tag is always pushed; the moving tags (:latest,
-# :main, :1, :1.2) are pushed conditionally — see the rules block.
+# buildctl client → persistent in-cluster buildkitd at BUILDKITD_ADDR.
+# The buildkitd instance is observed by the leitwacht egress agent
+# (BuildKit step-attribution), so every RUN-step's egress in our own
+# image builds attributes to the CI job that ran it — dogfood path
+# for the BuildKit attribution feature.
+#
+# Auth: buildctl forwards the client's ~/.docker/config.json to
+# buildkitd over the session multiplexer; buildkitd uses it for
+# registry pushes. No buildkitd-side credential mount needed.
+#
+# Each image is built in parallel and gets the full tag ladder. The
+# sha-X tag is always pushed; moving tags (:latest, :main, :1, :1.2)
+# are pushed conditionally — see the rules block.
 
 .build_image:
   stage: build
   image:
-    name: ghcr.io/osscontainertools/kaniko:v1.27.4-debug
+    name: ${BUILDKIT_IMAGE}
     entrypoint: [""]
   script:
     # Resolve the tag set we'll push. CI_COMMIT_TAG is set on git tags;
@@ -131,44 +145,81 @@ semantic-release:
     # semver ladder.
     - |
       set -eu
-      DESTINATIONS="--destination=${IMAGE}:sha-${CI_COMMIT_SHORT_SHA}"
+
+      # buildctl's --output type=image accepts a comma-separated
+      # name list inside a quoted "name=..." field. Build the list
+      # now; the quoting in the buildctl invocation below preserves
+      # the commas as part of the field value.
+      DEST_NAMES="${IMAGE}:sha-${CI_COMMIT_SHORT_SHA}"
 
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
         # Strip leading 'v' if present.
         VERSION="${CI_COMMIT_TAG#v}"
-        DESTINATIONS="${DESTINATIONS} --destination=${IMAGE}:${CI_COMMIT_TAG}"
-        DESTINATIONS="${DESTINATIONS} --destination=${IMAGE}:${VERSION}"
+        DEST_NAMES="${DEST_NAMES},${IMAGE}:${CI_COMMIT_TAG}"
+        DEST_NAMES="${DEST_NAMES},${IMAGE}:${VERSION}"
         case "${VERSION}" in
           *-*) ;;  # pre-release: skip moving tags
           *)
             MAJOR_MINOR="${VERSION%.*}"
             MAJOR="${MAJOR_MINOR%.*}"
-            DESTINATIONS="${DESTINATIONS} --destination=${IMAGE}:${MAJOR_MINOR}"
-            DESTINATIONS="${DESTINATIONS} --destination=${IMAGE}:${MAJOR}"
-            DESTINATIONS="${DESTINATIONS} --destination=${IMAGE}:latest"
+            DEST_NAMES="${DEST_NAMES},${IMAGE}:${MAJOR_MINOR}"
+            DEST_NAMES="${DEST_NAMES},${IMAGE}:${MAJOR}"
+            DEST_NAMES="${DEST_NAMES},${IMAGE}:latest"
             ;;
         esac
       elif [ "${CI_COMMIT_BRANCH:-}" = "main" ]; then
-        DESTINATIONS="${DESTINATIONS} --destination=${IMAGE}:main"
+        DEST_NAMES="${DEST_NAMES},${IMAGE}:main"
       fi
 
       VERSION_LDFLAG="${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}"
 
-      mkdir -p /kaniko/.docker
-      cat > /kaniko/.docker/config.json <<EOF
+      mkdir -p /root/.docker
+      cat > /root/.docker/config.json <<EOF
       {"auths":{"${CI_REGISTRY}":{"auth":"$(printf '%s:%s' "${CI_REGISTRY_USER}" "${CI_REGISTRY_PASSWORD}" | base64 | tr -d '\n')"}}}
       EOF
 
-      /kaniko/executor \
-        --context "${CI_PROJECT_DIR}" \
-        --dockerfile "${CI_PROJECT_DIR}/${DOCKERFILE}" \
-        --build-arg "VERSION=${VERSION_LDFLAG}" \
-        --build-arg "COMMIT=${CI_COMMIT_SHORT_SHA}" \
-        --build-arg "GO_VERSION=${GO_VERSION}" \
-        --custom-platform=linux/amd64 \
-        ${DESTINATIONS} \
-        --image-fs-extract-retry=3 \
-        --reproducible
+      # CI metadata as build-args. The leitwacht egress agent reads
+      # these from each Solve session's FrontendAttrs and attributes
+      # every RUN-step's egress to this exact CI job. Matches the
+      # tools/leitwacht-buildx wrapper used for developer-side
+      # `docker buildx build` invocations.
+      CI_BUILD_ARGS=""
+      for pair in CI_PROJECT_PATH:LEITWACHT_CI_PROJECT_PATH \
+                  CI_JOB_ID:LEITWACHT_CI_JOB_ID \
+                  CI_PIPELINE_ID:LEITWACHT_CI_PIPELINE_ID \
+                  CI_JOB_NAME:LEITWACHT_CI_JOB_NAME \
+                  CI_JOB_STAGE:LEITWACHT_CI_JOB_STAGE \
+                  CI_COMMIT_REF_NAME:LEITWACHT_CI_GIT_REF \
+                  CI_JOB_URL:LEITWACHT_CI_JOB_URL \
+                  CI_PIPELINE_SOURCE:LEITWACHT_CI_PIPELINE_SOURCE; do
+        src="${pair%%:*}"; dst="${pair##*:}"
+        val="$(printenv "$src" || true)"
+        if [ -n "$val" ]; then
+          CI_BUILD_ARGS="$CI_BUILD_ARGS --opt build-arg:$dst=$val"
+        fi
+      done
+
+      # Reproducible-ish output: SOURCE_DATE_EPOCH normalises layer
+      # manifest timestamps. BuildKit has no exact equivalent of
+      # Kaniko's --reproducible (which also normalises file mtimes
+      # inside the rootfs); bit-exact reproducibility is weaker but
+      # acceptable — the released image hash + cosign signature in
+      # Rekor + the SBOM are the source-of-truth for verification.
+      export SOURCE_DATE_EPOCH="$(git log -1 --pretty=%ct)"
+
+      # shellcheck disable=SC2086 # CI_BUILD_ARGS intentionally splits
+      buildctl --addr "${BUILDKITD_ADDR}" build \
+        --frontend dockerfile.v0 \
+        --local context="${CI_PROJECT_DIR}" \
+        --local dockerfile="${CI_PROJECT_DIR}" \
+        --opt filename="${DOCKERFILE}" \
+        --opt platform=linux/amd64 \
+        --opt build-arg:VERSION="${VERSION_LDFLAG}" \
+        --opt build-arg:COMMIT="${CI_COMMIT_SHORT_SHA}" \
+        --opt build-arg:GO_VERSION="${GO_VERSION}" \
+        --opt build-arg:SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH}" \
+        $CI_BUILD_ARGS \
+        --output "type=image,\"name=${DEST_NAMES}\",push=true"
   rules:
     - if: $CI_COMMIT_TAG
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"

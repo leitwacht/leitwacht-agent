@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"regexp"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -61,6 +62,16 @@ type SessionRegistry struct {
 	// that haven't opted into hard policy enforcement yet.
 	requireCIMetadata bool
 	requiredAttrs     []string // FrontendAttrs keys, already prefixed (e.g. "build-arg:LEITWACHT_CI_PROJECT_PATH")
+
+	// denyVertexPatterns are compiled regular expressions that match
+	// against a vertex's Name (e.g. "[stage 2/5] RUN apk add curl").
+	// When a cgroup-join finds a candidate vertex whose Name matches
+	// any of these, the cgroup-join layer SIGKILLs the RUN cgroup
+	// before linking it — same kill mechanism as the requireCIMetadata
+	// path. Sourced from server-distributed policy rules with
+	// PatternType=build_vertex+Action=deny, or from the CE env var
+	// LEITWACHT_CE_BUILDKIT_DENY_VERTEX_PATTERNS.
+	denyVertexPatterns []*regexp.Regexp
 }
 
 // CgroupBinding ties a kernel cgroup_id to the build session and
@@ -331,6 +342,41 @@ func (r *SessionRegistry) SetCIRequirement(require bool, requiredKeys []string) 
 	defer r.mu.Unlock()
 	r.requireCIMetadata = require
 	r.requiredAttrs = append([]string(nil), requiredKeys...) // defensive copy
+}
+
+// SetBuildVertexDenyPatterns installs the regex set the cgroup-join
+// layer evaluates against each candidate vertex's Name before linking.
+// A matching vertex causes the layer to SIGKILL the RUN cgroup via
+// cgroup.kill — same kill mechanism as the require-CI-metadata path.
+//
+// Patterns are compiled with regexp.Compile (RE2 semantics); invalid
+// patterns are dropped silently after a log message at caller side —
+// the contract here is "all patterns are pre-validated regexps". An
+// empty/nil slice disables the per-vertex kill policy.
+//
+// Safe to call before AttributionWatcher.Run; should not be called
+// while sessions are actively being registered.
+func (r *SessionRegistry) SetBuildVertexDenyPatterns(patterns []*regexp.Regexp) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.denyVertexPatterns = append([]*regexp.Regexp(nil), patterns...) // defensive copy
+}
+
+// MatchesDenyVertexPattern reports whether the given vertex Name
+// matches any installed deny pattern. Used by the cgroup-join layer
+// to decide between LinkCgroup and killCgroup. Returns false when no
+// patterns are installed (the back-compat default).
+func (r *SessionRegistry) MatchesDenyVertexPattern(vertexName string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for _, p := range r.denyVertexPatterns {
+		if p.MatchString(vertexName) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // evaluateAuthorization checks whether the session's FrontendAttrs

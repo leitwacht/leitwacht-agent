@@ -19,22 +19,26 @@ const (
 	ActionAudit = "audit"
 	ActionBlock = "block"
 
-	PatternFQDN = "fqdn"
-	PatternCIDR = "cidr"
+	PatternFQDN        = "fqdn"
+	PatternCIDR        = "cidr"
+	PatternBuildVertex = "build_vertex"
 )
 
 // Rule is one entry in an ordered policy list. The DNS proxy walks the
 // composed slice top to bottom; the first match decides the outcome.
 // Resolution is only meaningful when Action=deny AND PatternType=fqdn;
 // Ports are only meaningful when Action=allow (nil = all ports).
+// RequireBuildAttribution, on a build_vertex rule, denies egress whose
+// BuildKit binding has no project_path override (= unattributed build).
 type Rule struct {
-	Pattern     string `json:"pattern"`
-	PatternType string `json:"pattern_type"`
-	Action      string `json:"action"`
-	Resolution  string `json:"resolution,omitempty"`
-	Ports       []int  `json:"ports,omitempty"`
-	Reason      string `json:"reason,omitempty"`
-	Source      string `json:"source,omitempty"`
+	Pattern                 string `json:"pattern"`
+	PatternType             string `json:"pattern_type"`
+	Action                  string `json:"action"`
+	Resolution              string `json:"resolution,omitempty"`
+	Ports                   []int  `json:"ports,omitempty"`
+	Reason                  string `json:"reason,omitempty"`
+	Source                  string `json:"source,omitempty"`
+	RequireBuildAttribution bool   `json:"require_build_attribution,omitempty"`
 }
 
 // DenyIP represents an IP deny rule. Fed into the eBPF deny map.

@@ -316,6 +316,27 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 			return true
 		}
 
+		// Per-vertex kill-switch: server policy can install regex
+		// patterns matching vertex_name (e.g. "RUN npm install"). A
+		// match SIGKILLs the cgroup, same mechanism as the missing-
+		// CI-metadata path above. Skipped when no patterns are
+		// installed — back-compat for installations that haven't
+		// opted into per-vertex policy.
+		if j.registry.MatchesDenyVertexPattern(m.VertexName) {
+			j.killCgroup(evt.CgroupPath)
+
+			j.logger.Warn("buildkit cgroup killed: vertex matched a deny policy pattern",
+				"cgroup_id", cgroupID,
+				"container_id", evt.ContainerID,
+				"cgroup_path", evt.CgroupPath,
+				"session_ref", m.SessionRef,
+				"vertex_digest", m.VertexDigest,
+				"vertex_name", m.VertexName,
+			)
+
+			return true
+		}
+
 		j.registry.LinkCgroup(cgroupID, CgroupBinding{
 			SessionRef:    m.SessionRef,
 			VertexDigest:  m.VertexDigest,

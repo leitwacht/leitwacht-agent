@@ -167,6 +167,20 @@ buildkit:
   # block agent startup.
   disableCgroupAttach: false
 
+  # Per-vertex kill-switch. Each list item is a Go regexp (RE2) that
+  # the agent evaluates against each BuildKit vertex's Name (e.g.
+  # "[stage 2/5] RUN apk add curl"). A match SIGKILLs the RUN
+  # cgroup via cgroup.kill BEFORE any egress can happen — same
+  # mechanism as requireCIMetadata. Server-distributed policy rules
+  # with pattern_type=build_vertex+action=deny populate the same
+  # kill-switch via the EE-side rule fetch; CE installs can pin a
+  # static set here.
+  #
+  # Examples:
+  #   - "^\\[.*\\] RUN npm install"        # block any "RUN npm install"
+  #   - "curl https?://"                   # block curl-to-internet
+  denyVertexPatterns: []
+
 # Logging.
 logLevel: info
 

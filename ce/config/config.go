@@ -96,6 +96,20 @@ type Config struct {
 	// cgroup-attach time.
 	BuildkitDisableCgroupAttach bool
 
+	// BuildkitDenyVertexPatterns is a comma-separated list of
+	// regular expressions evaluated against each BuildKit vertex's
+	// Name (e.g. "[stage 2/5] RUN apk add curl"). A match SIGKILLs
+	// the RUN cgroup via cgroup.kill before any egress can happen —
+	// same mechanism as BuildkitRequireCIMetadata. Server-distributed
+	// policy rules with PatternType=build_vertex+Action=deny populate
+	// the same kill-switch via the EE-side rule fetch; CE installs
+	// can pin a static set via this env var.
+	//
+	// Examples:
+	//   LEITWACHT_CE_BUILDKIT_DENY_VERTEX_PATTERNS="^\\[.*\\] RUN npm install"
+	//   LEITWACHT_CE_BUILDKIT_DENY_VERTEX_PATTERNS="apt-get,curl https?://"
+	BuildkitDenyVertexPatterns string
+
 	// Logging.
 	LogLevel string
 }
@@ -121,16 +135,17 @@ func Load() (*Config, error) {
 		// must point this at their own resolver — typically the kube-
 		// dns ClusterIP on K8s or the host's recursive resolver on
 		// bare metal.
-		DNSUpstream:           os.Getenv("LEITWACHT_CE_DNS_UPSTREAM"),
-		TrustedCIDRs:          os.Getenv("LEITWACHT_CE_TRUSTED_CIDRS"),
-		HoneypotDir:           envOr("LEITWACHT_CE_HONEYPOT_DIR", "/var/lib/leitwacht/honeypot"),
-		PromAddr:              envOr("LEITWACHT_CE_PROM_ADDR", ":9090"),
-		WebhookURL:            os.Getenv("LEITWACHT_CE_WEBHOOK_URL"),
-		WebhookAuth:           os.Getenv("LEITWACHT_CE_WEBHOOK_AUTH"),
-		BuildkitGRPCAddr:      os.Getenv("LEITWACHT_CE_BUILDKIT_GRPC_ADDR"),
-		BuildkitCgroupPaths:   os.Getenv("LEITWACHT_CE_BUILDKIT_CGROUP_PATHS"),
-		BuildkitRequiredAttrs: os.Getenv("LEITWACHT_CE_BUILDKIT_REQUIRED_ATTRS"),
-		LogLevel:              envOr("LEITWACHT_CE_LOG_LEVEL", "info"),
+		DNSUpstream:                os.Getenv("LEITWACHT_CE_DNS_UPSTREAM"),
+		TrustedCIDRs:               os.Getenv("LEITWACHT_CE_TRUSTED_CIDRS"),
+		HoneypotDir:                envOr("LEITWACHT_CE_HONEYPOT_DIR", "/var/lib/leitwacht/honeypot"),
+		PromAddr:                   envOr("LEITWACHT_CE_PROM_ADDR", ":9090"),
+		WebhookURL:                 os.Getenv("LEITWACHT_CE_WEBHOOK_URL"),
+		WebhookAuth:                os.Getenv("LEITWACHT_CE_WEBHOOK_AUTH"),
+		BuildkitGRPCAddr:           os.Getenv("LEITWACHT_CE_BUILDKIT_GRPC_ADDR"),
+		BuildkitCgroupPaths:        os.Getenv("LEITWACHT_CE_BUILDKIT_CGROUP_PATHS"),
+		BuildkitRequiredAttrs:      os.Getenv("LEITWACHT_CE_BUILDKIT_REQUIRED_ATTRS"),
+		BuildkitDenyVertexPatterns: os.Getenv("LEITWACHT_CE_BUILDKIT_DENY_VERTEX_PATTERNS"),
+		LogLevel:                   envOr("LEITWACHT_CE_LOG_LEVEL", "info"),
 	}
 
 	var err error

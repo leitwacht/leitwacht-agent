@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -64,6 +65,15 @@ func startBuildKitAttribution(
 
 		log.Info("buildkit kill-switch active: refusing sessions without required CI metadata",
 			"required_attrs", strings.Join(required, ","),
+		)
+	}
+
+	if denyPatterns := compileDenyVertexPatterns(cfg.BuildkitDenyVertexPatterns, log); len(denyPatterns) > 0 {
+		registry.SetBuildVertexDenyPatterns(denyPatterns)
+
+		log.Info("buildkit per-vertex kill-switch active",
+			"pattern_count", len(denyPatterns),
+			"patterns", cfg.BuildkitDenyVertexPatterns,
 		)
 	}
 
@@ -157,6 +167,33 @@ func startBuildKitAttribution(
 	)
 
 	return attach, nil
+}
+
+// compileDenyVertexPatterns parses the comma-separated regex list from
+// LEITWACHT_CE_BUILDKIT_DENY_VERTEX_PATTERNS into compiled regexp
+// values. Invalid patterns are skipped with a WARN log — the rest
+// flow through, so a typo in one pattern doesn't disable the policy
+// entirely. Empty input returns nil.
+func compileDenyVertexPatterns(raw string, log *slog.Logger) []*regexp.Regexp {
+	plain := splitTrim(raw, ",")
+	if len(plain) == 0 {
+		return nil
+	}
+
+	out := make([]*regexp.Regexp, 0, len(plain))
+	for _, p := range plain {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			log.Warn("buildkit deny vertex pattern invalid; skipping",
+				"pattern", p, "error", err)
+
+			continue
+		}
+
+		out = append(out, re)
+	}
+
+	return out
 }
 
 // resolveRequiredAttrs turns the comma-separated

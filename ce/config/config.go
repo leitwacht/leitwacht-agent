@@ -32,8 +32,10 @@ type Config struct {
 	UnknownProjectMode string // "enforce" (default — apply DefaultAction) | "pass" (passive-only, no checks)
 	DNSUpstream        string
 	TrustedCIDRs       string
-	HoneypotEnabled    bool
-	HoneypotDir        string
+	CredwatchEnabled   bool
+	CredwatchPaths     string // comma-separated path suffixes to watch
+	CredwatchExclude   string // comma-separated path suffixes to exclude
+	ProcMemEnabled     bool
 	RecordEnvNames     bool // when true, attach env-var NAMES (never values) to each Violation report
 	MaxConcurrentEnf   int
 	EventBuffer        int           // size of the watcher's event channel; back-pressures containerd subscriptions when full
@@ -137,7 +139,8 @@ func Load() (*Config, error) {
 		// bare metal.
 		DNSUpstream:                os.Getenv("LEITWACHT_CE_DNS_UPSTREAM"),
 		TrustedCIDRs:               os.Getenv("LEITWACHT_CE_TRUSTED_CIDRS"),
-		HoneypotDir:                envOr("LEITWACHT_CE_HONEYPOT_DIR", "/var/lib/leitwacht/honeypot"),
+		CredwatchPaths:             envOr("LEITWACHT_CE_CREDWATCH_PATHS", defaultCredwatchPaths),
+		CredwatchExclude:           envOr("LEITWACHT_CE_CREDWATCH_EXCLUDE", defaultCredwatchExclude),
 		PromAddr:                   envOr("LEITWACHT_CE_PROM_ADDR", ":9090"),
 		WebhookURL:                 os.Getenv("LEITWACHT_CE_WEBHOOK_URL"),
 		WebhookAuth:                os.Getenv("LEITWACHT_CE_WEBHOOK_AUTH"),
@@ -150,7 +153,11 @@ func Load() (*Config, error) {
 
 	var err error
 
-	c.HoneypotEnabled, err = envBool("LEITWACHT_CE_HONEYPOT_ENABLED", false)
+	c.CredwatchEnabled, err = envBool("LEITWACHT_CE_CREDWATCH_ENABLED", false)
+	if err != nil {
+		return nil, err
+	}
+	c.ProcMemEnabled, err = envBool("LEITWACHT_CE_PROC_MEM_ENABLED", false)
 	if err != nil {
 		return nil, err
 	}
@@ -324,3 +331,13 @@ func envDuration(key string, def time.Duration) (time.Duration, error) {
 	}
 	return d, nil
 }
+
+const defaultCredwatchPaths = "/.aws/credentials,/.ssh/id_rsa,/.ssh/id_ed25519,/.ssh/id_ecdsa," +
+	"/.ssh/config,/.ssh/authorized_keys," +
+	"/.kube/config,/.docker/config.json,/.git-credentials," +
+	"/.config/gcloud/application_default_credentials.json,/.vault-token," +
+	"/.config/gcloud/credentials.db,/.azure/accessTokens.json," +
+	"/.terraform.d/credentials.tfrc.json," +
+	"/secrets/vault_token,/rancher/k3s/k3s.yaml"
+
+const defaultCredwatchExclude = "/.npmrc,/.netrc,/.pypirc"

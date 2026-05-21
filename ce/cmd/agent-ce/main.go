@@ -104,12 +104,12 @@ func main() {
 	}
 
 	// Enforcer.
-	mgr, honeypotCfg, err := newEnforcer(cfg, log)
+	mgr, credwatchCfg, err := newEnforcer(cfg, log)
 	if err != nil {
 		log.Error("start enforcer", "error", err)
 		os.Exit(1)
 	}
-	log.Info("enforcer ready", "honeypot_lsm", mgr.LSMLoaded(), "max_concurrent", cfg.MaxConcurrentEnf)
+	log.Info("enforcer ready", "credwatch_lsm", mgr.CredwatchLSMLoaded(), "proc_mem_lsm", mgr.ProcMemLSMLoaded(), "max_concurrent", cfg.MaxConcurrentEnf)
 
 	// BuildKit step attribution. No-op when LEITWACHT_CE_BUILDKIT_GRPC_ADDR
 	// is empty (the default): the enforcer's egress path still calls
@@ -162,8 +162,11 @@ func main() {
 		UnknownProjectMode: unknownMode,
 	}
 
-	wireHoneypotKill(mgr, w, multi, log)
-	emitHoneypotAdvisory(honeypotCfg, mgr, multi)
+	wireCredwatchKill(mgr, w, multi, log)
+	emitCredwatchAdvisory(credwatchCfg, mgr, multi)
+	wireProcMemKill(mgr, w, multi, log)
+	emitProcMemAdvisory(cfg, mgr, multi)
+	wireDNSKill(mgr, w, multi, log)
 
 	// Channel-depth gauge: surfaces back-pressure against containerd's
 	// event subscription. A persistently non-zero value means CI bursts
@@ -255,14 +258,18 @@ func hostnameOrFallback() string {
 	return h
 }
 
-func newEnforcer(cfg *config.Config, log *slog.Logger) (*enforcer.Manager, enforcer.HoneypotConfig, error) {
+func newEnforcer(cfg *config.Config, log *slog.Logger) (*enforcer.Manager, enforcer.CredwatchConfig, error) {
 	upstreams := splitTrim(cfg.DNSUpstream, ",")
 	trusted := parseTrustedCIDRs(cfg.TrustedCIDRs, log)
 
 	platform := &enforcer.LinuxPlatform{Logger: log}
-	honeypotCfg := enforcer.HoneypotConfig{Enabled: cfg.HoneypotEnabled, Dir: cfg.HoneypotDir}
+	credwatchCfg := enforcer.CredwatchConfig{
+		Enabled:       cfg.CredwatchEnabled,
+		WatchedPaths:  enforcer.ParsePathList(cfg.CredwatchPaths),
+		ExcludedPaths: enforcer.ParsePathList(cfg.CredwatchExclude),
+	}
 
-	mgr := enforcer.NewManager(log, cfg.MaxConcurrentEnf, upstreams, trusted, platform, honeypotCfg)
+	mgr := enforcer.NewManager(log, cfg.MaxConcurrentEnf, upstreams, trusted, platform, credwatchCfg, enforcer.ProcMemConfig{Enabled: cfg.ProcMemEnabled})
 	mgr.NetnsGrace = cfg.NetnsGrace
 	mgr.IsDocker = cfg.ContainerRuntime == "docker"
 	mgr.AgentVersion = version.Version
@@ -279,10 +286,19 @@ func newEnforcer(cfg *config.Config, log *slog.Logger) (*enforcer.Manager, enfor
 		log.Info("env-name capture enabled (LEITWACHT_CE_RECORD_ENV_NAMES=true)")
 	}
 
-	if err := mgr.StartHoneypot(); err != nil {
-		return nil, honeypotCfg, fmt.Errorf("start honeypot lsm: %w", err)
+	if err := mgr.StartDNSPIDTracker(); err != nil {
+		log.Warn("dns pid tracker failed to start", "error", err)
 	}
-	return mgr, honeypotCfg, nil
+	if err := mgr.StartCredwatch(); err != nil {
+		mgr.StopDNSPIDTracker()
+		return nil, credwatchCfg, fmt.Errorf("start credwatch lsm: %w", err)
+	}
+	if err := mgr.StartProcMem(); err != nil {
+		mgr.StopCredwatch()
+		mgr.StopDNSPIDTracker()
+		return nil, credwatchCfg, fmt.Errorf("start proc_mem lsm: %w", err)
+	}
+	return mgr, credwatchCfg, nil
 }
 
 func newWatcher(cfg *config.Config, log *slog.Logger) (watcher.ContainerWatcher, error) {
@@ -309,35 +325,83 @@ func newWatcher(cfg *config.Config, log *slog.Logger) (watcher.ContainerWatcher,
 	return w, nil
 }
 
-func wireHoneypotKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *sinks.Multi, log *slog.Logger) {
-	mgr.OnHoneypotEvent = func(ev enforcer.HoneypotEvent) {
+func wireCredwatchKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *sinks.Multi, log *slog.Logger) {
+	mgr.OnCredwatchEvent = func(ev enforcer.CredwatchEvent) {
 		if ev.ContainerID != "" {
 			if err := w.KillContainer(context.Background(), ev.ContainerID); err != nil {
-				log.Warn("honeypot kill failed", "container", ev.ContainerID, "error", err)
+				log.Warn("credwatch kill failed", "container", ev.ContainerID, "error", err)
 			}
 		}
-		// Synthesize an advisory so operators see the honeypot trip.
 		_ = sink.ReportAdvisory(context.Background(), &advisory.Advisory{
 			ContainerID: ev.ContainerID,
-			Kind:        advisory.KindBPFLSMUnavailable, // closest catch-all today
-			Message:     fmt.Sprintf("honeypot tripped: %s", ev.HoneypotPath),
+			Kind:        advisory.KindCredFileOpen,
+			Message:     fmt.Sprintf("credential file access detected: pid=%d comm=%q path=%q", ev.PID, ev.Comm, ev.Path),
 			ActionTaken: "killed",
 		})
-		// And ship the final egress stats if we still have them.
 		if result := mgr.Detach(ev.ContainerID); result != nil {
 			sink.ReportAsync(context.Background(), result.Info, &result.Stats, false, time.Time{})
 		}
 	}
 }
 
-func emitHoneypotAdvisory(cfg enforcer.HoneypotConfig, mgr *enforcer.Manager, sink *sinks.Multi) {
-	if !cfg.Enabled || mgr.LSMLoaded() {
+func emitCredwatchAdvisory(cfg enforcer.CredwatchConfig, mgr *enforcer.Manager, sink *sinks.Multi) {
+	if !cfg.Enabled || mgr.CredwatchLSMLoaded() {
 		return
 	}
 	_ = sink.ReportAdvisory(context.Background(), &advisory.Advisory{
-		Kind:        advisory.KindBPFLSMUnavailable,
-		Message:     "BPF LSM not supported by kernel — honeypot enforcement inactive",
+		Kind:        advisory.KindCredwatchLSMUnavailable,
+		Message:     "BPF LSM not supported by kernel — credential file watch enforcement inactive",
 		ActionTaken: "warned",
+	})
+}
+
+func wireProcMemKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *sinks.Multi, log *slog.Logger) {
+	mgr.OnProcMemEvent = func(ev enforcer.ProcMemEvent) {
+		if ev.ContainerID != "" {
+			if err := w.KillContainer(context.Background(), ev.ContainerID); err != nil {
+				log.Warn("proc_mem kill failed", "container", ev.ContainerID, "error", err)
+			}
+		}
+		_ = sink.ReportAdvisory(context.Background(), &advisory.Advisory{
+			ContainerID: ev.ContainerID,
+			Kind:        advisory.KindProcMemRead,
+			Message:     fmt.Sprintf("process memory read detected: pid=%d comm=%q path=%q", ev.PID, ev.Comm, ev.Path),
+			ActionTaken: "killed",
+		})
+		if result := mgr.Detach(ev.ContainerID); result != nil {
+			sink.ReportAsync(context.Background(), result.Info, &result.Stats, false, time.Time{})
+		}
+	}
+}
+
+func emitProcMemAdvisory(cfg *config.Config, mgr *enforcer.Manager, sink *sinks.Multi) {
+	if !cfg.ProcMemEnabled || mgr.ProcMemLSMLoaded() {
+		return
+	}
+	_ = sink.ReportAdvisory(context.Background(), &advisory.Advisory{
+		Kind:        advisory.KindProcMemLSMUnavailable,
+		Message:     "BPF LSM not supported by kernel — /proc/*/mem read enforcement inactive",
+		ActionTaken: "warned",
+	})
+}
+
+func wireDNSKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *sinks.Multi, log *slog.Logger) {
+	mgr.SetOnDNSViolation(func(cgroupID uint64, domain, action string) {
+		containerID := mgr.ContainerIDForCgroup(cgroupID)
+		if containerID != "" {
+			if err := w.KillContainer(context.Background(), containerID); err != nil {
+				log.Warn("dns kill failed", "container", containerID, "error", err)
+			}
+		}
+		_ = sink.ReportAdvisory(context.Background(), &advisory.Advisory{
+			ContainerID: containerID,
+			Kind:        advisory.KindDNSViolationKill,
+			Message:     fmt.Sprintf("dns %s: %s — container killed", action, domain),
+			ActionTaken: "killed",
+		})
+		if result := mgr.Detach(containerID); result != nil {
+			sink.ReportAsync(context.Background(), result.Info, &result.Stats, false, time.Time{})
+		}
 	})
 }
 
@@ -384,7 +448,9 @@ func runEventLoop(
 		select {
 		case <-ctx.Done():
 			log.Info("shutting down, detaching enforcers")
-			mgr.StopHoneypot()
+			mgr.StopCredwatch()
+			mgr.StopDNSPIDTracker()
+			mgr.StopProcMem()
 			results := mgr.DetachAll()
 			for _, r := range results {
 				sink.ReportAsync(ctx, r.Info, &r.Stats, false, time.Time{})

@@ -19,11 +19,10 @@ type ContainerEvent struct {
 	PodUID      string            // K8s pod UID from io.kubernetes.pod.uid (set on pod_sandbox_* actions; for SandboxChanged keying)
 
 	// Security flags detected during inspection
-	HasDinD               bool // DOCKER_HOST=tcp://... in env
-	HasSocketMount        bool // /var/run/docker.sock in mounts
-	HasGVisor             bool // runtime == "runsc"
-	MissingNetworkPerBld  bool // FF_NETWORK_PER_BUILD not set or false
-	MissingHoneypotMounts bool // expected honeypot mount targets not found
+	HasDinD              bool // DOCKER_HOST=tcp://... in env
+	HasSocketMount       bool // /var/run/docker.sock in mounts
+	HasGVisor            bool // runtime == "runsc"
+	MissingNetworkPerBld bool // FF_NETWORK_PER_BUILD not set or false
 }
 
 const (

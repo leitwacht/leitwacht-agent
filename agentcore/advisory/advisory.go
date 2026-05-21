@@ -25,7 +25,11 @@ const (
 	KindAttachFailure            Kind = "attach_failure"
 	KindAgentStartupFailure      Kind = "agent_startup_failure"
 	KindBPFLSMUnavailable        Kind = "bpf_lsm_unavailable"
-	KindHoneypotMountsMissing    Kind = "honeypot_mounts_missing"
+	KindCredFileOpen             Kind = "cred_file_open"
+	KindCredwatchLSMUnavailable  Kind = "credwatch_lsm_unavailable"
+	KindProcMemRead              Kind = "proc_mem_read"
+	KindProcMemLSMUnavailable    Kind = "proc_mem_lsm_unavailable"
+	KindDNSViolationKill         Kind = "dns_violation_kill"
 )
 
 // Advisory is the plain-Go view of a single security concern the agent

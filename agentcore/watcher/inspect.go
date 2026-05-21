@@ -83,29 +83,7 @@ func extractContainerEvent(
 		}
 	}
 
-	// Honeypot mount detection — check for expected honeypot target paths.
-	ev.MissingHoneypotMounts = !hasHoneypotMounts(mounts)
-
 	return ev
-}
-
-// honeypotTargets are mount target paths that indicate honeypot files are present.
-var honeypotTargets = []string{ //nolint:gochecknoglobals // constant-like lookup table
-	"/.aws/credentials",
-	"/.ssh/id_rsa",
-	"/.config/gcloud/application_default_credentials.json",
-}
-
-func hasHoneypotMounts(mounts []string) bool {
-	for _, m := range mounts {
-		for _, target := range honeypotTargets {
-			if strings.HasSuffix(m, target) {
-				return true
-			}
-		}
-	}
-
-	return false
 }
 
 // resolveScope returns the project/scope key for a container, preferring

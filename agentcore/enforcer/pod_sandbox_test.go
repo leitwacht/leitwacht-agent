@@ -51,7 +51,7 @@ func TestAttachPodSandbox_AttachesAtPodCgroup(t *testing.T) {
 		},
 	}
 
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 
 	err := mgr.AttachPodSandbox(PodSandboxInfo{
@@ -131,7 +131,7 @@ func TestAttachPodSandbox_BuildContainerJoinSkipsAttachCgroup(t *testing.T) {
 		},
 	}
 
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 
 	err := mgr.AttachPodSandbox(PodSandboxInfo{
@@ -175,7 +175,7 @@ func TestAttachPodSandbox_FallbackOnNonK8sPath(t *testing.T) {
 		netnsByPID: map[int]uint64{testSandboxPID: testSharedNetnsIno},
 	}
 
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 
 	err := mgr.AttachPodSandbox(PodSandboxInfo{
@@ -206,7 +206,7 @@ func TestAttachPodSandbox_StatMissingFallsBack(t *testing.T) {
 		netnsByPID: map[int]uint64{testSandboxPID: testSharedNetnsIno},
 	}
 
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 
 	// K8s-shape path that doesn't exist on disk.
@@ -241,7 +241,7 @@ func TestDetachPodSandbox_TriggersTeardown(t *testing.T) {
 		netnsByPID: map[int]uint64{testSandboxPID: testSharedNetnsIno},
 	}
 
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0 // immediate teardown
 	defer mgr.DetachAll()
 

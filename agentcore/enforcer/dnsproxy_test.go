@@ -71,7 +71,7 @@ func TestHandleDNSQuery_BlockedDomain(t *testing.T) {
 	cfg, pol, rec := testDNSConfig("block", []policy.Rule{allowFQDN("pypi.org", 443)})
 
 	msg := makeQuery(testEvilDomain, dns.TypeA)
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	assertSinkholeA(t, resp)
 
@@ -138,7 +138,7 @@ func TestHandleDNSQuery_LeitwachtAttached(t *testing.T) {
 
 	t.Run("A record returns pinned attachment IP", func(t *testing.T) {
 		msg := makeQuery(ReservedDomains[0], dns.TypeA)
-		resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+		resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 		if resp.Rcode != dns.RcodeSuccess {
 			t.Fatalf("rcode = %d, want NOERROR", resp.Rcode)
@@ -164,7 +164,7 @@ func TestHandleDNSQuery_LeitwachtAttached(t *testing.T) {
 
 	t.Run("TXT record echoes agent version", func(t *testing.T) {
 		msg := makeQuery(ReservedDomains[0], dns.TypeTXT)
-		resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+		resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 		if resp.Rcode != dns.RcodeSuccess {
 			t.Fatalf("rcode = %d, want NOERROR", resp.Rcode)
@@ -191,7 +191,7 @@ func TestHandleDNSQuery_LeitwachtAttached(t *testing.T) {
 
 	t.Run("AAAA returns NOERROR with empty answer", func(t *testing.T) {
 		msg := makeQuery(ReservedDomains[0], dns.TypeAAAA)
-		resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+		resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 		if resp.Rcode != dns.RcodeSuccess {
 			t.Fatalf("rcode = %d, want NOERROR (not NXDOMAIN)", resp.Rcode)
@@ -208,7 +208,7 @@ func TestHandleDNSQuery_LeitwachtAttached(t *testing.T) {
 		cfg.AgentVersion = testVersion
 
 		msg := makeQuery(ReservedDomains[0], dns.TypeA)
-		_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+		_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 		_, activity := rec.Snapshot()
 		for _, a := range activity {
@@ -236,7 +236,7 @@ func TestHandleDNSQuery_LeitwachtAttached(t *testing.T) {
 
 		for _, name := range variants {
 			msg := makeQuery(name, dns.TypeA)
-			resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+			resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 			if resp.Rcode != dns.RcodeNameError {
 				t.Errorf("variant %q: rcode = %d, want NXDOMAIN", name, resp.Rcode)
@@ -262,7 +262,7 @@ func TestHandleDNSQuery_LeitwachtAttached(t *testing.T) {
 		cfg.AgentVersion = ""
 
 		msg := makeQuery(ReservedDomains[0], dns.TypeTXT)
-		resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+		resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 		txt, ok := resp.Answer[0].(*dns.TXT)
 		if !ok {
@@ -280,7 +280,7 @@ func TestHandleDNSQuery_EmptyQuestion(t *testing.T) {
 
 	msg := &dns.Msg{}
 	msg.Id = dns.Id()
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	if resp.Rcode != dns.RcodeRefused {
 		t.Fatalf("rcode = %d, want REFUSED", resp.Rcode)
@@ -298,7 +298,7 @@ func TestHandleDNSQuery_AllowedDomainForwarded(t *testing.T) {
 	}
 
 	msg := makeQuery("example.com", dns.TypeA)
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	// Response depends on live DNS resolution (may fail in CI).
 	if resp.Rcode == dns.RcodeNameError {
@@ -310,7 +310,7 @@ func TestHandleDNSQuery_AuditModeForwardsEverything(t *testing.T) {
 	cfg, pol, rec := testDNSConfig("audit", []policy.Rule{allowFQDN("pypi.org", 443)})
 
 	msg := makeQuery(testEvilDomain, dns.TypeA)
-	_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	violations, activity := rec.Snapshot()
 	if len(violations) != 0 {
@@ -328,7 +328,7 @@ func TestHandleDNSQuery_WildcardAllowSingleLabel(t *testing.T) {
 	cfg, pol, rec := testDNSConfig("block", []policy.Rule{allowFQDN("*.example.com", 443)})
 
 	msg := makeQuery("sub.example.com", dns.TypeA)
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	if resp.Rcode == dns.RcodeNameError {
 		t.Fatal("wildcard-matched domain should not return NXDOMAIN")
@@ -341,7 +341,7 @@ func TestHandleDNSQuery_WildcardAllowRejectsMultiLabel(t *testing.T) {
 	cfg, pol, rec := testDNSConfig("block", []policy.Rule{allowFQDN("*.example.com", 443)})
 
 	msg := makeQuery("a.b.example.com", dns.TypeA)
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	assertSinkholeA(t, resp)
 
@@ -356,7 +356,7 @@ func TestHandleDNSQuery_ClusterLocalBlocked(t *testing.T) {
 	cfg, pol, rec := testDNSConfig("block", nil)
 
 	msg := makeQuery("storage.googleapis.com.svc.cluster.local", dns.TypeA)
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	assertSinkholeA(t, resp)
 
@@ -376,7 +376,7 @@ func TestHandleDNSQuery_ClusterLocalAllowlisted(t *testing.T) {
 	})
 
 	msg := makeQuery("my-api.staging.svc.cluster.local", dns.TypeA)
-	_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	_, activity := rec.Snapshot()
 	if len(activity) != 1 || activity[0].Domain != "my-api.staging.svc.cluster.local" {
@@ -395,7 +395,7 @@ func TestHandleDNSQuery_DenyRuleSinkhole(t *testing.T) {
 	})
 
 	msg := makeQuery("telemetry.example.com", dns.TypeA)
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	assertSinkholeA(t, resp)
 
@@ -417,7 +417,7 @@ func TestHandleDNSQuery_FirstMatch_AllowBeforeDenyWildcard(t *testing.T) {
 	})
 
 	msg := makeQuery("foo.example.com", dns.TypeA)
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	if resp.Rcode == dns.RcodeNameError {
 		t.Fatal("allow-first should forward foo.example.com, not NXDOMAIN")
@@ -437,7 +437,7 @@ func TestHandleDNSQuery_FirstMatch_DenyBeforeAllowWildcard(t *testing.T) {
 	})
 
 	msg := makeQuery("evil.example.com", dns.TypeA)
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	assertSinkholeA(t, resp)
 
@@ -460,13 +460,13 @@ func TestHandleDNSQuery_BlockClusterExceptKubeDNS(t *testing.T) {
 	// Allowed kube-dns forwards.
 	_ = HandleDNSQuery(
 		makeQuery("kube-dns.kube-system.svc.cluster.local", dns.TypeA),
-		cfg, pol, rec, 0, "", "", "",
+		cfg, pol, rec, 0, "", "", "", 0,
 	)
 
 	// Any other cluster.local returns NXDOMAIN.
 	resp := HandleDNSQuery(
 		makeQuery("other.svc.cluster.local", dns.TypeA),
-		cfg, pol, rec, 0, "", "", "",
+		cfg, pol, rec, 0, "", "", "", 0,
 	)
 	if resp.Rcode != dns.RcodeNameError {
 		t.Fatalf("other.svc.cluster.local rcode = %d, want NXDOMAIN", resp.Rcode)
@@ -475,7 +475,7 @@ func TestHandleDNSQuery_BlockClusterExceptKubeDNS(t *testing.T) {
 	// k8s search-path variant also NXDOMAINs (suffix-match on the deny).
 	resp = HandleDNSQuery(
 		makeQuery("git.example.com.gitlab-runner.svc.cluster.local", dns.TypeA),
-		cfg, pol, rec, 0, "", "", "",
+		cfg, pol, rec, 0, "", "", "", 0,
 	)
 	if resp.Rcode != dns.RcodeNameError {
 		t.Fatalf("search-path rcode = %d, want NXDOMAIN", resp.Rcode)
@@ -491,7 +491,7 @@ func TestHandleDNSQuery_ClusterLocalNXDomain(t *testing.T) {
 	})
 
 	msg := makeQuery("git.example.com.gitlab-runner.svc.cluster.local", dns.TypeA)
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	if resp.Rcode != dns.RcodeNameError {
 		t.Fatalf("rcode = %d, want NXDOMAIN (%d)", resp.Rcode, dns.RcodeNameError)
@@ -521,7 +521,7 @@ func TestHandleDNSQuery_ClusterLocalSinkhole(t *testing.T) {
 	})
 
 	msg := makeQuery("c2.beacon.attacker.net", dns.TypeA)
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	assertSinkholeA(t, resp)
 
@@ -543,7 +543,7 @@ func TestHandleDNSQuery_BlockedAAAAFallsBackToNXDOMAIN(t *testing.T) {
 	cfg, pol, rec := testDNSConfig("block", []policy.Rule{allowFQDN("pypi.org", 443)})
 
 	msg := makeQuery(testEvilDomain, dns.TypeAAAA)
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	if resp.Rcode != dns.RcodeNameError {
 		t.Fatalf("AAAA blocked query should NXDOMAIN, got rcode=%d", resp.Rcode)
@@ -579,7 +579,7 @@ func TestDNSProxy_UpdatePolicy(t *testing.T) {
 
 	msg := makeQuery(testEvilDomain, dns.TypeA)
 	pol := proxy.policy.Load()
-	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "")
+	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
 	if resp.Rcode == dns.RcodeNameError {
 		t.Fatal("audit-all mode should not return NXDOMAIN")
@@ -601,7 +601,7 @@ func TestDNSProxy_UpdatePolicy(t *testing.T) {
 	rec2 := NewViolationRecorder(nil)
 	msg2 := makeQuery(testEvilDomain, dns.TypeA)
 	pol2 := proxy.policy.Load()
-	resp2 := HandleDNSQuery(msg2, cfg, pol2, rec2, 0, "", "", "")
+	resp2 := HandleDNSQuery(msg2, cfg, pol2, rec2, 0, "", "", "", 0)
 	assertSinkholeA(t, resp2)
 
 	violations2, activity2 := rec2.Snapshot()
@@ -612,4 +612,113 @@ func TestDNSProxy_UpdatePolicy(t *testing.T) {
 	if len(activity2) != 1 || activity2[0].Action != actionDNSBlocked {
 		t.Fatalf("expected dns_blocked activity after swap, got %+v", activity2)
 	}
+}
+
+func TestHandleDNSQuery_OnDNSViolation_BlockMode(t *testing.T) {
+	// Verify OnDNSViolation fires for both dns_blocked and dns_denied
+	// in block mode, with the correct domain and action.
+	cfg, pol, rec := testDNSConfig("block", []policy.Rule{
+		denyFQDN("denied.example.com", policy.DenyResolutionSinkhole),
+		allowFQDN("allowed.example.com", 443),
+	})
+
+	var violations []struct {
+		cgroupID uint64
+		domain   string
+		action   string
+	}
+
+	cfg.OnDNSViolation = func(cgroupID uint64, domain, action string) {
+		violations = append(violations, struct {
+			cgroupID uint64
+			domain   string
+			action   string
+		}{cgroupID: cgroupID, domain: domain, action: action})
+	}
+
+	const testCgroupID uint64 = 42
+
+	// Case 1: default-allow sinkhole (dns_blocked) -- no rule matches, block mode
+	msg := makeQuery(testEvilDomain, dns.TypeA)
+	_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", testCgroupID)
+
+	if len(violations) != 1 {
+		t.Fatalf("expected 1 OnDNSViolation call for dns_blocked, got %d", len(violations))
+	}
+
+	if violations[0].domain != testEvilDomain {
+		t.Errorf("domain = %q, want %q", violations[0].domain, testEvilDomain)
+	}
+
+	if violations[0].action != actionDNSBlocked {
+		t.Errorf("action = %q, want %q", violations[0].action, actionDNSBlocked)
+	}
+
+	if violations[0].cgroupID != testCgroupID {
+		t.Errorf("cgroupID = %d, want %d", violations[0].cgroupID, testCgroupID)
+	}
+
+	// Case 2: explicit deny rule (dns_denied)
+	violations = nil
+
+	msg = makeQuery("denied.example.com", dns.TypeA)
+	_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", testCgroupID)
+
+	if len(violations) != 1 {
+		t.Fatalf("expected 1 OnDNSViolation call for dns_denied, got %d", len(violations))
+	}
+
+	if violations[0].domain != "denied.example.com" {
+		t.Errorf("domain = %q, want %q", violations[0].domain, "denied.example.com")
+	}
+
+	if violations[0].action != actionDNSDenied {
+		t.Errorf("action = %q, want %q", violations[0].action, actionDNSDenied)
+	}
+
+	// Case 3: allowed domain -- no violation callback
+	violations = nil
+
+	msg = makeQuery("allowed.example.com", dns.TypeA)
+	_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", testCgroupID)
+
+	if len(violations) != 0 {
+		t.Fatalf("allowed domain should not trigger OnDNSViolation, got %d calls", len(violations))
+	}
+
+	_ = rec // suppress unused warning
+}
+
+func TestHandleDNSQuery_OnDNSViolation_AuditMode(t *testing.T) {
+	// Verify OnDNSViolation is NOT called in audit mode --
+	// audit mode records but does not kill.
+	cfg, pol, rec := testDNSConfig("audit", []policy.Rule{
+		denyFQDN("denied.example.com", policy.DenyResolutionSinkhole),
+	})
+
+	var violationCalled bool
+
+	cfg.OnDNSViolation = func(_ uint64, _, _ string) {
+		violationCalled = true
+	}
+
+	const testCgroupID uint64 = 42
+
+	// Case 1: default-allow in audit mode -- forwarded, no kill
+	msg := makeQuery(testEvilDomain, dns.TypeA)
+	_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", testCgroupID)
+
+	if violationCalled {
+		t.Fatal("OnDNSViolation should not be called in audit mode (default-allow)")
+	}
+
+	// Case 2: explicit deny rule in audit mode -- forwarded, no kill
+	msg = makeQuery("denied.example.com", dns.TypeA)
+	_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", testCgroupID)
+
+	if violationCalled {
+		t.Fatal("OnDNSViolation should not be called in audit mode (deny rule)")
+	}
+
+	_ = rec // suppress unused warning
 }

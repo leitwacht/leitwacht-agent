@@ -239,7 +239,7 @@ func TestContainerScopeCgroup(t *testing.T) {
 
 func TestAttachDetachHappyPath(t *testing.T) {
 	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0 // immediate teardown for this test
 	defer mgr.DetachAll()
 	ctx := context.Background()
@@ -292,7 +292,7 @@ func TestAttachDetachHappyPath(t *testing.T) {
 
 func TestAttachSkipsAllowAction(t *testing.T) {
 	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 
 	pol := testPolicy("allow")
 	e, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "abcdef123456"}, 1, pol)
@@ -309,7 +309,7 @@ func TestAttachSkipsAllowAction(t *testing.T) {
 
 func TestAttachMaxConcurrency(t *testing.T) {
 	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
-	mgr := NewManager(testLogger(), 1, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 1, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 	ctx := context.Background()
 
@@ -332,7 +332,7 @@ func TestAttachMaxConcurrency(t *testing.T) {
 
 func TestAttachDuplicateContainerSkipped(t *testing.T) {
 	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 	ctx := context.Background()
 
@@ -366,7 +366,7 @@ func TestAttachSiblingJoinsNetnsContext(t *testing.T) {
 			101: 4242,
 		},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 	ctx := context.Background()
 	pol := testPolicy("audit")
@@ -412,7 +412,7 @@ func TestDetachSiblingRefcountDecrement(t *testing.T) {
 			101: 4242,
 		},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0 // immediate teardown for this test
 	defer mgr.DetachAll()
 	ctx := context.Background()
@@ -456,7 +456,7 @@ func TestDetachPrimaryUpdatesLivePID(t *testing.T) {
 			101: 4242,
 		},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 	ctx := context.Background()
 	pol := testPolicy("audit")
@@ -494,7 +494,7 @@ func TestSiblingAttachFailureNoRefcountLeak(t *testing.T) {
 			101: 4242,
 		},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 	ctx := context.Background()
 	pol := testPolicy("audit")
@@ -537,7 +537,7 @@ func TestRecorderRoutingPerContainer(t *testing.T) {
 			101: 4242,
 		},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 	ctx := context.Background()
 	pol := testPolicy("audit")
@@ -582,7 +582,7 @@ func TestAttachDistinctNetnsBothEnforced(t *testing.T) {
 			201: 2222,
 		},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 	ctx := context.Background()
 	pol := testPolicy("audit")
@@ -619,7 +619,7 @@ func TestAttachAfterPrimaryDetachedReusesNetns(t *testing.T) {
 			301: 9999,
 		},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 	ctx := context.Background()
 	pol := testPolicy("audit")
@@ -656,7 +656,7 @@ func TestAttachFailureReleasesNetnsOwner(t *testing.T) {
 			401: 7777,
 		},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 
 	pol := testPolicy("audit")
@@ -685,7 +685,7 @@ func TestAttachFailureCleansSentinel(t *testing.T) {
 		cgroupPath:  "/sys/fs/cgroup/test",
 		loadEBPFErr: errors.New("ebpf failed"),
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 
 	pol := testPolicy("audit")
@@ -715,7 +715,7 @@ func TestAttachRollbackOnNftablesFailure(t *testing.T) {
 		cgroupPath:       "/sys/fs/cgroup/test",
 		setupRedirectErr: errors.New("nftables failed"),
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 
 	pol := testPolicy("block")
 	_, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "abcdef123456"}, 1, pol)
@@ -733,7 +733,7 @@ func TestAttachRollbackOnEBPFFailure(t *testing.T) {
 		cgroupPath:  "/sys/fs/cgroup/test",
 		loadEBPFErr: errors.New("ebpf load failed"),
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 
 	pol := testPolicy("audit")
 	_, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "abcdef123456"}, 1, pol)
@@ -750,7 +750,7 @@ func TestAttachRollbackOnCgroupFailure(t *testing.T) {
 	fp := &fakePlatform{
 		cgroupErr: errors.New("cgroup not found"),
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 
 	pol := testPolicy("audit")
 	_, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "abcdef123456"}, 1, pol)
@@ -768,7 +768,7 @@ func TestAttachRollbackOnBindFailure(t *testing.T) {
 		cgroupPath: "/sys/fs/cgroup/test",
 		bindErr:    errors.New("bind failed"),
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 
 	pol := testPolicy("block")
 	_, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "abcdef123456"}, 1, pol)
@@ -782,7 +782,7 @@ func TestAttachRollbackOnBindFailure(t *testing.T) {
 
 func TestDetachNonExistent(t *testing.T) {
 	fp := &fakePlatform{}
-	mgr := NewManager(testLogger(), 32, nil, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, nil, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 
 	result := mgr.Detach("nonexistent1234")
 	if result != nil {
@@ -798,7 +798,7 @@ func TestRecorderRegisteredBeforeReady(t *testing.T) {
 			101: 5555,
 		},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 	ctx := context.Background()
 	pol := testPolicy("audit")
@@ -853,7 +853,7 @@ func TestRecorderRegisteredBeforeReady(t *testing.T) {
 
 func TestDetachCollectsViolations(t *testing.T) {
 	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	ctx := context.Background()
 
 	info := ContainerInfo{ContainerID: "abcdef123456", ProjectPath: "test/project"}
@@ -894,7 +894,7 @@ func TestDetachCollectsViolations(t *testing.T) {
 // domains never reached the DB and showed as PASS in the egress view.
 func TestDNSBucketReporterIncludesActivity(t *testing.T) {
 	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 
 	// Enable bucketing with a short interval so the tick fires during the test.
@@ -951,7 +951,7 @@ func TestDNSBucketReporterIncludesActivity(t *testing.T) {
 // read it — producing empty reports for short-lived containers.
 func TestDetachWithGracePeriodCapturesDNS(t *testing.T) {
 	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 50 * time.Millisecond // short grace so deferred teardown completes quickly
 	mgr.BucketInterval = 50 * time.Millisecond
 
@@ -998,7 +998,7 @@ func TestPrepareNetns_SiblingThenBuild(t *testing.T) {
 		cgroupPath: "/sys/fs/cgroup/test",
 		netnsByPID: map[int]uint64{100: 9999, 101: 9999},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 	ctx := context.Background()
 
@@ -1077,7 +1077,7 @@ func TestPrepareNetns_BuildJoinUpdatesEBPFMode(t *testing.T) {
 		cgroupPath: "/sys/fs/cgroup/test",
 		netnsByPID: map[int]uint64{100: 8888, 101: 8888},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 
 	// Step 1: Helper container starts — PrepareNetns sets up in audit mode.
@@ -1144,7 +1144,7 @@ func TestPrepareNetns_RingbufReaderObservesLiveModeFlip(t *testing.T) {
 		cgroupPath: "/sys/fs/cgroup/test",
 		netnsByPID: map[int]uint64{100: 9999, 101: 9999},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 
 	prepErr := mgr.PrepareNetns("helper0000000000", 100, "/sys/fs/cgroup/helper")
@@ -1183,7 +1183,7 @@ func TestPrepareNetns_RingbufReaderObservesLiveModeFlip(t *testing.T) {
 
 func TestPrepareNetns_SiblingDetachSuppressesReport(t *testing.T) {
 	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 
 	err := mgr.PrepareNetns("helper0000000000", 100, "/sys/fs/cgroup/helper")
@@ -1220,7 +1220,7 @@ func TestInitContainerExitsBeforeBuild(t *testing.T) {
 		cgroupPath: "/sys/fs/cgroup/test",
 		netnsByPID: map[int]uint64{100: 7777, 200: 7777},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 100 * time.Millisecond // short grace for test
 	defer mgr.DetachAll()
 	ctx := context.Background()
@@ -1328,7 +1328,7 @@ func TestPrepareNetns_IdempotentWhenAlreadyPrepared(t *testing.T) {
 		cgroupPath: "/sys/fs/cgroup/test",
 		netnsByPID: map[int]uint64{100: 9999, 101: 9999},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	defer mgr.DetachAll()
 
 	err := mgr.PrepareNetns("helper0000000000", 100, "/sys/fs/cgroup/helper")
@@ -1362,7 +1362,7 @@ func TestSiblingDenyIPsDoNotLeakAcrossDetach(t *testing.T) {
 			101: 4242,
 		},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, HoneypotConfig{})
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0
 	defer mgr.DetachAll()
 

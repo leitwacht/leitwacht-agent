@@ -80,6 +80,12 @@ type DNSProxyConfig struct {
 	// AgentVersion is echoed in the TXT record for attachedName.
 	// Empty strings render as "unknown" — leaving this unset is not a bug.
 	AgentVersion string
+
+	// OnDNSViolation is called when a DNS query is blocked or denied in
+	// block mode, providing an opportunity for immediate container kill.
+	// Receives the cgroup ID, domain, and action string ("dns_blocked" or "dns_denied").
+	// Nil by default — CE wires this in main.go. Not called in audit mode.
+	OnDNSViolation func(cgroupID uint64, domain, action string)
 }
 
 // HandleDNSQuery processes a single DNS query under ordered-rule policy.
@@ -96,6 +102,7 @@ type DNSProxyConfig struct {
 func HandleDNSQuery(
 	msg *dns.Msg, cfg *DNSProxyConfig, pol *policy.ResolvedPolicy,
 	recorder *ViolationRecorder, pid uint32, comm, parentComm, binaryPath string,
+	cgroupID uint64,
 ) *dns.Msg {
 	if len(msg.Question) == 0 {
 		return refusedResponse(msg)
@@ -131,7 +138,7 @@ func HandleDNSQuery(
 	match, matched := matchFirstRule(qname, rules)
 	if matched {
 		if match.Action == policy.ActionDeny {
-			return handleDenyRule(msg, qname, qtype, match, recorder, pid, comm, parentComm, binaryPath, cfg.Logger)
+			return handleDenyRule(msg, cfg, qname, qtype, match, recorder, pid, comm, parentComm, binaryPath, cgroupID, pol.Action == policy.ActionAudit)
 		}
 
 		return handleAllowRule(msg, cfg, qname, qtype, match, recorder, pid, comm, parentComm, binaryPath)
@@ -145,6 +152,10 @@ func HandleDNSQuery(
 		}
 
 		cfg.Logger.Debug("dns blocked", "domain", qname)
+
+		if cfg.OnDNSViolation != nil {
+			cfg.OnDNSViolation(cgroupID, qname, "dns_blocked")
+		}
 
 		return sinkholeResponse(msg)
 	}
@@ -185,9 +196,9 @@ func matchesRule(qname string, r policy.Rule) bool {
 // NXDOMAIN when resolution=nxdomain (k8s search-path cleanup), sinkhole
 // A record otherwise (forensic signal on follow-up connect).
 func handleDenyRule(
-	msg *dns.Msg, qname string, qtype uint16, rule policy.Rule,
+	msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uint16, rule policy.Rule,
 	recorder *ViolationRecorder, pid uint32, comm, parentComm, binaryPath string,
-	logger *slog.Logger,
+	cgroupID uint64, isAudit bool,
 ) *dns.Msg {
 	useNXDomain := rule.Resolution == policy.DenyResolutionNXDomain
 
@@ -200,7 +211,11 @@ func handleDenyRule(
 		recorder.RecordDNS(qname, dns.TypeToString[qtype], "dns_denied", resolvedIPs, pid, comm, parentComm, binaryPath)
 	}
 
-	logger.Debug("dns denied", "domain", qname, "pattern", rule.Pattern, "resolution", rule.Resolution)
+	cfg.Logger.Debug("dns denied", "domain", qname, "pattern", rule.Pattern, "resolution", rule.Resolution)
+
+	if cfg.OnDNSViolation != nil && !isAudit {
+		cfg.OnDNSViolation(cgroupID, qname, "dns_denied")
+	}
 
 	if useNXDomain {
 		return nxdomainResponse(msg)
@@ -574,7 +589,7 @@ func (p *DNSProxy) Start(udpConn net.PacketConn, tcpListener net.Listener) {
 
 		pol := p.policy.Load()
 
-		resp := HandleDNSQuery(r, p.cfg, pol, recorder, pid, comm, parentComm, binaryPath)
+		resp := HandleDNSQuery(r, p.cfg, pol, recorder, pid, comm, parentComm, binaryPath, cgroupID)
 		if resp != nil {
 			_ = w.WriteMsg(resp)
 		}

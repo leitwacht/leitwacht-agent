@@ -224,15 +224,26 @@ type Manager struct {
 	// DNS PID tracker (global kprobe, per-container cgroup registration).
 	dnsPIDTracker *DNSPIDTracker
 
-	// Honeypot LSM (global, not per-container).
-	// Fields used by honeypot_linux.go; appear unused on non-linux builds.
-	honeypotCfg       HoneypotConfig
-	lsmLoaded         bool                               //nolint:unused,nolintlint // used in honeypot_linux.go (linux-only build tag)
-	honeypotState     any                                //nolint:unused,nolintlint // *honeypotLSMImpl on Linux
-	honeypotStop      func()                             //nolint:unused,nolintlint // stops ring buffer reader
-	containers        map[string]*honeypotContainerState // containerID → tracked state
-	cgroupToContainer map[uint64]string                  // cgroupID → containerID (for event resolution)
-	OnHoneypotEvent   func(event HoneypotEvent)          // callback for kill + report
+	// Credwatch LSM (global, not per-container).
+	// Fields used by credwatch_linux.go; appear unused on non-linux builds.
+	credwatchCfg               CredwatchConfig                              //nolint:unused,nolintlint // used in credwatch_linux.go
+	credwatchLSMLoaded         bool                                         //nolint:unused,nolintlint // true after successful LSM load
+	credwatchState             any                                          //nolint:unused,nolintlint // *credwatchLSMImpl on Linux
+	credwatchStop              func()                                       //nolint:unused,nolintlint // stops ring buffer reader
+	credwatchContainers        map[string]*credwatchContainerState          //nolint:unused,nolintlint // containerID → tracked state
+	credwatchCgroupToContainer map[uint64]string                            //nolint:unused,nolintlint // cgroupID → containerID
+	OnCredwatchEvent           func(event CredwatchEvent)                   //nolint:unused,nolintlint // callback for kill + report
+	onDNSViolation             func(cgroupID uint64, domain, action string) // called from DNS proxy on block-mode violations
+
+	// Proc_mem LSM (global, not per-container).
+	// Fields used by proc_mem_linux.go; appear unused on non-linux builds.
+	procMemCfg        ProcMemConfig                     //nolint:unused,nolintlint // used in proc_mem_linux.go
+	procMemState      any                               //nolint:unused,nolintlint // *procMemLSMImpl on Linux
+	procMemStop       func()                            //nolint:unused,nolintlint // stops ring buffer reader
+	procMemLSMLoaded  bool                              //nolint:unused,nolintlint // true after successful LSM load
+	procMemContainers map[string]*procMemContainerState //nolint:unused,nolintlint // containerID → tracked state
+	procMemCgroupMap  map[uint64]string                 //nolint:unused,nolintlint // cgroupID → containerID
+	OnProcMemEvent    func(event ProcMemEvent)          //nolint:unused,nolintlint // callback for kill + report
 
 	// inFlightReports tracks bucket-flush ReportFunc invocations that
 	// have started but not returned. DetachAll waits on this WaitGroup
@@ -261,23 +272,49 @@ func (m *Manager) Platform() Platform {
 	return m.platform
 }
 
+// SetOnDNSViolation sets the callback invoked when a DNS violation occurs
+// in block mode. CE wires this to kill the container; EE may quarantine.
+func (m *Manager) SetOnDNSViolation(fn func(cgroupID uint64, domain, action string)) {
+	m.onDNSViolation = fn
+}
+
+// ContainerIDForCgroup resolves a cgroup ID to a container ID by searching
+// the credwatch and proc_mem cgroup-to-container maps.
+func (m *Manager) ContainerIDForCgroup(cgroupID uint64) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if id, ok := m.credwatchCgroupToContainer[cgroupID]; ok {
+		return id
+	}
+
+	if id, ok := m.procMemCgroupMap[cgroupID]; ok {
+		return id
+	}
+
+	return ""
+}
+
 // NewManager creates an enforcement manager with the given configuration.
 func NewManager(
 	logger *slog.Logger, maxConcurrent int, upstreams []string,
-	trustedCIDRs []net.IPNet, platform Platform, honeypotCfg HoneypotConfig,
+	trustedCIDRs []net.IPNet, platform Platform, credwatchCfg CredwatchConfig, procMemCfg ProcMemConfig,
 ) *Manager {
 	return &Manager{
-		enforcers:         make(map[string]*Enforcer),
-		netnsContexts:     make(map[uint64]*NetnsContext),
-		logger:            logger,
-		maxConc:           maxConcurrent,
-		upstreams:         upstreams,
-		trustedCIDRs:      trustedCIDRs,
-		platform:          platform,
-		honeypotCfg:       honeypotCfg,
-		containers:        make(map[string]*honeypotContainerState),
-		cgroupToContainer: make(map[uint64]string),
-		shutdownCh:        make(chan struct{}),
+		enforcers:                  make(map[string]*Enforcer),
+		netnsContexts:              make(map[uint64]*NetnsContext),
+		logger:                     logger,
+		maxConc:                    maxConcurrent,
+		upstreams:                  upstreams,
+		trustedCIDRs:               trustedCIDRs,
+		platform:                   platform,
+		credwatchCfg:               credwatchCfg,
+		procMemCfg:                 procMemCfg,
+		credwatchContainers:        make(map[string]*credwatchContainerState),
+		credwatchCgroupToContainer: make(map[uint64]string),
+		procMemContainers:          make(map[string]*procMemContainerState),
+		procMemCgroupMap:           make(map[uint64]string),
+		shutdownCh:                 make(chan struct{}),
 	}
 }
 
@@ -580,7 +617,7 @@ func (m *Manager) acquireOrCreateNetnsContext(
 // finalizeAttach completes a successful Attach: stores the enforcer in
 // m.enforcers, records project info for sibling inheritance, attaches
 // buildkit (if configured), starts bucket reporters, and registers
-// honeypot inodes. Common to both creator and joiner paths in Attach.
+// credwatch/proc_mem entries. Common to both creator and joiner paths in Attach.
 func (m *Manager) finalizeAttach(info ContainerInfo, e *Enforcer, nctx *NetnsContext) {
 	m.mu.Lock()
 	m.enforcers[info.ContainerID] = e
@@ -598,7 +635,8 @@ func (m *Manager) finalizeAttach(info ContainerInfo, e *Enforcer, nctx *NetnsCon
 
 	m.startPacketBucketReporter(e)
 	m.startDNSBucketReporter(info, nctx)
-	m.AttachHoneypot(info.ContainerID, e.cgroup)
+	m.AttachCredwatch(info.ContainerID, e.cgroup, info.AllowCredWatch)
+	m.AttachProcMem(info.ContainerID, e.cgroup, info.AllowProcMemRead)
 }
 
 // denyKey identifies one entry in the eBPF deny map.
@@ -1293,8 +1331,9 @@ func (m *Manager) Detach(containerID string) *DetachResult {
 		delete(m.netnsContexts, nctx.inode)
 	}
 
-	// Also clean up cgroup-to-container mapping while we hold m.mu.
-	delete(m.cgroupToContainer, e.cgroupID)
+	// Also clean up cgroup-to-container mappings while we hold m.mu.
+	delete(m.credwatchCgroupToContainer, e.cgroupID)
+	delete(m.procMemCgroupMap, e.cgroupID)
 
 	// Read stats while m.mu is held so a concurrent teardown from another
 	// sibling cannot close the eBPF handle out from under us.
@@ -1401,8 +1440,9 @@ func (m *Manager) Detach(containerID string) *DetachResult {
 		m.teardownNetnsContext(nctx)
 	}
 
-	// Remove honeypot inode entries for this container.
-	m.DetachHoneypot(containerID)
+	// Remove credwatch/proc_mem entries for this container.
+	m.DetachCredwatch(containerID)
+	m.DetachProcMem(containerID)
 
 	e.logger.Info("enforcement detached",
 		"violations", len(violations),

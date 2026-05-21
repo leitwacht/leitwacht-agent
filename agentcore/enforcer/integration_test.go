@@ -106,16 +106,21 @@ func TestIntegrationDNSRecording(t *testing.T) {
 
 	// Create the enforcement manager with real platform.
 	platform := &LinuxPlatform{Logger: logger}
-	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, platform, HoneypotConfig{})
+	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, platform, CredwatchConfig{}, ProcMemConfig{})
 
-	err = mgr.StartHoneypot()
+	err = mgr.StartDNSPIDTracker()
 	if err != nil {
-		t.Fatalf("manager start: %v", err)
+		t.Fatalf("start dns pid tracker: %v", err)
+	}
+	err = mgr.StartCredwatch()
+	if err != nil {
+		t.Fatalf("start credwatch: %v", err)
 	}
 
 	t.Cleanup(func() {
 		mgr.DetachAll()
-		mgr.StopHoneypot()
+		mgr.StopCredwatch()
+		mgr.StopDNSPIDTracker()
 	})
 
 	// Build a policy that allows example.com in audit mode.
@@ -308,16 +313,21 @@ func TestIntegrationMultiContainer(t *testing.T) {
 
 	// Set up enforcement manager.
 	platform := &LinuxPlatform{Logger: logger}
-	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, platform, HoneypotConfig{})
+	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, platform, CredwatchConfig{}, ProcMemConfig{})
 
-	err = mgr.StartHoneypot()
+	err = mgr.StartDNSPIDTracker()
 	if err != nil {
-		t.Fatalf("manager start: %v", err)
+		t.Fatalf("start dns pid tracker: %v", err)
+	}
+	err = mgr.StartCredwatch()
+	if err != nil {
+		t.Fatalf("start credwatch: %v", err)
 	}
 
 	t.Cleanup(func() {
 		mgr.DetachAll()
-		mgr.StopHoneypot()
+		mgr.StopCredwatch()
+		mgr.StopDNSPIDTracker()
 	})
 
 	pol := &policy.ResolvedPolicy{
@@ -501,15 +511,20 @@ func TestIntegrationBinaryPathMovedBinary(t *testing.T) {
 	}
 
 	platform := &LinuxPlatform{Logger: logger}
-	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, platform, HoneypotConfig{})
+	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, platform, CredwatchConfig{}, ProcMemConfig{})
 
-	if err = mgr.StartHoneypot(); err != nil {
-		t.Fatalf("manager start: %v", err)
+	if err = mgr.StartDNSPIDTracker(); err != nil {
+		t.Fatalf("start dns pid tracker: %v", err)
+	}
+
+	if err = mgr.StartCredwatch(); err != nil {
+		t.Fatalf("start credwatch: %v", err)
 	}
 
 	t.Cleanup(func() {
 		mgr.DetachAll()
-		mgr.StopHoneypot()
+		mgr.StopCredwatch()
+		mgr.StopDNSPIDTracker()
 	})
 
 	pol := &policy.ResolvedPolicy{
@@ -676,15 +691,20 @@ func TestIntegrationBinaryPathShortLivedExecs(t *testing.T) {
 	}
 
 	platform := &LinuxPlatform{Logger: logger}
-	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, platform, HoneypotConfig{})
+	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, platform, CredwatchConfig{}, ProcMemConfig{})
 
-	if err = mgr.StartHoneypot(); err != nil {
-		t.Fatalf("manager start: %v", err)
+	if err = mgr.StartDNSPIDTracker(); err != nil {
+		t.Fatalf("start dns pid tracker: %v", err)
+	}
+
+	if err = mgr.StartCredwatch(); err != nil {
+		t.Fatalf("start credwatch: %v", err)
 	}
 
 	t.Cleanup(func() {
 		mgr.DetachAll()
-		mgr.StopHoneypot()
+		mgr.StopCredwatch()
+		mgr.StopDNSPIDTracker()
 	})
 
 	// Audit mode so every query is recorded regardless of allow-list.
@@ -835,15 +855,20 @@ func TestIntegrationAttributionBurst(t *testing.T) {
 	t.Cleanup(stopUpstream)
 
 	platform := &LinuxPlatform{Logger: logger}
-	mgr := NewManager(logger, 32, []string{upstreamAddr}, nil, platform, HoneypotConfig{})
+	mgr := NewManager(logger, 32, []string{upstreamAddr}, nil, platform, CredwatchConfig{}, ProcMemConfig{})
 
-	if err = mgr.StartHoneypot(); err != nil {
-		t.Fatalf("manager start: %v", err)
+	if err = mgr.StartDNSPIDTracker(); err != nil {
+		t.Fatalf("start dns pid tracker: %v", err)
+	}
+
+	if err = mgr.StartCredwatch(); err != nil {
+		t.Fatalf("start credwatch: %v", err)
 	}
 
 	t.Cleanup(func() {
 		mgr.DetachAll()
-		mgr.StopHoneypot()
+		mgr.StopCredwatch()
+		mgr.StopDNSPIDTracker()
 	})
 
 	pol := &policy.ResolvedPolicy{
@@ -996,15 +1021,20 @@ func TestIntegrationTCPDNSAttribution(t *testing.T) {
 	t.Cleanup(stopUpstream)
 
 	platform := &LinuxPlatform{Logger: logger}
-	mgr := NewManager(logger, 32, []string{upstreamAddr}, nil, platform, HoneypotConfig{})
+	mgr := NewManager(logger, 32, []string{upstreamAddr}, nil, platform, CredwatchConfig{}, ProcMemConfig{})
 
-	if err = mgr.StartHoneypot(); err != nil {
-		t.Fatalf("manager start: %v", err)
+	if err = mgr.StartDNSPIDTracker(); err != nil {
+		t.Fatalf("start dns pid tracker: %v", err)
+	}
+
+	if err = mgr.StartCredwatch(); err != nil {
+		t.Fatalf("start credwatch: %v", err)
 	}
 
 	t.Cleanup(func() {
 		mgr.DetachAll()
-		mgr.StopHoneypot()
+		mgr.StopCredwatch()
+		mgr.StopDNSPIDTracker()
 	})
 
 	pol := &policy.ResolvedPolicy{
@@ -1160,15 +1190,20 @@ func TestIntegrationSinkholeHit(t *testing.T) {
 	}
 
 	platform := &LinuxPlatform{Logger: logger}
-	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, platform, HoneypotConfig{})
+	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, platform, CredwatchConfig{}, ProcMemConfig{})
 
-	if err = mgr.StartHoneypot(); err != nil {
-		t.Fatalf("manager start: %v", err)
+	if err = mgr.StartDNSPIDTracker(); err != nil {
+		t.Fatalf("start dns pid tracker: %v", err)
+	}
+
+	if err = mgr.StartCredwatch(); err != nil {
+		t.Fatalf("start credwatch: %v", err)
 	}
 
 	t.Cleanup(func() {
 		mgr.DetachAll()
-		mgr.StopHoneypot()
+		mgr.StopCredwatch()
+		mgr.StopDNSPIDTracker()
 	})
 
 	// Block mode policy — nothing allowed. blocked.example will be
@@ -1403,15 +1438,20 @@ func TestIntegrationGlibcUnconnectedUDP(t *testing.T) {
 	upstreamAddr, stopUpstream := startFakeNXDomainUpstream(t)
 	t.Cleanup(stopUpstream)
 
-	mgr := NewManager(logger, 32, []string{upstreamAddr}, nil, platform, HoneypotConfig{})
+	mgr := NewManager(logger, 32, []string{upstreamAddr}, nil, platform, CredwatchConfig{}, ProcMemConfig{})
 
-	if err = mgr.StartHoneypot(); err != nil {
-		t.Fatalf("manager start: %v", err)
+	if err = mgr.StartDNSPIDTracker(); err != nil {
+		t.Fatalf("start dns pid tracker: %v", err)
+	}
+
+	if err = mgr.StartCredwatch(); err != nil {
+		t.Fatalf("start credwatch: %v", err)
 	}
 
 	t.Cleanup(func() {
 		mgr.DetachAll()
-		mgr.StopHoneypot()
+		mgr.StopCredwatch()
+		mgr.StopDNSPIDTracker()
 	})
 
 	pol := &policy.ResolvedPolicy{
@@ -1686,15 +1726,20 @@ func TestIntegrationMultiNetnsPortCollision(t *testing.T) {
 	t.Cleanup(stopUpstream)
 
 	platform := &LinuxPlatform{Logger: logger}
-	mgr := NewManager(logger, 32, []string{upstreamAddr}, nil, platform, HoneypotConfig{})
+	mgr := NewManager(logger, 32, []string{upstreamAddr}, nil, platform, CredwatchConfig{}, ProcMemConfig{})
 
-	if err := mgr.StartHoneypot(); err != nil {
-		t.Fatalf("manager start: %v", err)
+	if err := mgr.StartDNSPIDTracker(); err != nil {
+		t.Fatalf("start dns pid tracker: %v", err)
+	}
+
+	if err := mgr.StartCredwatch(); err != nil {
+		t.Fatalf("start credwatch: %v", err)
 	}
 
 	t.Cleanup(func() {
 		mgr.DetachAll()
-		mgr.StopHoneypot()
+		mgr.StopCredwatch()
+		mgr.StopDNSPIDTracker()
 	})
 
 	pol := &policy.ResolvedPolicy{
@@ -1951,15 +1996,20 @@ func TestIntegrationBareIPBlocked(t *testing.T) {
 	}
 
 	platform := &LinuxPlatform{Logger: logger}
-	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, platform, HoneypotConfig{})
+	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, platform, CredwatchConfig{}, ProcMemConfig{})
 
-	if err = mgr.StartHoneypot(); err != nil {
-		t.Fatalf("manager start: %v", err)
+	if err = mgr.StartDNSPIDTracker(); err != nil {
+		t.Fatalf("start dns pid tracker: %v", err)
+	}
+
+	if err = mgr.StartCredwatch(); err != nil {
+		t.Fatalf("start credwatch: %v", err)
 	}
 
 	t.Cleanup(func() {
 		mgr.DetachAll()
-		mgr.StopHoneypot()
+		mgr.StopCredwatch()
+		mgr.StopDNSPIDTracker()
 	})
 
 	// Block-mode policy. No allow rules, no deny IPs (the bare IP must

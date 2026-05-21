@@ -2,6 +2,11 @@
 
 package enforcer
 
+import (
+	"fmt"
+	"log/slog"
+)
+
 // DNSPIDTracker is a no-op on non-Linux platforms.
 type DNSPIDTracker struct{}
 
@@ -26,3 +31,8 @@ func (*DNSPIDTracker) RemoveCgroup(_ uint64) {}
 
 // Close is a no-op on non-Linux.
 func (*DNSPIDTracker) Close() {}
+
+// NewDNSPIDTracker returns an error on non-Linux (BPF kprobes require Linux).
+func NewDNSPIDTracker(_ *slog.Logger) (*DNSPIDTracker, error) {
+	return nil, fmt.Errorf("dns pid tracker requires linux")
+}

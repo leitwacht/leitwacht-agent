@@ -39,16 +39,18 @@ var truncID = idutil.Trunc
 // new identity field is a one-line edit instead of a multi-site sweep.
 func infoFromEvent(ev watcher.ContainerEvent) enforcer.ContainerInfo {
 	return enforcer.ContainerInfo{
-		ContainerID: ev.ContainerID,
-		ProjectPath: ev.ProjectPath,
-		JobID:       ev.JobID,
-		PipelineID:  ev.PipelineID,
-		JobURL:      ev.JobURL,
-		GitRef:      ev.GitRef,
-		JobName:     ev.JobName,
-		JobStage:    ev.JobStage,
-		PipelineSrc: ev.PipelineSrc,
-		CgroupPath:  ev.CgroupPath,
+		ContainerID:      ev.ContainerID,
+		ProjectPath:      ev.ProjectPath,
+		JobID:            ev.JobID,
+		PipelineID:       ev.PipelineID,
+		JobURL:           ev.JobURL,
+		GitRef:           ev.GitRef,
+		JobName:          ev.JobName,
+		JobStage:         ev.JobStage,
+		PipelineSrc:      ev.PipelineSrc,
+		CgroupPath:       ev.CgroupPath,
+		AllowProcMemRead: ev.Labels["leitwacht.io/allow-proc-read"] == "true",
+		AllowCredWatch:   ev.Labels["leitwacht.io/allow-cred-read"] == "true",
 	}
 }
 
@@ -292,17 +294,6 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 			"warned")
 	}
 
-	// Honeypot mounts missing — warn so ops can fix config.toml volumes.
-	if ev.MissingHoneypotMounts && h.Enforcer.LSMLoaded() {
-		h.Logger.Warn("honeypot mounts missing", "container_id", truncID(ev.ContainerID))
-		report(advisory.KindHoneypotMountsMissing,
-			"Expected honeypot mounts not found — credential honeypot enforcement inactive for this container.\n\n"+
-				"Fix: Add the honeypot volume mounts to the runner's volume configuration "+
-				"(config.toml [runners.docker] volumes, or Helm values runners.config volumes). "+
-				"See the Sentinel deployment docs for the required mount paths.",
-			"warned")
-	}
-
 	_, attachErr := h.Enforcer.Attach(ctx, infoFromEvent(ev), ev.PID, pol)
 	if attachErr != nil {
 		// Short-lived helper containers (e.g. GitLab Runner init containers) may exit
@@ -314,7 +305,7 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 			h.Logger.Error("attach enforcement failed", "container_id", truncID(ev.ContainerID), "error", attachErr)
 			report(advisory.KindAttachFailure,
 				fmt.Sprintf("eBPF enforcement failed to attach: %s\n\n"+
-					"Fix: Ensure the host kernel supports eBPF (5.8+), the agent has CAP_SYS_ADMIN/CAP_BPF, "+
+					"Fix: Ensure the host kernel supports eBPF (a maintained kernel current on its distro's security stream), the agent has CAP_SYS_ADMIN/CAP_BPF, "+
 					"and the container PID namespace is accessible. Check agent logs for details.", attachErr),
 				"warned")
 		}

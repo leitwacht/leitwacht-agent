@@ -1,6 +1,6 @@
 # leitwacht-agent
 
-> Source of truth: <https://gitlab.com/leitwacht/leitwacht-agent>.
+> <https://leitwacht.eu> — source of truth: <https://gitlab.com/leitwacht/leitwacht-agent>.
 > Issues, MRs, and discussions live on GitLab.
 
 > **Pre-1.0.** The 0.x series is pre-stable; minor releases may carry
@@ -24,7 +24,7 @@ and replaces the YAML loader with a gRPC rule stream.
 
 ```
 agentcore/                   data-plane primitives (MPL-2.0)
-  enforcer/                  eBPF + nftables + DNS proxy + LSM honeypot
+  enforcer/                  eBPF + nftables + DNS proxy + LSM cred/proc_mem
   watcher/                   container-lifecycle event source (containerd, docker)
   handler/                   lifecycle handler — edition-neutral
   policy/                    ResolvedPolicy + Source interface + loader

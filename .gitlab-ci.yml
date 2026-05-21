@@ -63,27 +63,6 @@ variables:
   # paths from binaries; -mod=readonly fails the build instead of
   # silently rewriting go.sum on dependency-graph shifts.
   GOFLAGS: "-trimpath -mod=readonly"
-  # ── Credential scoping ──────────────────────────────────────────────
-  # Project-level CI/CD variables (Settings > CI/CD > Variables) MUST be
-  # scoped to a named environment so they are only injected into jobs
-  # that declare that environment.  Jobs without an "environment:" key
-  # never receive environment-scoped variables — only the * catch-all
-  # scope, which should NOT be used for secrets.
-  #
-  #   Variable          Environment scope   Protect   Mask
-  #   ────────────────  ──────────────────  ────────  ─────
-  #   GITLAB_TOKEN      release            yes       yes
-  #   QUAY_USER         quay-mirror        yes       yes
-  #   QUAY_TOKEN        quay-mirror        yes       yes
-  #
-  # CI_REGISTRY_USER / CI_REGISTRY_PASSWORD are GitLab's built-in job
-  # tokens — they are auto-injected and cannot be environment-scoped;
-  # they are ephemeral and per-job, so the risk is lower.
-  #
-  # BUILDKITD_ADDR is a YAML-level variable (not a project secret) so it
-  # is visible to every job in the pipeline.  The cluster-internal
-  # service address it contains is accepted as an unavoidable leak.
-  # ─────────────────────────────────────────────────────────────────────
 
 default:
   image: ${GO_IMAGE}
@@ -91,8 +70,6 @@ default:
 # ---------------------------------------------------------------- LINT
 lint:
   stage: lint
-  # No "environment:" → no environment-scoped secrets injected.
-  variables: {}
   script:
     # Verify the module graph hasn't drifted since go.sum was committed,
     # then run the usual static checks.
@@ -108,8 +85,6 @@ lint:
 # output — local regen with a different toolchain will mismatch on purpose.
 check-ebpf-drift:
   stage: lint
-  # No "environment:" → no environment-scoped secrets injected.
-  variables: {}
   image: ${GO_BOOKWORM_IMAGE}
   script:
     - apt-get update -qq && apt-get install -y --no-install-recommends clang libbpf-dev llvm
@@ -118,8 +93,6 @@ check-ebpf-drift:
 # ---------------------------------------------------------------- TEST
 test:
   stage: test
-  # No "environment:" → no environment-scoped secrets injected.
-  variables: {}
   script:
     - go mod download
     - go mod verify
@@ -138,12 +111,6 @@ test:
 semantic-release:
   stage: release
   image: ${ALPINE_IMAGE}
-  # GITLAB_TOKEN is scoped to the "release" environment; only this job
-  # receives it.  Without environment: the variable would leak into every
-  # job on a protected branch, including lint and test.
-  environment:
-    name: release
-    action: prepare
   variables:
     GIT_STRATEGY: clone
     GIT_DEPTH: 0
@@ -187,13 +154,6 @@ semantic-release:
 
 .build_image:
   stage: build
-  # Needs CI_REGISTRY credentials for image push.  These are GitLab's
-  # built-in job tokens (auto-injected, cannot be environment-scoped) so
-  # this environment declaration is primarily for consistency and for any
-  # future secrets that may be added to this scope.
-  environment:
-    name: container-registry
-    action: prepare
   image:
     name: ${BUILDKIT_IMAGE}
     entrypoint: [""]
@@ -312,9 +272,6 @@ build-agent-ce:
 
 .sign_image:
   stage: sign
-  environment:
-    name: signing
-    action: prepare
   # alpine ships cosign in its community repo; using alpine instead of
   # gcr.io/projectsigstore/cosign because the upstream cosign image is
   # fully distroless (no shell), and GitLab Runner's k8s executor needs
@@ -360,9 +317,6 @@ sign-agent-ce:
 
 .sbom_image:
   stage: sbom
-  environment:
-    name: container-registry
-    action: prepare
   # alpine ships syft in its community repo; using alpine instead of
   # anchore/syft (also distroless) so the k8s executor has a shell.
   # ALPINE_IMAGE pins the base; the syft package version still drifts.
@@ -399,9 +353,6 @@ sbom-agent-ce:
 
 .attach_sbom:
   stage: sbom
-  environment:
-    name: signing
-    action: prepare
   image: ${ALPINE_IMAGE}
   variables:
     COSIGN_YES: "true"
@@ -442,11 +393,6 @@ attach-sbom-agent-ce:
 
 .mirror_image:
   stage: mirror
-  # QUAY_USER / QUAY_TOKEN are scoped to "quay-mirror"; only mirror
-  # jobs receive them.
-  environment:
-    name: quay-mirror
-    action: prepare
   image:
     name: ${CRANE_IMAGE}
     entrypoint: [""]

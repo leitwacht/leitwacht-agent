@@ -348,7 +348,15 @@ int egress_filter(struct __sk_buff *skb) {
     __u32 ip_hlen = iph.ihl * 4;
     __u16 dst_port = 0;
 
-    /* Extract destination port for TCP/UDP */
+    /* Extract destination port for TCP/UDP.
+     *
+     * bpf_skb_load_bytes failure (return 1 = allow) is not a bypass:
+     * locally-originated packets pass cgroup_skb/egress before
+     * ip_fragment(), so transport headers are always present. Raw
+     * sockets with IP_HDRINCL cannot fragment (kernel forbids it per
+     * raw(7)), and without IP_HDRINCL the kernel fragments after this
+     * hook. AF_PACKET bypasses cgroup_skb entirely. The failure path
+     * is only reachable on corrupt/malformed skbs. */
     if (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP) {
         /* Destination port is at offset 2 in both TCP and UDP headers */
         __be16 dport;

@@ -112,6 +112,13 @@ struct {
  * context (TCP retransmits, keepalives, delayed ACKs), current is
  * whichever task got preempted on that CPU and would misattribute.
  *
+ * No socket_accept hook: accepted sockets get sk_storage at the
+ * first sendmsg (the server calling send on the accepted socket).
+ * Without sk_storage, softirq traffic (ACKs, keepalives) on accepted
+ * sockets is correctly suppressed by skip_softirq_attribution below.
+ * Adding socket_accept would create sk_storage entries that bypass
+ * the softirq guard, publishing noise events for accepted sockets.
+ *
  * Kernel frees the entry when the socket is destroyed. No LRU, no
  * userspace cleanup, no size tuning. */
 struct sock_owner {

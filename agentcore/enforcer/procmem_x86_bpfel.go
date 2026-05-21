@@ -18,6 +18,15 @@ type procMemCgroupProcConfig struct {
 	Flags uint8
 }
 
+type procMemProcMemEvent struct {
+	_           structs.HostLayout
+	CgroupId    uint64
+	Pid         uint32
+	Comm        [16]int8
+	Path        [64]int8
+	TimestampNs uint64
+}
+
 // loadProcMem returns the embedded CollectionSpec for procMem.
 func loadProcMem() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_ProcMemBytes)

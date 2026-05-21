@@ -82,8 +82,10 @@ struct {
 
 /* Force clang to emit BTF for credwatch_event. Without a live reference, the
  * ringbuf-reserve path uses void* and BTF drops the struct — which blocks
- * the userspace struct-size self-check at load time. */
-struct credwatch_event *__credwatch_event_btf_hint __attribute__((used));
+ * the userspace struct-size self-check at load time. Concrete instance
+ * (not a pointer-with-used) for toolchain-stable BTF retention — see
+ * egress.c __sock_owner_btf_hint comment for rationale. */
+volatile const struct credwatch_event __credwatch_event_btf_hint;
 
 /* match_suffix checks whether the resolved path ends with any watched
  * suffix. It scans backwards from the end of the path string, trying

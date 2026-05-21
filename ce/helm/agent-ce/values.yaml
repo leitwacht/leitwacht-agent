@@ -77,9 +77,20 @@ dnsUpstream: ""
 # Example: ["10.0.0.0/8", "192.168.0.0/16"]
 trustedCIDRs: []
 
-honeypot:
+# Credwatch: BPF LSM hook that detects credential file access
+# (/.ssh/id_rsa, /.aws/credentials, etc.) inside monitored containers.
+credwatch:
   enabled: false
-  dir: /var/lib/leitwacht/honeypot
+  # Comma-separated path suffixes to watch. Defaults are baked into the
+  # binary; override only to add or remove paths.
+  paths: ""
+  # Comma-separated path suffixes to exclude from watching.
+  exclude: ""
+
+# Proc-mem: BPF LSM hook that blocks /proc/<pid>/mem reads by
+# monitored containers.
+procMem:
+  enabled: false
 
 # When true, attach env-var NAMES (never values) of the offending PID
 # to each violation report. Useful for "what secrets could this process

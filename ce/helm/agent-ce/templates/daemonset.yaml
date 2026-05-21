@@ -78,10 +78,18 @@ spec:
             - name: LEITWACHT_CE_TRUSTED_CIDRS
               value: {{ join "," .Values.trustedCIDRs | quote }}
             {{- end }}
-            - name: LEITWACHT_CE_HONEYPOT_ENABLED
-              value: {{ .Values.honeypot.enabled | quote }}
-            - name: LEITWACHT_CE_HONEYPOT_DIR
-              value: {{ .Values.honeypot.dir | quote }}
+            - name: LEITWACHT_CE_CREDWATCH_ENABLED
+              value: {{ .Values.credwatch.enabled | quote }}
+            {{- if .Values.credwatch.paths }}
+            - name: LEITWACHT_CE_CREDWATCH_PATHS
+              value: {{ .Values.credwatch.paths | quote }}
+            {{- end }}
+            {{- if .Values.credwatch.exclude }}
+            - name: LEITWACHT_CE_CREDWATCH_EXCLUDE
+              value: {{ .Values.credwatch.exclude | quote }}
+            {{- end }}
+            - name: LEITWACHT_CE_PROC_MEM_ENABLED
+              value: {{ .Values.procMem.enabled | quote }}
             - name: LEITWACHT_CE_RECORD_ENV_NAMES
               value: {{ .Values.recordEnvNames | default false | quote }}
             - name: LEITWACHT_CE_STDOUT_ENABLED

@@ -33,7 +33,7 @@ filing a public issue.
 ## Development setup
 
 leitwacht-agent is **Linux-only** at runtime — eBPF, nftables, and
-the LSM honeypot all assume a Linux kernel. macOS works for editing
+the LSM credwatch/proc_mem hooks all assume a Linux kernel. macOS works for editing
 but you cannot run the integration tests there.
 
 ```sh

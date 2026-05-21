@@ -51,8 +51,10 @@ struct {
 
 /* Force clang to emit BTF for proc_mem_event. Without a live reference, the
  * ringbuf-reserve path uses void* and BTF drops the struct — which blocks
- * the userspace struct-size self-check at load time. */
-struct proc_mem_event *__proc_mem_event_btf_hint __attribute__((used));
+ * the userspace struct-size self-check at load time. Concrete instance
+ * (not a pointer-with-used) for toolchain-stable BTF retention — see
+ * egress.c __sock_owner_btf_hint comment for rationale. */
+volatile const struct proc_mem_event __proc_mem_event_btf_hint;
 
 /* is_proc_mem_path checks whether the resolved path is /proc/<pid>/mem.
  * Uses a bounded loop with constant-offset reads to avoid variable-offset

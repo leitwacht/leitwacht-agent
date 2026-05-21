@@ -103,7 +103,8 @@ static __always_inline void record_dns_attribution(struct sock *sk, __u64 cgroup
 
     struct task_struct *task = (struct task_struct *)bpf_get_current_task();
     struct task_struct *parent = BPF_CORE_READ(task, real_parent);
-    (void)bpf_probe_read_kernel_str(&attr.parent_comm, sizeof(attr.parent_comm), &parent->comm);
+    if (parent)
+        (void)bpf_probe_read_kernel_str(&attr.parent_comm, sizeof(attr.parent_comm), &parent->comm);
 
     /* Read the netns cookie directly from the socket's sock_net via
        CO-RE rather than calling bpf_get_netns_cookie(). The helper is

@@ -18,6 +18,15 @@ type credwatchCgroupProcConfig struct {
 	Flags uint8
 }
 
+type credwatchCredwatchEvent struct {
+	_           structs.HostLayout
+	CgroupId    uint64
+	Pid         uint32
+	Comm        [16]int8
+	Path        [128]int8
+	TimestampNs uint64
+}
+
 // loadCredwatch returns the embedded CollectionSpec for credwatch.
 func loadCredwatch() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_CredwatchBytes)

@@ -106,7 +106,7 @@ struct {
 
 /* Per-socket attribution.
  *
- * Populated by LSM hooks (socket_connect, socket_accept, socket_sendmsg)
+ * Populated by LSM hooks (socket_connect, socket_sendmsg)
  * that always run in process context — current is guaranteed to be the
  * real socket owner. Read from cgroup_skb/egress where, in softirq
  * context (TCP retransmits, keepalives, delayed ACKs), current is

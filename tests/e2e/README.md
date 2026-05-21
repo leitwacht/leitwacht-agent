@@ -41,7 +41,7 @@ ad-hoc curls against a leitwacht-protected host.
 
 ## What this does **not** test
 
-- The honeypot LSM hook (run separately on a host with BPF LSM enabled).
+- The credwatch / proc_mem LSM hooks (run separately on a host with BPF LSM enabled).
 - Multi-node / DaemonSet behaviour (covered by Helm-chart tests).
 - IPv6 egress (env-tagged TODO; the YAML schema accepts IPv6 CIDRs but
   the smoke harness only exercises IPv4).

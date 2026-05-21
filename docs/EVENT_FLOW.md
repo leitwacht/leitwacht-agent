@@ -81,7 +81,7 @@ event-loop goroutine is even reading from the channel.
    - `Policy.GetPolicy` (CE: direct YAML lookup; EE: BBolt-cached
      gRPC). On miss the handler fails open with `DefaultAction`.
    - Run the security gauntlet (DinD, socket mount, FF_NETWORK_PER_BUILD,
-     honeypot mounts) — kill or warn per `pol.Action`.
+     credwatch/proc_mem flags) — kill or warn per `pol.Action`.
    - `Enforcer.Attach` builds (or reuses) a `NetnsContext`, loads the
      eBPF programs, attaches nftables, starts the per-netns DNS proxy.
 6. `dispatch` returns; the loop reads the next event.

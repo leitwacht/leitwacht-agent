@@ -65,15 +65,11 @@ start_agent() {
 
   log "starting agent-ce (pid will be in $sandbox/pid, log in $AGENT_LOG)"
 
-  # The agent runs with honeypot=disabled for the smoke tests — the LSM
-  # honeypot adds startup constraints that don't affect the YAML →
-  # enforcement path under test here.
   LEITWACHT_CE_RULES_PATH="$rules" \
   LEITWACHT_CE_CONTAINER_RUNTIME=docker \
   LEITWACHT_CE_DEFAULT_ACTION=block \
   LEITWACHT_CE_DNS_UPSTREAM="${LEITWACHT_CE_DNS_UPSTREAM:-1.1.1.1:53,8.8.8.8:53}" \
   LEITWACHT_CE_PROM_ADDR=":$METRICS_PORT" \
-  LEITWACHT_CE_HONEYPOT_ENABLED=false \
   LEITWACHT_CE_LOG_LEVEL="$LOG_LEVEL" \
   HOSTNAME_OVERRIDE="e2e-host" \
     "$BIN" >"$AGENT_LOG" 2>&1 &

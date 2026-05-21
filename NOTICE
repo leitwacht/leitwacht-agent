@@ -10,7 +10,7 @@ use, modify, and redistribute these files in your own products
 files must be made available under the same license.
 
 All source files in this repository, including the eBPF programs
-(egress.c, dns_pid.c, honeypot.c, sock_attr.c) under agentcore/enforcer/,
+(credwatch.c, dns_pid.c, egress.c, proc_mem.c, sock_attr.c) under agentcore/enforcer/,
 are licensed under MPL-2.0.
 
 The eBPF programs `#include "vmlinux.h"`, a dump of the running kernel's

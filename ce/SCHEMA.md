@@ -36,6 +36,12 @@ scopes:
     job_actions:             # optional, override default_action per CI job
       build: block
       release: allow
+    credwatch: enforce       # optional LSM mode: off | observe | enforce
+    proc_mem: observe        # optional LSM mode: off | observe | enforce
+    job_overrides:           # optional, per-CI-job LSM mode overrides
+      detonate-sample:
+        credwatch: observe
+        proc_mem: observe
     rule_sets:               # required
       "":                    # "" is the catch-all rule list
         - pattern: github.com
@@ -59,6 +65,36 @@ scopes:
 Optional per-CI-job overrides. Keys are CI job names (matched against
 the container's `CI_JOB_NAME` env var); values are the same set as
 `default_action`.
+
+### `credwatch` / `proc_mem`
+
+Optional scope-default mode for the two LSM detectors:
+
+| Detector   | Watches for                                            |
+| ---------- | ------------------------------------------------------ |
+| `credwatch`| Reads of credential files (`~/.aws/credentials`, SSH keys, …). |
+| `proc_mem` | Reads of another process's `/proc/<pid>/mem`.          |
+
+| Mode      | Behaviour                                                 |
+| --------- | --------------------------------------------------------- |
+| `off`     | Detector not attached for the container — no monitoring.  |
+| `observe` | Event is reported, but the workload is **not** killed. For detonation sandboxes where killing at first hit truncates the kill chain. |
+| `enforce` | Event is reported **and** the container is killed.        |
+
+These only take effect when the corresponding detector LSM is loaded
+globally (`LEITWACHT_CE_CREDWATCH_ENABLED`,
+`LEITWACHT_CE_PROC_MEM_ENABLED`). When the detector is loaded but a scope
+omits the field, the mode defaults to `enforce` (matching the historical
+"globally on = kill" behaviour). The per-container exemption labels
+(`leitwacht.io/allow-cred-read`, `leitwacht.io/allow-proc-read`) still
+apply on top and suppress events entirely for a marked container.
+
+### `job_overrides`
+
+Optional per-CI-job overrides for `credwatch` / `proc_mem`. Keys are CI
+job names; each entry may set either or both detector modes and wins over
+the scope default for that job. A detector omitted in an override inherits
+the scope default.
 
 ## Rule
 

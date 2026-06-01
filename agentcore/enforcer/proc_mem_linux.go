@@ -124,10 +124,13 @@ func startProcMemReader(objs *procMemObjects, logger *slog.Logger, onEvent func(
 
 // populateProcMemMaps adds a container's cgroup ID to known_containers
 // with the appropriate flags (monitored, and optionally allow_proc_read).
-func populateProcMemMaps(objs *procMemObjects, cgID uint64, allowProcRead bool) error {
+func populateProcMemMaps(objs *procMemObjects, cgID uint64, allowProcRead, observeOnly bool) error {
 	flags := uint8(procMemFlagMonitored)
 	if allowProcRead {
 		flags |= procMemFlagAllowProcRead
+	}
+	if observeOnly {
+		flags |= procMemFlagObserveOnly
 	}
 
 	cfg := cgroupProcConfig{Flags: flags}
@@ -211,7 +214,7 @@ func (m *Manager) ProcMemLSMLoaded() bool {
 
 // AttachProcMem populates proc_mem BPF maps for a container.
 // Non-fatal: logs warnings on failure (egress enforcement continues).
-func (m *Manager) AttachProcMem(containerID, cgroupPath string, allowProcRead bool) {
+func (m *Manager) AttachProcMem(containerID, cgroupPath string, allowProcRead, observeOnly bool) {
 	if !m.procMemLSMLoaded {
 		return
 	}
@@ -228,14 +231,14 @@ func (m *Manager) AttachProcMem(containerID, cgroupPath string, allowProcRead bo
 		return
 	}
 
-	if err := populateProcMemMaps(lsm.objs, cgID, allowProcRead); err != nil {
+	if err := populateProcMemMaps(lsm.objs, cgID, allowProcRead, observeOnly); err != nil {
 		m.logger.Warn("proc_mem: failed to populate maps", "container", containerID[:12], "error", err)
 
 		return
 	}
 
 	m.mu.Lock()
-	m.procMemContainers[containerID] = &procMemContainerState{CgroupID: cgID}
+	m.procMemContainers[containerID] = &procMemContainerState{CgroupID: cgID, ObserveOnly: observeOnly}
 	m.procMemCgroupMap[cgID] = containerID
 	m.mu.Unlock()
 
@@ -243,6 +246,7 @@ func (m *Manager) AttachProcMem(containerID, cgroupPath string, allowProcRead bo
 		"container", containerID[:12],
 		"cgroup_id", cgID,
 		"allow_proc_read", allowProcRead,
+		"observe_only", observeOnly,
 	)
 }
 
@@ -277,6 +281,10 @@ func (m *Manager) DetachProcMem(containerID string) {
 func (m *Manager) handleProcMemBPFEvent(evt procMemEventBPF) {
 	m.mu.Lock()
 	containerID := m.procMemCgroupMap[evt.CgroupID]
+	observeOnly := false
+	if state := m.procMemContainers[containerID]; state != nil {
+		observeOnly = state.ObserveOnly
+	}
 	m.mu.Unlock()
 
 	event := ProcMemEvent{
@@ -286,6 +294,7 @@ func (m *Manager) handleProcMemBPFEvent(evt procMemEventBPF) {
 		Comm:        nullTerminated(evt.Comm[:]),
 		Path:        nullTerminated(evt.Path[:]),
 		TimestampNs: int64(evt.TimestampNs), //nolint:gosec // ns timestamp fits int64
+		ObserveOnly: observeOnly,
 	}
 
 	m.logger.Warn("proc_mem read detected",

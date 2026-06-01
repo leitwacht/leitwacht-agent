@@ -11,6 +11,11 @@
 /* Bit flags for cgroup_proc_config.flags */
 #define FLAG_MONITORED       1
 #define FLAG_ALLOW_PROC_READ 2
+/* FLAG_OBSERVE_ONLY: emit the ringbuf event but DON'T deny the
+ * /proc/<pid>/mem open. For sandboxed detonation, where we want to
+ * record the injection attempt without killing the workload that
+ * makes it. Mirrors credwatch.c's FLAG_OBSERVE_ONLY. */
+#define FLAG_OBSERVE_ONLY    4
 
 struct cgroup_proc_config {
     __u8 flags;
@@ -131,7 +136,12 @@ int BPF_PROG(proc_mem_file_open, struct file *file)
         bpf_ringbuf_submit(evt, 0);
     }
 
-    /* 7. Deny the open */
+    /* 7. Deny the open — unless this container is in observe-only
+     * mode, in which case the event above is enough and we let the
+     * open proceed (sandboxed detonation: record, don't kill). */
+    if (cfg->flags & FLAG_OBSERVE_ONLY)
+        return 0;
+
     return -EPERM;
 }
 

@@ -164,11 +164,17 @@ func populateWatchedPathMaps(objs *credwatchObjects, watchedPaths, excludedPaths
 }
 
 // populateCredwatchMaps adds a container's cgroup ID to known_containers
-// with the appropriate flags (monitored, and optionally allow_credwatch).
-func populateCredwatchMaps(objs *credwatchObjects, cgID uint64, allowCredWatch bool) error {
+// with the appropriate flags (monitored + optional exemption mode).
+// allowCredWatch and observeOnly are not mutually exclusive at the
+// flag level, but if both are set allowCredWatch wins because the
+// BPF program's ALLOW check fires first (no event emitted).
+func populateCredwatchMaps(objs *credwatchObjects, cgID uint64, allowCredWatch, observeOnly bool) error {
 	flags := uint8(credwatchFlagMonitored)
 	if allowCredWatch {
 		flags |= credwatchFlagAllowCredWatch
+	}
+	if observeOnly {
+		flags |= credwatchFlagObserveOnly
 	}
 
 	cfg := cgroupCredwatchConfig{Flags: flags}
@@ -264,7 +270,7 @@ func (m *Manager) CredwatchLSMLoaded() bool {
 
 // AttachCredwatch populates credwatch BPF maps for a container.
 // Non-fatal: logs warnings on failure (egress enforcement continues).
-func (m *Manager) AttachCredwatch(containerID, cgroupPath string, allowCredWatch bool) {
+func (m *Manager) AttachCredwatch(containerID, cgroupPath string, allowCredWatch, observeOnly bool) {
 	if !m.credwatchLSMLoaded {
 		return
 	}
@@ -281,14 +287,17 @@ func (m *Manager) AttachCredwatch(containerID, cgroupPath string, allowCredWatch
 		return
 	}
 
-	if err := populateCredwatchMaps(lsm.objs, cgID, allowCredWatch); err != nil {
+	if err := populateCredwatchMaps(lsm.objs, cgID, allowCredWatch, observeOnly); err != nil {
 		m.logger.Warn("credwatch: failed to populate maps", "container", containerID[:12], "error", err)
 
 		return
 	}
 
 	m.mu.Lock()
-	m.credwatchContainers[containerID] = &credwatchContainerState{CgroupID: cgID}
+	m.credwatchContainers[containerID] = &credwatchContainerState{
+		CgroupID:    cgID,
+		ObserveOnly: observeOnly,
+	}
 	m.credwatchCgroupToContainer[cgID] = containerID
 	m.mu.Unlock()
 
@@ -296,6 +305,7 @@ func (m *Manager) AttachCredwatch(containerID, cgroupPath string, allowCredWatch
 		"container", containerID[:12],
 		"cgroup_id", cgID,
 		"allow_credwatch", allowCredWatch,
+		"observe_only", observeOnly,
 	)
 }
 
@@ -330,6 +340,10 @@ func (m *Manager) DetachCredwatch(containerID string) {
 func (m *Manager) handleCredwatchBPFEvent(evt credwatchEventBPF) {
 	m.mu.Lock()
 	containerID := m.credwatchCgroupToContainer[evt.CgroupID]
+	observeOnly := false
+	if state := m.credwatchContainers[containerID]; state != nil {
+		observeOnly = state.ObserveOnly
+	}
 	m.mu.Unlock()
 
 	event := CredwatchEvent{
@@ -339,6 +353,7 @@ func (m *Manager) handleCredwatchBPFEvent(evt credwatchEventBPF) {
 		Comm:        nullTerminated(evt.Comm[:]),
 		Path:        nullTerminated(evt.Path[:]),
 		TimestampNs: int64(evt.TimestampNs), //nolint:gosec // ns timestamp fits int64
+		ObserveOnly: observeOnly,
 	}
 
 	m.logger.Warn("credential file access detected",

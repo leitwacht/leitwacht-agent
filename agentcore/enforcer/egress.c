@@ -18,13 +18,6 @@
 /* struct sock is opaque; only used as a handle for bpf_sk_storage_get. */
 struct sock;
 
-/* Minimal task_struct decl: only flags is read (PF_KTHREAD check in
- * skip_softirq_attribution). preserve_access_index makes the field
- * offset CO-RE-relocated against the running kernel's BTF. */
-struct task_struct {
-    unsigned int flags;
-} __attribute__((preserve_access_index));
-
 struct allow_key {
     __u32 ip;
     __u16 port;
@@ -54,27 +47,22 @@ struct {
 #define DROP_REASON_POLICY   1
 #define DROP_REASON_SINKHOLE 2
 
-/* pid + comm capture attribution for packet violations. cgroup_skb/egress
-   runs in process context for send syscalls (sendmsg/sendto/connect), so
-   bpf_get_current_pid_tgid() and bpf_get_current_comm() name the caller.
-   Caveat: for softirq-context emissions (TCP retransmits, ACKs,
-   keepalives), `current` is whatever task was interrupted — a kernel
-   worker or unrelated process. Attribution for those events is noisy.
-   The dominant case (first SYN drops, UDP sendmsg) is in process context
-   and attributes correctly. Userspace also does a second lookup against
-   process_info[pid] for binary_path, mirroring the DNS proxy's
-   LookupWithBinary two-step. */
+/* Per-packet violation attribution. All identity fields are sourced
+   from sk_storage, captured by the LSM socket hooks (sock_attr.c) in
+   process context. The cgroup_skb/egress program itself calls no
+   current-task helpers (see emit_drop_event), so attribution is
+   correct regardless of whether the packet is emitted in process or
+   softirq context — and the program loads on cgroup_skb proto tables
+   from 5.10 through 6.18+. */
 struct drop_event {
     __u32 dst_ip;
     __u16 dst_port;
     __u8  protocol;
-    __u64 cgroup_id;
+    __u64 cgroup_id;        /* socket creator's cgroup (from sk_storage) */
     __u8  reason;           /* DROP_REASON_* */
-    __u32 pid;              /* tgid of connecting task (from sk_storage)
-                               or current task (fallback); 0 if none */
-    char  comm[16];         /* process name, "" if unavailable */
-    char  binary_path[BINARY_PATH_LEN]; /* bpf_d_path result from LSM
-                                           capture, "" if unavailable */
+    __u32 pid;              /* tgid of connecting task (from sk_storage) */
+    char  comm[16];         /* process name */
+    char  binary_path[BINARY_PATH_LEN]; /* bpf_d_path result from LSM capture */
 } __attribute__((packed));
 
 struct {
@@ -114,10 +102,10 @@ struct {
  *
  * No socket_accept hook: accepted sockets get sk_storage at the
  * first sendmsg (the server calling send on the accepted socket).
- * Without sk_storage, softirq traffic (ACKs, keepalives) on accepted
- * sockets is correctly suppressed by skip_softirq_attribution below.
- * Adding socket_accept would create sk_storage entries that bypass
- * the softirq guard, publishing noise events for accepted sockets.
+ * Without an sk_storage owner, emit_drop_event drops the event
+ * entirely, so softirq traffic (ACKs, keepalives) on not-yet-captured
+ * accepted sockets produces no noise. Adding socket_accept would
+ * create sk_storage entries that publish events for accepted sockets.
  *
  * Kernel frees the entry when the socket is destroyed. No LRU, no
  * userspace cleanup, no size tuning. */
@@ -164,41 +152,13 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } trusted_nets SEC(".maps");
 
-/* PF_KTHREAD: set on every kernel thread (swapper, ksoftirqd, kworker,
-   migration, rcu_N, irq_N). Stable across kernels since before 3.0. */
-#define PF_KTHREAD 0x00200000U
-
-/* skip_softirq_attribution returns 1 if the caller is a kernel thread,
-   which is the dominant form of misattribution for softirq-context
-   egress events (retransmits landing on idle CPUs → current = swapper,
-   deferred softirqs on ksoftirqd, timer-queued work on kworker). Early
-   returning here skips the whole event path — no ringbuf reserve, no
-   dedup map write, no userspace wakeup. Saves ~500ns per suppressed
-   event; PF_KTHREAD read is ~15ns.
-
-   We considered also checking preempt_count & SOFTIRQ_MASK to catch
-   softirqs that preempt user tasks, but thread_info.preempt_count
-   isn't reliably CO-RE-resolvable across kernel builds on 6.x (per-
-   CPU optimisations relocate the field). The userspace comm-prefix
-   filter in platform_linux.go stays as belt-and-suspenders for that
-   residual case. */
-static __always_inline int skip_softirq_attribution(void)
-{
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    if (!task)
-        return 0;
-
-    __u32 flags = BPF_CORE_READ(task, flags);
-    return (flags & PF_KTHREAD) ? 1 : 0;
-}
-
 static __always_inline void emit_drop_event(struct __sk_buff *skb,
                                             __u32 ip, __u16 port, __u8 proto,
-                                            __u64 cgroup_id, __u8 reason) {
-    /* Dedup first: 1-second window on (ip, port). Runs before any
-     * attribution work so we don't pay the sk_storage lookup or the
-     * softirq guard cost on the ~99% of events that are retransmits
-     * of an already-published drop on a failed connection. */
+                                            __u8 reason) {
+    /* Dedup first: 1-second window on (ip, port). Runs before the
+     * sk_storage lookup so we don't pay it on the ~99% of events that
+     * are retransmits of an already-published drop on a failed
+     * connection. */
     struct allow_key dedup_key = {.ip = ip, .port = port};
     __u64 now = bpf_ktime_get_ns();
     __u64 *last = bpf_map_lookup_elem(&drop_dedup, &dedup_key);
@@ -206,15 +166,25 @@ static __always_inline void emit_drop_event(struct __sk_buff *skb,
     if (last && (now - *last) < 1000000000ULL) /* 1 second */
         return;
 
-    /* Attribution precedence:
-     *   1. sk_storage (captured at LSM socket_connect / sendmsg, always
-     *      in process context). Authoritative — immune to softirq
-     *      context where `current` would be the preempted task.
-     *   2. bpf_get_current_* fallback when sk_storage is unavailable
-     *      (pre-existing sockets from before agent attach, skb->sk
-     *      NULL on some forwarded packets, LSM not attached on this
-     *      kernel). Paired with skip_softirq_attribution below so
-     *      fallback events aren't published with kthread noise.
+    /* Attribution comes EXCLUSIVELY from sk_storage, captured at LSM
+     * socket_connect / sendmsg (sock_attr.c) — always in process
+     * context, so pid/comm/binary_path are authoritative and immune
+     * to softirq context where `current` is the preempted task.
+     *
+     * We deliberately do NOT fall back to bpf_get_current_* here:
+     * those helpers aren't exposed to cgroup_skb on kernels < 6.18
+     * (cg_skb_func_proto has socket/skb helpers only), so using them
+     * makes the whole egress program fail the verifier on 6.1 — the
+     * kernel we need for Firecracker snapshot/restore. Dropping the
+     * fallback keeps one program that loads from 5.10 through 6.18+.
+     *
+     * Consequence: a packet with no sk_storage owner (socket created
+     * before the agent attached, or skb->sk NULL) is not published.
+     * In every supported deployment the agent attaches before the
+     * workload runs and the LSM socket hooks are loaded, so the owner
+     * is populated on effectively every socket — the no-owner path is
+     * the pre-attach-race canary the integration tests already treat
+     * as anomalous, not a steady-state source of events.
      *
      * skb->sk is a trusted bpf_sock in cgroup_skb/egress;
      * bpf_sk_storage_get's arg2 accepts ARG_PTR_TO_SOCK_COMMON (bpf_sock
@@ -224,24 +194,16 @@ static __always_inline void emit_drop_event(struct __sk_buff *skb,
     if (skb && skb->sk) {
         owner = bpf_sk_storage_get(&sock_owners, skb->sk, NULL, 0);
     }
-
-    if (!owner && skip_softirq_attribution()) {
-        /* Fallback-only: softirq with no sk_storage means `current`
-         * is an arbitrary preempted task. Publishing would misattribute;
-         * skip. LSM-attached deployments rarely land here after the
-         * first post-attach socket on a container. */
+    if (!owner)
         return;
-    }
 
     struct drop_event *ev = bpf_ringbuf_reserve(&drop_events, sizeof(struct drop_event), 0);
     if (!ev)
         return;
 
-    /* Ringbuf reserve returns uninitialised slot memory — stale
-     * bytes from the previous event at this slot leak into fields
-     * we don't explicitly write below. Zero the whole struct first
-     * so the fallback branch (which doesn't set binary_path) can't
-     * publish the binary of an unrelated prior process. */
+    /* Ringbuf reserve returns uninitialised slot memory — zero the
+     * whole struct so stale bytes from a prior event can't leak into
+     * fields we don't write. */
     __builtin_memset(ev, 0, sizeof(*ev));
 
     ev->dst_ip = ip;
@@ -249,26 +211,15 @@ static __always_inline void emit_drop_event(struct __sk_buff *skb,
     ev->protocol = proto;
     ev->reason = reason;
 
-    if (owner) {
-        /* Authoritative attribution from LSM capture. Use the
-         * owner's cgroup_id rather than the caller's: on softirq-
-         * origin packets, bpf_get_current_cgroup_id() at egress_filter
-         * entry would have been the preempted task's cgroup, not the
-         * socket creator's. The userspace recorder lookup keys on the
-         * socket creator's cgroup. */
-        ev->cgroup_id = owner->cgroup_id;
-        ev->pid = owner->pid;
-        __builtin_memcpy(&ev->comm, &owner->comm, sizeof(ev->comm));
-        __builtin_memcpy(&ev->binary_path, &owner->binary_path,
-                         sizeof(ev->binary_path));
-    } else {
-        /* Fallback to current. binary_path stays empty (zeroed above)
-         * when we can't resolve it — userspace falls back to
-         * process_info[pid] in that case. */
-        ev->cgroup_id = cgroup_id;
-        ev->pid = bpf_get_current_pid_tgid() >> 32;
-        (void)bpf_get_current_comm(&ev->comm, sizeof(ev->comm));
-    }
+    /* Authoritative attribution from LSM capture. Use the owner's
+     * cgroup_id rather than the skb's: on softirq-origin packets the
+     * skb cgroup is correct too, but the userspace recorder lookup
+     * keys on the socket creator's cgroup, which is what owner holds. */
+    ev->cgroup_id = owner->cgroup_id;
+    ev->pid = owner->pid;
+    __builtin_memcpy(&ev->comm, &owner->comm, sizeof(ev->comm));
+    __builtin_memcpy(&ev->binary_path, &owner->binary_path,
+                     sizeof(ev->binary_path));
 
     bpf_ringbuf_submit(ev, 0);
     (void)bpf_map_update_elem(&drop_dedup, &dedup_key, &now, BPF_ANY);
@@ -297,8 +248,8 @@ static __always_inline __u8 get_mode(void) {
  * mode returns 0 (drop). */
 static __always_inline int apply_drop(struct __sk_buff *skb, __u32 ip,
                                       __u16 port, __u8 proto,
-                                      __u64 cgroup_id, __u8 reason) {
-    emit_drop_event(skb, ip, port, proto, cgroup_id, reason);
+                                      __u8 reason) {
+    emit_drop_event(skb, ip, port, proto, reason);
 
     if (get_mode() == 1) {
         account_bytes(skb);
@@ -311,9 +262,15 @@ static __always_inline int apply_drop(struct __sk_buff *skb, __u32 ip,
 SEC("cgroup_skb/egress")
 int egress_filter(struct __sk_buff *skb) {
     /* Use bpf_skb_load_bytes for cgroup_skb — direct packet access is
-       unreliable across kernel versions for this program type. */
+       unreliable across kernel versions for this program type.
 
-    __u64 cgroup_id = bpf_get_current_cgroup_id();
+       Note: this program intentionally calls NO cgroup/current-task
+       helpers. Attribution is sourced entirely from sk_storage
+       (populated by the LSM socket hooks in sock_attr.c). That keeps
+       cg_skb_func_proto happy on kernels from 5.10 through 6.18+ —
+       older cgroup_skb proto tables expose socket/skb helpers only,
+       not bpf_get_current_* — which is what lets the agent load on
+       the 6.1 kernel the Firecracker snapshot path requires. */
 
     __u8 ver_ihl;
     if (bpf_skb_load_bytes(skb, 0, &ver_ihl, 1) < 0)
@@ -377,11 +334,11 @@ int egress_filter(struct __sk_buff *skb) {
     /* Cloud metadata: 169.254.169.254 — always block regardless of allow map.
        Prevents DNS rebinding attacks (attacker domain resolving to metadata IP). */
     if (dst_ip == bpf_htonl(0xA9FEA9FE))
-        return apply_drop(skb, dst_ip, dst_port, protocol, cgroup_id, DROP_REASON_POLICY);
+        return apply_drop(skb, dst_ip, dst_port, protocol, DROP_REASON_POLICY);
 
     /* DoT: always block port 853 */
     if (dst_port == DOT_PORT)
-        return apply_drop(skb, dst_ip, dst_port, protocol, cgroup_id, DROP_REASON_POLICY);
+        return apply_drop(skb, dst_ip, dst_port, protocol, DROP_REASON_POLICY);
 
     /* Loopback: 127.0.0.0/8 — always allow (before allow map) */
     if ((dst_ip & bpf_htonl(0xFF000000)) == bpf_htonl(0x7F000000))
@@ -403,7 +360,7 @@ int egress_filter(struct __sk_buff *skb) {
                means the app ignored DNS policy; tag it distinctly. */
             __u8 reason = (dst_ip == bpf_htonl(0xC0000201))
                     ? DROP_REASON_SINKHOLE : DROP_REASON_POLICY;
-            return apply_drop(skb, dst_ip, dst_port, protocol, cgroup_id, reason);
+            return apply_drop(skb, dst_ip, dst_port, protocol, reason);
         }
     }
 
@@ -422,7 +379,7 @@ int egress_filter(struct __sk_buff *skb) {
     }
 
     /* Default deny */
-    return apply_drop(skb, dst_ip, dst_port, protocol, cgroup_id, DROP_REASON_POLICY);
+    return apply_drop(skb, dst_ip, dst_port, protocol, DROP_REASON_POLICY);
 }
 
 /* sock_owners is shared with the LSM hooks in sock_attr.c via cilium/ebpf

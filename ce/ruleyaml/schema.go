@@ -19,12 +19,28 @@ type File struct {
 // running container to a scope using the value of an env var or label
 // configured via SCOPE_LABEL / SCOPE_ENV on the agent daemon. Scope name
 // "default" is used as the fallback when no match is found.
+//
+// Credwatch / ProcMem set the scope-default LSM detector mode
+// (off|observe|enforce). They only take effect when the corresponding
+// detector LSM is loaded (the global LEITWACHT_CE_*_ENABLED switch);
+// when unset the detector defaults to enforce for backward compatibility.
+// JobOverrides keys off job name and wins over the scope default.
 type Scope struct {
-	Name          string            `yaml:"name"`
-	DefaultAction string            `yaml:"default_action"`
-	JobActions    map[string]string `yaml:"job_actions,omitempty"`
-	RuleSets      map[string][]Rule `yaml:"rule_sets"`
-	DenyIPs       []DenyIP          `yaml:"deny_ips,omitempty"`
+	Name          string                 `yaml:"name"`
+	DefaultAction string                 `yaml:"default_action"`
+	JobActions    map[string]string      `yaml:"job_actions,omitempty"`
+	RuleSets      map[string][]Rule      `yaml:"rule_sets"`
+	DenyIPs       []DenyIP               `yaml:"deny_ips,omitempty"`
+	Credwatch     string                 `yaml:"credwatch,omitempty"`
+	ProcMem       string                 `yaml:"proc_mem,omitempty"`
+	JobOverrides  map[string]JobOverride `yaml:"job_overrides,omitempty"`
+}
+
+// JobOverride holds per-job-name LSM detector mode overrides within a
+// scope. An empty field inherits the scope default for that detector.
+type JobOverride struct {
+	Credwatch string `yaml:"credwatch,omitempty"`
+	ProcMem   string `yaml:"proc_mem,omitempty"`
 }
 
 // Rule is one entry in a scope's rule list. PatternType accepts the

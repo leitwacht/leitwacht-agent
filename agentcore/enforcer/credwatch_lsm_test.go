@@ -164,7 +164,7 @@ func TestCredwatchRingbufDirect(t *testing.T) {
 	}
 
 	// 6. Add our cgroup to known_containers (monitored, no exemption)
-	err = populateCredwatchMaps(objs, myCgroupID, false)
+	err = populateCredwatchMaps(objs, myCgroupID, false, false)
 	if err != nil {
 		t.Fatalf("populateCredwatchMaps: %v", err)
 	}
@@ -232,7 +232,7 @@ func TestCredwatchRingbufDirect(t *testing.T) {
 	events = nil
 	mu.Unlock()
 
-	err = populateCredwatchMaps(objs, myCgroupID, true)
+	err = populateCredwatchMaps(objs, myCgroupID, true, false)
 	if err != nil {
 		t.Fatalf("populateCredwatchMaps (exempt): %v", err)
 	}

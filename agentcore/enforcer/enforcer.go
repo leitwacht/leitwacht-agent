@@ -635,8 +635,17 @@ func (m *Manager) finalizeAttach(info ContainerInfo, e *Enforcer, nctx *NetnsCon
 
 	m.startPacketBucketReporter(e)
 	m.startDNSBucketReporter(info, nctx)
-	m.AttachCredwatch(info.ContainerID, e.cgroup, info.AllowCredWatch)
-	m.AttachProcMem(info.ContainerID, e.cgroup, info.AllowProcMemRead)
+
+	// "off" mode skips the attach entirely (container not monitored);
+	// "observe" attaches with the BPF observe-only bit; "enforce" (and the
+	// empty/unset default) attaches in killing mode.
+	if info.CredwatchMode != policy.LSMModeOff {
+		m.AttachCredwatch(info.ContainerID, e.cgroup, info.AllowCredWatch, info.CredwatchMode == policy.LSMModeObserve)
+	}
+
+	if info.ProcMemMode != policy.LSMModeOff {
+		m.AttachProcMem(info.ContainerID, e.cgroup, info.AllowProcMemRead, info.ProcMemMode == policy.LSMModeObserve)
+	}
 }
 
 // denyKey identifies one entry in the eBPF deny map.

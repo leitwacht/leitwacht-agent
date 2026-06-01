@@ -169,7 +169,7 @@ func TestDefenseInDepth_CredwatchKill(t *testing.T) {
 	}
 	myCgroupID := st.Ino
 
-	err = populateCredwatchMaps(objs, myCgroupID, false)
+	err = populateCredwatchMaps(objs, myCgroupID, false, false)
 	if err != nil {
 		t.Fatalf("populateCredwatchMaps: %v", err)
 	}
@@ -414,8 +414,8 @@ func TestDefenseInDepth_AllThreeKillPoints(t *testing.T) {
 		t.Fatalf("get cgroup path: %v", err)
 	}
 
-	mgr.AttachCredwatch("test-container", myCgroupPath, false)
-	mgr.AttachProcMem("test-container", myCgroupPath, false)
+	mgr.AttachCredwatch("test-container", myCgroupPath, false, false)
+	mgr.AttachProcMem("test-container", myCgroupPath, false, false)
 
 	// --- Kill point 1: /proc/self/mem ---
 	f, err := os.Open("/proc/self/mem")

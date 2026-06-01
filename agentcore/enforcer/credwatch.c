@@ -21,6 +21,12 @@
 /* Bit flags for cgroup_proc_config.flags */
 #define FLAG_MONITORED        1
 #define FLAG_ALLOW_CREDWATCH  4
+/* Observe-only: emit the ringbuf event for visibility but DON'T
+ * deny the open. Intended for sandboxed detonation environments
+ * where killing the workload at first cred read defeats the purpose —
+ * we want the sample to RUN so the full kill chain is captured, while
+ * still surfacing every cred touch as an event. */
+#define FLAG_OBSERVE_ONLY     8
 
 struct cgroup_proc_config {
     __u8 flags;
@@ -229,7 +235,11 @@ int BPF_PROG(credwatch_file_open, struct file *file)
         bpf_ringbuf_submit(evt, 0);
     }
 
-    /* 8. Deny the open */
+    /* 8. Deny the open — unless this container is in observe-only
+     * mode, in which case we've already emitted the event and let
+     * the open proceed. */
+    if (cfg->flags & FLAG_OBSERVE_ONLY)
+        return 0;
     return -EPERM;
 }
 

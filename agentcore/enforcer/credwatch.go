@@ -10,6 +10,11 @@ type CredwatchEvent struct {
 	Comm        string
 	Path        string
 	TimestampNs int64
+	// ObserveOnly mirrors the per-container FLAG_OBSERVE_ONLY bit
+	// the BPF program was configured with. When true, the BPF
+	// program emitted this event but DID NOT deny the open — the
+	// userspace callback should also skip its kill path.
+	ObserveOnly bool
 }
 
 // CredwatchConfig holds credwatch enforcement configuration.
@@ -30,14 +35,19 @@ type credwatchEventBPF struct {
 
 // credwatchContainerState tracks cgroup ID for a container in the credwatch LSM.
 type credwatchContainerState struct {
-	CgroupID uint64
-	AddedAt  time.Time
+	CgroupID    uint64
+	AddedAt     time.Time
+	ObserveOnly bool
 }
 
 // Flag constants for cgroup_proc_config.flags (matching BPF defines).
 const (
 	credwatchFlagMonitored      = 1
 	credwatchFlagAllowCredWatch = 4
+	// credwatchFlagObserveOnly: emit the ringbuf event but DON'T
+	// deny the cred-file open. For sandboxed detonation
+	// environments — see credwatch.c's FLAG_OBSERVE_ONLY comment.
+	credwatchFlagObserveOnly = 8
 )
 
 // credwatchEventSize is the expected packed size of struct credwatch_event in BPF bytecode.

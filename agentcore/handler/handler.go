@@ -37,7 +37,10 @@ var truncID = idutil.Trunc
 // separate (one is the watcher's input shape, the other the enforcer's
 // retained-for-reporting shape) — the projection lives here so adding a
 // new identity field is a one-line edit instead of a multi-site sweep.
-func infoFromEvent(ev watcher.ContainerEvent) enforcer.ContainerInfo {
+//
+// pol must already be job-scoped (post ForJob): CredwatchMode/ProcMemMode
+// are read verbatim as the resolved per-job LSM enforcement mode.
+func infoFromEvent(ev watcher.ContainerEvent, pol *policy.ResolvedPolicy) enforcer.ContainerInfo {
 	return enforcer.ContainerInfo{
 		ContainerID:      ev.ContainerID,
 		ProjectPath:      ev.ProjectPath,
@@ -51,6 +54,8 @@ func infoFromEvent(ev watcher.ContainerEvent) enforcer.ContainerInfo {
 		CgroupPath:       ev.CgroupPath,
 		AllowProcMemRead: ev.Labels["leitwacht.io/allow-proc-read"] == "true",
 		AllowCredWatch:   ev.Labels["leitwacht.io/allow-cred-read"] == "true",
+		CredwatchMode:    pol.CredwatchMode,
+		ProcMemMode:      pol.ProcMemMode,
 	}
 }
 
@@ -294,7 +299,7 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 			"warned")
 	}
 
-	_, attachErr := h.Enforcer.Attach(ctx, infoFromEvent(ev), ev.PID, pol)
+	_, attachErr := h.Enforcer.Attach(ctx, infoFromEvent(ev, pol), ev.PID, pol)
 	if attachErr != nil {
 		// Short-lived helper containers (e.g. GitLab Runner init containers) may exit
 		// before we can attach. Don't fire an advisory for these — the build container
@@ -317,7 +322,7 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 // CI pod exits. No security checks run and no advisories are emitted —
 // an opted-out project should not generate pressure on operators.
 func (h *Handler) attachSentinelOnly(ctx context.Context, ev watcher.ContainerEvent, pol *policy.ResolvedPolicy) {
-	_, err := h.Enforcer.Attach(ctx, infoFromEvent(ev), ev.PID, pol)
+	_, err := h.Enforcer.Attach(ctx, infoFromEvent(ev, pol), ev.PID, pol)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		h.Logger.Warn("passive-only attach failed",
 			"container_id", truncID(ev.ContainerID),

@@ -24,6 +24,34 @@ const (
 	PatternBuildVertex = "build_vertex"
 )
 
+// LSM feature mode values for the credwatch (credential-file access) and
+// proc_mem (/proc/<pid>/mem read) LSM detectors. Carried per-project and
+// per-job in the resolved policy so an operator can scope each detector
+// independently of the global "is the LSM loaded" daemon switch.
+//
+//   - off:     don't attach the container to the detector (no monitoring)
+//   - observe: emit the event but DON'T kill — sets the BPF
+//     FLAG_OBSERVE_ONLY bit. For detonation sandboxes where killing at
+//     first hit drops the kill chain we want to capture.
+//   - enforce: emit the event AND kill/detach the container.
+const (
+	LSMModeOff     = "off"
+	LSMModeObserve = "observe"
+	LSMModeEnforce = "enforce"
+)
+
+// IsValidLSMMode reports whether s is one of the recognised LSM mode
+// strings. The empty string is NOT valid here — callers that allow an
+// unset/inherit value should check for "" before calling this.
+func IsValidLSMMode(s string) bool {
+	switch s {
+	case LSMModeOff, LSMModeObserve, LSMModeEnforce:
+		return true
+	default:
+		return false
+	}
+}
+
 // Rule is one entry in an ordered policy list. The DNS proxy walks the
 // composed slice top to bottom; the first match decides the outcome.
 // Resolution is only meaningful when Action=deny AND PatternType=fqdn;
@@ -69,6 +97,15 @@ type ResolvedPolicy struct {
 	Version     int                `json:"version"`
 	FetchedAt   time.Time          `json:"fetched_at"`
 	TTL         time.Duration      `json:"ttl"`
+
+	// CredwatchMode / ProcMemMode are the project-level default LSM
+	// enforcement mode (LSMMode* — "" means unset, resolved to enforce
+	// for backward compatibility). The *JobModes maps hold per-job-name
+	// overrides; an entry wins over the project default for that job.
+	CredwatchMode     string            `json:"credwatch_mode,omitempty"`
+	ProcMemMode       string            `json:"proc_mem_mode,omitempty"`
+	CredwatchJobModes map[string]string `json:"credwatch_job_modes,omitempty"`
+	ProcMemJobModes   map[string]string `json:"proc_mem_job_modes,omitempty"`
 }
 
 // ActionForJob returns the enforcement action for a specific job name,
@@ -81,6 +118,36 @@ func (p *ResolvedPolicy) ActionForJob(jobName string) string {
 	}
 
 	return p.Action
+}
+
+// CredwatchModeForJob returns the resolved credwatch LSM mode for a job:
+// the per-job override if set, else the project default, else enforce.
+func (p *ResolvedPolicy) CredwatchModeForJob(jobName string) string {
+	return resolveLSMMode(p.CredwatchMode, p.CredwatchJobModes, jobName)
+}
+
+// ProcMemModeForJob returns the resolved proc_mem LSM mode for a job:
+// the per-job override if set, else the project default, else enforce.
+func (p *ResolvedPolicy) ProcMemModeForJob(jobName string) string {
+	return resolveLSMMode(p.ProcMemMode, p.ProcMemJobModes, jobName)
+}
+
+// resolveLSMMode applies the override → project-default → enforce
+// precedence. The enforce fallback preserves the pre-policy behaviour:
+// before per-project modes existed, enabling an LSM detector globally
+// killed on every hit, so an unset mode must keep killing.
+func resolveLSMMode(projectDefault string, jobModes map[string]string, jobName string) string {
+	if jobModes != nil {
+		if m, ok := jobModes[jobName]; ok && m != "" {
+			return m
+		}
+	}
+
+	if projectDefault != "" {
+		return projectDefault
+	}
+
+	return LSMModeEnforce
 }
 
 // BuildLookups populates DenyIPSet for O(1) IP lookup. Rule slices are
@@ -124,6 +191,10 @@ func (p *ResolvedPolicy) ForJob(jobName string) *ResolvedPolicy {
 		Version:     p.Version,
 		FetchedAt:   p.FetchedAt,
 		TTL:         p.TTL,
+		// Collapse the LSM modes to the resolved value for this job; the
+		// per-job maps are intentionally dropped from the job-scoped view.
+		CredwatchMode: p.CredwatchModeForJob(jobName),
+		ProcMemMode:   p.ProcMemModeForJob(jobName),
 	}
 }
 

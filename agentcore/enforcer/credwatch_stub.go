@@ -12,7 +12,7 @@ func (m *Manager) StopCredwatch() {}
 func (m *Manager) CredwatchLSMLoaded() bool { return false }
 
 // AttachCredwatch is a no-op on non-linux.
-func (m *Manager) AttachCredwatch(_, _ string, _ bool) {}
+func (m *Manager) AttachCredwatch(_, _ string, _, _ bool) {}
 
 // DetachCredwatch is a no-op on non-linux.
 func (m *Manager) DetachCredwatch(_ string) {}

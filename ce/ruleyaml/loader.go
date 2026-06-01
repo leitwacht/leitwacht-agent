@@ -266,17 +266,36 @@ func buildSnapshot(f *File, version int) (*snapshot, error) {
 			return nil, fmt.Errorf("scope %q: deny_ips: %w", s.Name, err)
 		}
 
+		credwatchMode, err := normaliseLSMMode(s.Credwatch)
+		if err != nil {
+			return nil, fmt.Errorf("scope %q: credwatch: %w", s.Name, err)
+		}
+
+		procMemMode, err := normaliseLSMMode(s.ProcMem)
+		if err != nil {
+			return nil, fmt.Errorf("scope %q: proc_mem: %w", s.Name, err)
+		}
+
+		credwatchJobs, procMemJobs, err := buildJobModes(s.JobOverrides)
+		if err != nil {
+			return nil, fmt.Errorf("scope %q: job_overrides: %w", s.Name, err)
+		}
+
 		pol := &policy.ResolvedPolicy{
-			ProjectPath: s.Name,
-			Action:      action,
-			JobActions:  jobActions,
-			RuleSets:    ruleSets,
-			DenyIPs:     denyIPs,
-			DenyIPSet:   denyIPSet,
-			Enrolled:    true,
-			Version:     version,
-			FetchedAt:   now,
-			TTL:         24 * time.Hour, // CE serves from snapshot; the cache TTL is irrelevant.
+			ProjectPath:       s.Name,
+			Action:            action,
+			JobActions:        jobActions,
+			RuleSets:          ruleSets,
+			DenyIPs:           denyIPs,
+			DenyIPSet:         denyIPSet,
+			Enrolled:          true,
+			Version:           version,
+			FetchedAt:         now,
+			TTL:               24 * time.Hour, // CE serves from snapshot; the cache TTL is irrelevant.
+			CredwatchMode:     credwatchMode,
+			ProcMemMode:       procMemMode,
+			CredwatchJobModes: credwatchJobs,
+			ProcMemJobModes:   procMemJobs,
 		}
 
 		if _, dup := out.scopes[s.Name]; dup {
@@ -361,6 +380,55 @@ func normaliseAction(in, fallback string) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown action %q (want allow|block|audit)", in)
 	}
+}
+
+// normaliseLSMMode validates an off|observe|enforce mode string. Empty is
+// allowed and returns "" (inherit/unset) so the agent's policy resolver
+// applies its enforce default rather than the loader baking it in.
+func normaliseLSMMode(in string) (string, error) {
+	v := strings.ToLower(strings.TrimSpace(in))
+	if v == "" {
+		return "", nil
+	}
+
+	if !policy.IsValidLSMMode(v) {
+		return "", fmt.Errorf("unknown mode %q (want off|observe|enforce)", in)
+	}
+
+	return v, nil
+}
+
+// buildJobModes splits per-job overrides into the two parallel maps the
+// agent policy carries (credwatch / proc_mem). Jobs that override neither
+// detector are omitted so the maps stay nil when unused.
+func buildJobModes(in map[string]JobOverride) (credwatch, procMem map[string]string, err error) {
+	for job, ov := range in {
+		cw, err := normaliseLSMMode(ov.Credwatch)
+		if err != nil {
+			return nil, nil, fmt.Errorf("job_overrides[%q]: credwatch: %w", job, err)
+		}
+
+		pm, err := normaliseLSMMode(ov.ProcMem)
+		if err != nil {
+			return nil, nil, fmt.Errorf("job_overrides[%q]: proc_mem: %w", job, err)
+		}
+
+		if cw != "" {
+			if credwatch == nil {
+				credwatch = make(map[string]string)
+			}
+			credwatch[job] = cw
+		}
+
+		if pm != "" {
+			if procMem == nil {
+				procMem = make(map[string]string)
+			}
+			procMem[job] = pm
+		}
+	}
+
+	return credwatch, procMem, nil
 }
 
 func normalisePattern(ptype, pattern string) (string, string, error) {

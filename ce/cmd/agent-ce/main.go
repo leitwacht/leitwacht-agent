@@ -327,7 +327,15 @@ func newWatcher(cfg *config.Config, log *slog.Logger) (watcher.ContainerWatcher,
 
 func wireCredwatchKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *sinks.Multi, log *slog.Logger) {
 	mgr.OnCredwatchEvent = func(ev enforcer.CredwatchEvent) {
-		if ev.ContainerID != "" {
+		// Observe-only: the BPF program already allowed the open.
+		// Userspace must skip its kill + detach paths too, otherwise
+		// we cancel the BPF allow with a userspace SIGKILL and the
+		// label is meaningless. The advisory still fires (operators
+		// see every touch) but with action_taken=observed.
+		action := "killed"
+		if ev.ObserveOnly {
+			action = "observed"
+		} else if ev.ContainerID != "" {
 			if err := w.KillContainer(context.Background(), ev.ContainerID); err != nil {
 				log.Warn("credwatch kill failed", "container", ev.ContainerID, "error", err)
 			}
@@ -336,10 +344,12 @@ func wireCredwatchKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *
 			ContainerID: ev.ContainerID,
 			Kind:        advisory.KindCredFileOpen,
 			Message:     fmt.Sprintf("credential file access detected: pid=%d comm=%q path=%q", ev.PID, ev.Comm, ev.Path),
-			ActionTaken: "killed",
+			ActionTaken: action,
 		})
-		if result := mgr.Detach(ev.ContainerID); result != nil {
-			sink.ReportAsync(context.Background(), result.Info, &result.Stats, false, time.Time{})
+		if !ev.ObserveOnly {
+			if result := mgr.Detach(ev.ContainerID); result != nil {
+				sink.ReportAsync(context.Background(), result.Info, &result.Stats, false, time.Time{})
+			}
 		}
 	}
 }
@@ -357,7 +367,14 @@ func emitCredwatchAdvisory(cfg enforcer.CredwatchConfig, mgr *enforcer.Manager, 
 
 func wireProcMemKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *sinks.Multi, log *slog.Logger) {
 	mgr.OnProcMemEvent = func(ev enforcer.ProcMemEvent) {
-		if ev.ContainerID != "" {
+		// Observe-only (sandboxed detonation): the BPF program already
+		// let the /proc/<pid>/mem open through; record the attempt but
+		// don't kill or detach, so the workload runs to completion and
+		// we capture the full behaviour. Mirrors the credwatch path.
+		action := "killed"
+		if ev.ObserveOnly {
+			action = "observed"
+		} else if ev.ContainerID != "" {
 			if err := w.KillContainer(context.Background(), ev.ContainerID); err != nil {
 				log.Warn("proc_mem kill failed", "container", ev.ContainerID, "error", err)
 			}
@@ -366,10 +383,12 @@ func wireProcMemKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *si
 			ContainerID: ev.ContainerID,
 			Kind:        advisory.KindProcMemRead,
 			Message:     fmt.Sprintf("process memory read detected: pid=%d comm=%q path=%q", ev.PID, ev.Comm, ev.Path),
-			ActionTaken: "killed",
+			ActionTaken: action,
 		})
-		if result := mgr.Detach(ev.ContainerID); result != nil {
-			sink.ReportAsync(context.Background(), result.Info, &result.Stats, false, time.Time{})
+		if !ev.ObserveOnly {
+			if result := mgr.Detach(ev.ContainerID); result != nil {
+				sink.ReportAsync(context.Background(), result.Info, &result.Stats, false, time.Time{})
+			}
 		}
 	}
 }

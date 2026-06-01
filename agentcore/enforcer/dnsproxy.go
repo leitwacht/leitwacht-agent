@@ -32,6 +32,14 @@ const (
 	tcpWriteTimeout = 5 * time.Second
 	tcpMaxQueries   = 128
 
+	// upstreamUDPSize is the UDP receive-buffer size for upstream
+	// responses. Without it the dns library defaults to MinMsgSize
+	// (512), which silently truncates and fails to parse larger
+	// answers — e.g. a multi-record A/AAAA set for a CDN-hosted name
+	// (registry.npmjs.org AAAA is ~611 bytes). 4096 matches the common
+	// EDNS0 buffer and fits any realistic response.
+	upstreamUDPSize = 4096
+
 	// SinkholeIPv4 is the RFC 5737 TEST-NET-1 address returned for
 	// blocked A queries. Any attempt to connect to it is tagged as
 	// a sinkhole_hit violation (the app ignored the DNS block). The
@@ -342,7 +350,7 @@ func forwardQuery(msg *dns.Msg, cfg *DNSProxyConfig) (*dns.Msg, error) {
 		// Fall through to regular upstreams on error.
 	}
 
-	udpClient := &dns.Client{Timeout: upstreamTimeout, Net: "udp"}
+	udpClient := &dns.Client{Timeout: upstreamTimeout, Net: "udp", UDPSize: upstreamUDPSize}
 	tcpClient := &dns.Client{Timeout: upstreamTimeout, Net: "tcp"}
 
 	for _, upstream := range cfg.Upstreams {
@@ -369,7 +377,9 @@ func forwardQuery(msg *dns.Msg, cfg *DNSProxyConfig) (*dns.Msg, error) {
 // the response. Retries on ID mismatch to skip stale responses from prior
 // timed-out queries.
 func exchangeViaConn(conn *net.UDPConn, msg *dns.Msg) (*dns.Msg, error) {
-	co := &dns.Conn{Conn: conn}
+	// UDPSize must be set or ReadMsg defaults to a 512-byte buffer and
+	// fails to parse larger upstream answers (see upstreamUDPSize).
+	co := &dns.Conn{Conn: conn, UDPSize: upstreamUDPSize}
 
 	deadlineErr := co.SetDeadline(time.Now().Add(upstreamTimeout))
 	if deadlineErr != nil {

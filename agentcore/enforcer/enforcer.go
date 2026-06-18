@@ -66,6 +66,19 @@ type NetnsContext struct {
 	// goroutine when a sibling joins with a different policy.
 	auditMode atomic.Bool
 
+	// egressAttached gates the DNS attach-liveness signal (the reserved
+	// `attached` reply) on the cgroup_skb/egress program actually being
+	// linked, not merely the DNS proxy being up. Set true once egress is
+	// live for this netns: in attachPodLink (K8s pod cgroup, before any
+	// container runs) and at the end of attachEnforcer (per-container /
+	// non-pod). Without this, the DNS proxy answers `attached` as soon as
+	// it starts in initNetnsContext — which on the non-pod path precedes
+	// AttachCgroup — so a gated entrypoint (probe-detonate's waitForAgent /
+	// leitwacht-init) could proceed in the window before egress enforcement
+	// is live and miss the first packets. Atomic: Stored from attach paths,
+	// Loaded by the DNS proxy goroutine on every reserved-name query.
+	egressAttached atomic.Bool
+
 	ebpf           EBPFHandle
 	dnsProxy       *DNSProxy
 	stopRingbuf    func()
@@ -808,6 +821,10 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 		Logger:         m.logger,
 		AddToAllowMap:  ebpfHandle.AddAllowedIP,
 		AgentVersion:   m.AgentVersion,
+		// Gate the `attached` reply on egress being linked (set by
+		// attachPodLink for K8s pods, attachEnforcer for non-pod). Closes
+		// the race where the signal fires before AttachCgroup.
+		EgressReady: nctx.egressAttached.Load,
 	}
 
 	if nctx.dockerUpstream != nil {
@@ -1013,6 +1030,12 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 			)
 		}
 	}
+
+	// Egress is now live for this netns (AttachCgroup above, or already
+	// covered by the pod link when podAttached). Arm the DNS attach-liveness
+	// signal so the reserved `attached` reply only fires now — closing the
+	// window where a gated entrypoint could run before enforcement.
+	nctx.egressAttached.Store(true)
 
 	e.logger.Info("enforcement attached",
 		"project", pol.ProjectPath,

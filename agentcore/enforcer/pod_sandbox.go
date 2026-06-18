@@ -207,6 +207,13 @@ func (m *Manager) attachPodLink(nctx *NetnsContext, podCgroup string, info PodSa
 	nctx.sandboxID = info.SandboxID
 	nctx.podAttached = true
 
+	// Egress is live at the pod cgroup before any user container runs, so
+	// arm the DNS attach-liveness signal here — the reserved `attached`
+	// reply is answerable from pod-sandbox time, exactly as before this
+	// gating existed (no change to K8s timing). The per-container
+	// attachEnforcer path sets the same flag for non-pod runtimes.
+	nctx.egressAttached.Store(true)
+
 	// Route softirq-context fallbacks (when bpf_get_current_cgroup_id()
 	// returns the pod cgroup id rather than a leaf container's id) to the
 	// pod-shared DNS recorder, instead of letting them fall back to the

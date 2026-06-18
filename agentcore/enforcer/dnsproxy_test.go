@@ -257,6 +257,39 @@ func TestHandleDNSQuery_LeitwachtAttached(t *testing.T) {
 		}
 	})
 
+	t.Run("signal withheld until egress is attached", func(t *testing.T) {
+		// The attach-race fix: while EgressReady reports false the reserved
+		// name returns NXDOMAIN so probe-detonate's waitForAgent /
+		// leitwacht-init keep polling; only once egress is linked does the
+		// pinned attachment A come back. Guarantees the gate cannot pass
+		// before cgroup_skb/egress enforcement is live.
+		cfg, pol, rec := testDNSConfig("block", []policy.Rule{denyAll})
+		cfg.AgentVersion = testVersion
+
+		egressReady := false
+		cfg.EgressReady = func() bool { return egressReady }
+
+		resp := HandleDNSQuery(makeQuery(ReservedDomains[0], dns.TypeA), cfg, pol, rec, 0, "", "", "", 0)
+		if resp.Rcode != dns.RcodeNameError {
+			t.Fatalf("pre-attach rcode = %d, want NXDOMAIN", resp.Rcode)
+		}
+
+		if len(resp.Answer) != 0 {
+			t.Fatalf("pre-attach answer count = %d, want 0", len(resp.Answer))
+		}
+
+		egressReady = true
+		resp = HandleDNSQuery(makeQuery(ReservedDomains[0], dns.TypeA), cfg, pol, rec, 0, "", "", "", 0)
+		if resp.Rcode != dns.RcodeSuccess || len(resp.Answer) != 1 {
+			t.Fatalf("post-attach rcode = %d answers = %d, want NOERROR/1", resp.Rcode, len(resp.Answer))
+		}
+
+		a, ok := resp.Answer[0].(*dns.A)
+		if !ok || a.A.String() != attachedIPv4 {
+			t.Fatalf("post-attach answer = %#v, want pinned %s", resp.Answer, attachedIPv4)
+		}
+	})
+
 	t.Run("empty agent version renders as 'unknown'", func(t *testing.T) {
 		cfg, pol, rec := testDNSConfig("block", nil)
 		cfg.AgentVersion = ""

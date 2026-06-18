@@ -94,6 +94,14 @@ type DNSProxyConfig struct {
 	// Receives the cgroup ID, domain, and action string ("dns_blocked" or "dns_denied").
 	// Nil by default — CE wires this in main.go. Not called in audit mode.
 	OnDNSViolation func(cgroupID uint64, domain, action string)
+
+	// EgressReady reports whether the cgroup_skb/egress program is attached
+	// for this netns. The reserved attach-liveness reply is withheld
+	// (NXDOMAIN, so the poller keeps waiting) until it returns true, so a
+	// gated entrypoint cannot proceed before egress enforcement is live.
+	// Nil means "no gating" (treated as ready) — preserves the prior
+	// behaviour for any caller that doesn't wire it.
+	EgressReady func() bool
 }
 
 // HandleDNSQuery processes a single DNS query under ordered-rule policy.
@@ -133,6 +141,15 @@ func HandleDNSQuery(
 	// suffix (and eventually the FQDN) without recording the variant.
 	for _, reserved := range ReservedDomains {
 		if qname == reserved {
+			// Withhold the attach-liveness signal until egress is actually
+			// attached for this netns. NXDOMAIN (not the pinned A/TXT) keeps
+			// the init/detonation poller waiting, so it cannot proceed in the
+			// window after the DNS proxy starts but before AttachCgroup. Nil
+			// EgressReady = no gating (prior behaviour).
+			if cfg.EgressReady != nil && !cfg.EgressReady() {
+				return nxdomainResponse(msg)
+			}
+
 			return attachedResponse(msg, qtype, cfg.AgentVersion)
 		}
 

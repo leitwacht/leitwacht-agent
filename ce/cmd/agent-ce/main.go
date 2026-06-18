@@ -231,7 +231,7 @@ func main() {
 	}
 
 	recoverRunning(ctx, w, h, log)
-	runEventLoop(ctx, log, h, mgr, w.Watch(ctx), multi)
+	runEventLoop(ctx, log, h, mgr, w, w.Watch(ctx), multi)
 }
 
 func parseLevel(v string) slog.Level {
@@ -459,10 +459,32 @@ func runEventLoop(
 	log *slog.Logger,
 	h *handler.Handler,
 	mgr *enforcer.Manager,
+	w watcher.ContainerWatcher,
 	events <-chan watcher.ContainerEvent,
 	sink *sinks.Multi,
 ) {
 	log.Info("agent ready, watching for containers")
+
+	// Reconcile loop: recover from missed /tasks/exit events (dropped under
+	// event-stream backpressure or a `--rm` teardown race) that would
+	// otherwise leave an enforcer attached forever with its final report
+	// unflushed. Each tick diffs attached containers against the runtime's
+	// running set; a container missing for two consecutive ticks (debounce
+	// against listing races and just-attached containers) is treated as a
+	// missed exit and detached via the normal die path. Skips the tick
+	// entirely on a listing error so a transient containerd failure can't
+	// mass-detach live containers. Only the containerd watcher implements
+	// the running-set query — other runtimes simply get no reconcile.
+	const reconcileInterval = 10 * time.Second
+
+	reconcile := time.NewTicker(reconcileInterval)
+	defer reconcile.Stop()
+
+	lister, _ := w.(interface {
+		RunningContainerIDs(context.Context) (map[string]struct{}, error)
+	})
+	missing := make(map[string]int)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -482,6 +504,48 @@ func runEventLoop(
 				return
 			}
 			dispatch(ctx, h, ev)
+		case <-reconcile.C:
+			if lister == nil {
+				continue
+			}
+
+			running, err := lister.RunningContainerIDs(ctx)
+			if err != nil {
+				log.Debug("reconcile: list running containers failed, skipping tick", "error", err)
+
+				continue
+			}
+
+			attached := mgr.AttachedContainerIDs()
+			seen := make(map[string]struct{}, len(attached))
+
+			for _, id := range attached {
+				seen[id] = struct{}{}
+
+				if _, ok := running[id]; ok {
+					delete(missing, id)
+
+					continue
+				}
+
+				missing[id]++
+				if missing[id] < 2 {
+					continue // debounce: require two consecutive misses
+				}
+
+				log.Warn("reconcile: attached container has no running task — recovering missed exit event",
+					"container_id", id[:min(len(id), 12)])
+				delete(missing, id)
+				dispatch(ctx, h, watcher.ContainerEvent{Action: "die", ContainerID: id})
+			}
+
+			// Drop debounce state for containers no longer attached (e.g.
+			// detached by a normal die event between reconcile ticks).
+			for id := range missing {
+				if _, ok := seen[id]; !ok {
+					delete(missing, id)
+				}
+			}
 		}
 	}
 }

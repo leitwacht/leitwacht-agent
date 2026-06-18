@@ -445,6 +445,38 @@ func (w *ContainerdWatcher) RecoverRunning(ctx context.Context) ([]ContainerEven
 	return evts, nil
 }
 
+// RunningContainerIDs returns the set of container IDs that currently have a
+// Running task in the watched namespace. Used by the agent's reconcile loop to
+// detect containers whose /tasks/exit event was missed — dropped under event-
+// stream backpressure or a `--rm` teardown race — so an attached container
+// absent from this set has stopped and its enforcer must be detached (and its
+// final report flushed). Best-effort: a listing error is returned so the caller
+// skips the tick rather than detaching everything on a transient failure.
+func (w *ContainerdWatcher) RunningContainerIDs(ctx context.Context) (map[string]struct{}, error) {
+	containers, err := w.client.Containers(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list containerd containers: %w", err)
+	}
+
+	running := make(map[string]struct{}, len(containers))
+
+	for _, c := range containers {
+		task, err := c.Task(ctx, nil)
+		if err != nil {
+			continue // no task → not running
+		}
+
+		status, err := task.Status(ctx)
+		if err != nil || status.Status != containerd.Running {
+			continue
+		}
+
+		running[c.ID()] = struct{}{}
+	}
+
+	return running, nil
+}
+
 // KillContainer kills a container with SIGKILL.
 func (w *ContainerdWatcher) KillContainer(ctx context.Context, containerID string) error {
 	task, err := w.getTask(ctx, containerID)

@@ -308,6 +308,25 @@ func (m *Manager) ContainerIDForCgroup(cgroupID uint64) string {
 	return ""
 }
 
+// AttachedContainerIDs returns the IDs of all fully-attached containers (those
+// with a live Enforcer). The reconcile loop diffs this against the runtime's
+// running set to find containers whose exit event was missed. Reserved-but-not-
+// yet-attached slots (nil value, set during the Attach critical section) are
+// excluded — they are mid-Attach, not stale, and must not be reconciled away.
+func (m *Manager) AttachedContainerIDs() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ids := make([]string, 0, len(m.enforcers))
+	for id, e := range m.enforcers {
+		if e != nil {
+			ids = append(ids, id)
+		}
+	}
+
+	return ids
+}
+
 // NewManager creates an enforcement manager with the given configuration.
 func NewManager(
 	logger *slog.Logger, maxConcurrent int, upstreams []string,

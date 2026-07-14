@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
@@ -287,13 +288,19 @@ func (m *Manager) handleProcMemBPFEvent(evt procMemEventBPF) {
 	}
 	m.mu.Unlock()
 
+	// BPF stamps evt.TimestampNs with bpf_ktime_get_ns() (CLOCK_MONOTONIC);
+	// convert to wall-clock epoch ns here so downstream last_seen isn't ~1970
+	// and the server doesn't TTL-purge the row. See clock.go.
+	nowWallNs := time.Now().UnixNano()
+	nowMonoNs := nowMonotonicNs()
+
 	event := ProcMemEvent{
 		ContainerID: containerID,
 		CgroupID:    evt.CgroupID,
 		PID:         evt.PID,
 		Comm:        nullTerminated(evt.Comm[:]),
 		Path:        nullTerminated(evt.Path[:]),
-		TimestampNs: int64(evt.TimestampNs), //nolint:gosec // ns timestamp fits int64
+		TimestampNs: monotonicToWallNs(int64(evt.TimestampNs), nowMonoNs, nowWallNs), //nolint:gosec // monotonic ns fits int64
 		ObserveOnly: observeOnly,
 	}
 

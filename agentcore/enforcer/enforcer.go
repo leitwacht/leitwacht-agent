@@ -308,6 +308,28 @@ func (m *Manager) ContainerIDForCgroup(cgroupID uint64) string {
 	return ""
 }
 
+// ContainerInfo returns the CI attribution recorded for an attached
+// container, without tearing anything down. Returns ok=false when the
+// container has no live Enforcer (never attached, already detached, or
+// still mid-Attach).
+//
+// Exists for the LSM observe-only path: an observed detection must be
+// reported with full project/job attribution, but must NOT detach the
+// container the way an enforced hit does. Detach was previously the only
+// way to obtain a ContainerInfo, which made "report it" and "leave the
+// workload running" mutually exclusive.
+func (m *Manager) ContainerInfo(containerID string) (ContainerInfo, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	e, ok := m.enforcers[containerID]
+	if !ok || e == nil {
+		return ContainerInfo{}, false
+	}
+
+	return e.info, true
+}
+
 // AttachedContainerIDs returns the IDs of all fully-attached containers (those
 // with a live Enforcer). The reconcile loop diffs this against the runtime's
 // running set to find containers whose exit event was missed. Reserved-but-not-

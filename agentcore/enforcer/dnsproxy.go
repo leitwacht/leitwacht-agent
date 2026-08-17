@@ -66,9 +66,10 @@ type DNSProxyConfig struct {
 	// Returns nil if the cgroup is not (yet) registered.
 	LookupRecorder func(cgroupID uint64) *ViolationRecorder
 
-	// AddToAllowMap is called when a domain resolves to add {ip, port} to the eBPF map.
+	// AddToAllowMap is called when a domain resolves to add {ip, port} to
+	// the eBPF map, stamped with the matching rule's priority.
 	// On non-Linux or in tests, this can be a no-op.
-	AddToAllowMap func(ip net.IP, ports []int) error
+	AddToAllowMap func(ip net.IP, ports []int, prio uint32) error
 
 	// LookupDNSPID returns the PID, process name, parent process name,
 	// binary path, and cgroup ID for a DNS query from (netnsCookie,
@@ -160,13 +161,13 @@ func HandleDNSQuery(
 
 	rules := pol.RulesForJob("")
 
-	match, matched := matchFirstRule(qname, rules)
+	match, matchIdx, matched := matchFirstRule(qname, rules)
 	if matched {
 		if match.Action == policy.ActionDeny {
 			return handleDenyRule(msg, cfg, qname, qtype, match, recorder, pid, comm, parentComm, binaryPath, cgroupID, pol.Action == policy.ActionAudit)
 		}
 
-		return handleAllowRule(msg, cfg, qname, qtype, match, recorder, pid, comm, parentComm, binaryPath)
+		return handleAllowRule(msg, cfg, qname, qtype, match, matchIdx, recorder, pid, comm, parentComm, binaryPath)
 	}
 
 	isAudit := pol.Action == policy.ActionAudit
@@ -188,21 +189,27 @@ func HandleDNSQuery(
 	return forwardAndObserve(msg, cfg, qname, qtype, recorder, pid, comm, parentComm, binaryPath)
 }
 
-// matchFirstRule walks rules top to bottom and returns the first fqdn rule
-// whose pattern matches qname. cidr rules are skipped (they feed the eBPF
-// deny map, not the DNS proxy).
-func matchFirstRule(qname string, rules []policy.Rule) (policy.Rule, bool) {
-	for _, r := range rules {
+// matchFirstRule walks rules top to bottom and returns the first fqdn
+// rule whose pattern matches qname, along with its index in the list.
+//
+// cidr rules are skipped here — they have no name to match against and
+// are enforced in the datapath instead (installed at attach into the
+// allow/deny maps). The returned index is what keeps the two halves
+// consistent: it becomes the priority of every allow-map entry this
+// resolution seeds, so an IP rule sitting above this fqdn rule still
+// wins in egress.c.
+func matchFirstRule(qname string, rules []policy.Rule) (policy.Rule, int, bool) {
+	for i, r := range rules {
 		if r.PatternType != policy.PatternFQDN {
 			continue
 		}
 
 		if matchesRule(qname, r) {
-			return r, true
+			return r, i, true
 		}
 	}
 
-	return policy.Rule{}, false
+	return policy.Rule{}, -1, false
 }
 
 // matchesRule chooses wildcard semantics per action: allow rules use
@@ -252,7 +259,7 @@ func handleDenyRule(
 // handleAllowRule forwards the query upstream, strips AAAA, and seeds the
 // eBPF allow map with the A-record IPs on the rule's permitted ports.
 func handleAllowRule(
-	msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uint16, rule policy.Rule,
+	msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uint16, rule policy.Rule, ruleIdx int,
 	recorder *ViolationRecorder, pid uint32, comm, parentComm, binaryPath string,
 ) *dns.Msg {
 	resp, ips, ok := forwardAndFilter(msg, cfg, qname, qtype)
@@ -264,7 +271,7 @@ func handleAllowRule(
 		recorder.RecordDNS(qname, dns.TypeToString[qtype], "dns_allowed", ips, pid, comm, parentComm, binaryPath)
 	}
 
-	seedAllowMap(cfg, ips, rule.Ports)
+	seedAllowMap(cfg, ips, rule.Ports, policy.RulePriority(ruleIdx))
 
 	return resp
 }
@@ -330,8 +337,9 @@ func forwardAndFilter(msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uin
 }
 
 // seedAllowMap adds the resolved IPs to the eBPF allow map on the given
-// ports. No-op when AddToAllowMap is nil (tests / non-Linux hosts).
-func seedAllowMap(cfg *DNSProxyConfig, ips []string, rulePorts []int) {
+// ports, stamped with the priority of the rule that authorised them.
+// No-op when AddToAllowMap is nil (tests / non-Linux hosts).
+func seedAllowMap(cfg *DNSProxyConfig, ips []string, rulePorts []int, prio uint32) {
 	if cfg.AddToAllowMap == nil {
 		return
 	}
@@ -347,7 +355,7 @@ func seedAllowMap(cfg *DNSProxyConfig, ips []string, rulePorts []int) {
 			continue
 		}
 
-		addErr := cfg.AddToAllowMap(ip, ports)
+		addErr := cfg.AddToAllowMap(ip, ports, prio)
 		if addErr != nil {
 			cfg.Logger.Error("add to allow map", "ip", ipStr, "error", addErr)
 		}

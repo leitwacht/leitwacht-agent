@@ -35,9 +35,24 @@ type fakePlatform struct {
 	ebpfClosed      bool
 	ringbufStarted  bool
 	allowedIPs      []string
+	allowedHosts    []string
 	deniedIPs       []string
 	loadCount       int
 	cgroupIDCounter atomic.Uint64
+
+	// ipPrio records the priority each {ip, port} entry was installed
+	// with, keyed the same way as the allowedHosts / deniedIPs slices.
+	// Kept out of those slices so the ordering assertions can stay
+	// written in terms of plain "ip:port" strings.
+	ipPrio map[string]uint32
+}
+
+func (f *fakePlatform) recordPrio(entry string, prio uint32) {
+	if f.ipPrio == nil {
+		f.ipPrio = make(map[string]uint32)
+	}
+
+	f.ipPrio[entry] = prio
 }
 
 func (f *fakePlatform) GetCgroupPath(_ int) (string, error) {
@@ -108,26 +123,44 @@ type fakeEBPFHandle struct {
 	ringbufAuditSrc *atomic.Bool
 }
 
-func (h *fakeEBPFHandle) AddAllowedIP(ip net.IP, ports []int) error {
+func (h *fakeEBPFHandle) AddAllowedIP(ip net.IP, ports []int, _ uint32) error {
 	h.platform.allowedIPs = append(h.platform.allowedIPs, ip.String())
 	return nil
 }
 
-func (h *fakeEBPFHandle) AddDeniedIP(ip net.IP, port int) error {
-	h.platform.deniedIPs = append(h.platform.deniedIPs, fmt.Sprintf("%s:%d", ip, port))
+func (h *fakeEBPFHandle) AddAllowedHost(ip net.IP, port int, prio uint32) error {
+	entry := fmt.Sprintf("%s:%d", ip, port)
+	h.platform.allowedHosts = append(h.platform.allowedHosts, entry)
+	h.platform.recordPrio(entry, prio)
+	return nil
+}
+
+func (h *fakeEBPFHandle) RemoveAllowedHost(ip net.IP, port int) error {
+	h.platform.allowedHosts = removeEntry(h.platform.allowedHosts, fmt.Sprintf("%s:%d", ip, port))
+	return nil
+}
+
+func (h *fakeEBPFHandle) AddDeniedIP(ip net.IP, port int, prio uint32) error {
+	entry := fmt.Sprintf("%s:%d", ip, port)
+	h.platform.deniedIPs = append(h.platform.deniedIPs, entry)
+	h.platform.recordPrio(entry, prio)
 	return nil
 }
 
 func (h *fakeEBPFHandle) RemoveDeniedIP(ip net.IP, port int) error {
-	target := fmt.Sprintf("%s:%d", ip, port)
-	out := h.platform.deniedIPs[:0]
-	for _, e := range h.platform.deniedIPs {
+	h.platform.deniedIPs = removeEntry(h.platform.deniedIPs, fmt.Sprintf("%s:%d", ip, port))
+	return nil
+}
+
+// removeEntry drops every occurrence of target, in place.
+func removeEntry(entries []string, target string) []string {
+	out := entries[:0]
+	for _, e := range entries {
 		if e != target {
 			out = append(out, e)
 		}
 	}
-	h.platform.deniedIPs = out
-	return nil
+	return out
 }
 
 func (h *fakeEBPFHandle) ReadStats() int64 { return 42 }

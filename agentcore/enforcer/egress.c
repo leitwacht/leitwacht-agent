@@ -15,6 +15,38 @@
 #define DOT_PORT 853
 #define BINARY_PATH_LEN 256
 
+/* Rule priority. The IP-policy maps store, as their value, the index of
+   the rule that produced the entry in the job's composed rule list —
+   so the datapath can reproduce the list's first-match-wins semantics
+   instead of hardcoding "deny beats allow". Lower wins.
+
+   Priority 0 is reserved for system-seeded entries that hold no
+   position in any rule list and must beat every rule: the DNS sinkhole
+   deny, and CE's standalone `deny_ips:` blocklist. Rule-derived entries
+   start at 1.
+
+   PRIO_NONE is the "no entry" sentinel — it must stay larger than any
+   real rule index, which is guaranteed since composed lists are many
+   orders of magnitude shorter than 2^32. */
+#define PRIO_NONE 0xFFFFFFFFU
+
+/* Fold a map hit into the running best (lowest) priority. Checks the
+   exact {ip, port} key then the port=0 wildcard, which means "any port
+   on this IP". Written as a macro rather than a helper taking void*:
+   the map argument has to be a literal for the verifier to resolve it,
+   and this keeps that obvious at each call site. */
+#define FOLD_PRIO(m, ip_, port_, best)                                  \
+    do {                                                               \
+        struct allow_key _k = {.ip = (ip_), .port = (port_)};          \
+        __u32 *_v = bpf_map_lookup_elem(&(m), &_k);                    \
+        if (_v && *_v < (best))                                        \
+            (best) = *_v;                                              \
+        _k.port = 0;                                                   \
+        _v = bpf_map_lookup_elem(&(m), &_k);                           \
+        if (_v && *_v < (best))                                        \
+            (best) = *_v;                                              \
+    } while (0)
+
 /* struct sock is opaque; only used as a handle for bpf_sk_storage_get. */
 struct sock;
 
@@ -23,10 +55,18 @@ struct allow_key {
     __u16 port;
 } __attribute__((packed));
 
+/* DNS-derived allows. Seeded by the DNS proxy when a query matches an
+   allow rule and resolves; the value is that rule's priority, so a
+   deny rule sitting above it in the list still wins.
+
+   LRU is correct here and only here: entries are re-seeded on every
+   re-resolution, so eviction costs at most one extra DNS round trip.
+   Statically-seeded entries must NOT live in this map — see
+   allowed_hosts. */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, struct allow_key);
-    __type(value, __u8);
+    __type(value, __u32);
     __uint(max_entries, 65536);
 } allowed_ips SEC(".maps");
 
@@ -83,14 +123,32 @@ struct {
     __uint(max_entries, 4096);
 } drop_dedup SEC(".maps");
 
-/* Operator-denied IPs. Checked before trusted_nets so deny overrides trust.
-   Port=0 means deny all ports for that IP. */
+/* Operator-denied IPs. Value is the denying rule's priority; port=0
+   means deny all ports for that IP. */
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, struct allow_key);
-    __type(value, __u8);
+    __type(value, __u32);
     __uint(max_entries, 4096);
 } denied_ips SEC(".maps");
+
+/* Operator-allowed IPs — the static counterpart to allowed_ips, for
+   destinations that have no DNS name at all (deploy targets, ClusterIPs,
+   hard-coded registry addresses). Populated at attach from the job's
+   composed cidr+allow rules; value is the rule's priority, port=0 means
+   any port on that IP.
+
+   Deliberately a plain HASH, not an LRU: nothing re-seeds these entries
+   after attach, so an eviction would silently turn a permitted
+   destination into an intermittent, unreproducible drop. Bounded size
+   is the right failure mode here — a full map fails loudly at install
+   time instead of quietly at 3am. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key, struct allow_key);
+    __type(value, __u32);
+    __uint(max_entries, 4096);
+} allowed_hosts SEC(".maps");
 
 /* Per-socket attribution.
  *
@@ -348,35 +406,57 @@ int egress_filter(struct __sk_buff *skb) {
     if ((dst_ip & bpf_htonl(0xFFFF0000)) == bpf_htonl(0xA9FE0000))
         return 1;
 
-    /* Deny map: operator-blocked IPs — checked before trusted_nets so deny
-       overrides trust. Port=0 entry means deny all ports for that IP. */
+    /* --- Ordered rule evaluation: lowest priority wins --------------
+     *
+     * Each IP-policy map stores the priority of the rule that produced
+     * the entry, so the winner here is whichever rule appears first in
+     * the job's composed list — the same first-match-wins semantics the
+     * DNS proxy applies to fqdn rules, and what an operator expects
+     * from a firewall ruleset.
+     *
+     * The hard blocks above are deliberately NOT part of this
+     * evaluation: cloud metadata, DoT and the loopback / link-local
+     * carve-outs are invariants, not policy, and no rule ordering may
+     * reach them. */
+    __u16 dport_be = bpf_htons(dst_port);
+    __u32 deny_prio = PRIO_NONE;
+    __u32 allow_prio = PRIO_NONE;
+
+    FOLD_PRIO(denied_ips, dst_ip, dport_be, deny_prio);
+    FOLD_PRIO(allowed_hosts, dst_ip, dport_be, allow_prio);
+
+    /* DNS-derived allows are seeded per resolved {ip, port} and have no
+       any-port form, so no wildcard probe here. */
     {
-        struct allow_key deny_key = {.ip = dst_ip, .port = bpf_htons(dst_port)};
-        struct allow_key deny_wild = {.ip = dst_ip, .port = 0};
-        if (bpf_map_lookup_elem(&denied_ips, &deny_key) ||
-            bpf_map_lookup_elem(&denied_ips, &deny_wild)) {
-            /* 192.0.2.1 (RFC 5737 TEST-NET-1) is our DNS sinkhole — the
-               proxy returns it for blocked A queries. A connect attempt
-               means the app ignored DNS policy; tag it distinctly. */
-            __u8 reason = (dst_ip == bpf_htonl(0xC0000201))
-                    ? DROP_REASON_SINKHOLE : DROP_REASON_POLICY;
-            return apply_drop(skb, dst_ip, dst_port, protocol, reason);
-        }
+        struct allow_key dns_key = {.ip = dst_ip, .port = dport_be};
+        __u32 *dns_prio = bpf_map_lookup_elem(&allowed_ips, &dns_key);
+        if (dns_prio && *dns_prio < allow_prio)
+            allow_prio = *dns_prio;
     }
 
-    /* Trusted CIDRs: operator-configured networks (Docker bridge, k8s pod net) */
-    struct lpm_key cidr_key = {.prefixlen = 32, .ip = dst_ip};
-    if (bpf_map_lookup_elem(&trusted_nets, &cidr_key))
-        return 1;
+    /* Ties go to deny. Distinct rules can't share an index, so a tie
+       only arises between system-seeded (priority 0) entries. */
+    if (deny_prio != PRIO_NONE && deny_prio <= allow_prio) {
+        /* 192.0.2.1 (RFC 5737 TEST-NET-1) is our DNS sinkhole — the
+           proxy returns it for blocked A queries. A connect attempt
+           means the app ignored DNS policy; tag it distinctly. */
+        __u8 reason = (dst_ip == bpf_htonl(0xC0000201))
+                ? DROP_REASON_SINKHOLE : DROP_REASON_POLICY;
+        return apply_drop(skb, dst_ip, dst_port, protocol, reason);
+    }
 
-    /* --- Allow map: only checked after hard blocks --- */
-
-    /* Check allow map */
-    struct allow_key key = {.ip = dst_ip, .port = bpf_htons(dst_port)};
-    if (bpf_map_lookup_elem(&allowed_ips, &key)) {
+    if (allow_prio != PRIO_NONE) {
         account_bytes(skb);
         return 1; /* allowed */
     }
+
+    /* Trusted CIDRs: node-level operator config (Docker bridge, k8s pod
+       net). These hold no position in any rule list, so they are
+       consulted only once every rule has missed — an explicit deny rule
+       still overrides trust, as it did before ordering existed. */
+    struct lpm_key cidr_key = {.prefixlen = 32, .ip = dst_ip};
+    if (bpf_map_lookup_elem(&trusted_nets, &cidr_key))
+        return 1;
 
     /* Default deny */
     return apply_drop(skb, dst_ip, dst_port, protocol, DROP_REASON_POLICY);

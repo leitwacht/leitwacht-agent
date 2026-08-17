@@ -372,11 +372,11 @@ func (h *linuxEBPFHandle) AttachCgroup(cgroupPath string) (CgroupLink, error) {
 	return &linuxCgroupLink{link: cgroupLink}, nil
 }
 
-func (h *linuxEBPFHandle) AddAllowedIP(ip net.IP, ports []int) error {
+func (h *linuxEBPFHandle) AddAllowedIP(ip net.IP, ports []int, prio uint32) error {
 	for _, port := range ports {
 		key := PackAllowKey(ip, port)
 
-		putErr := h.objs.AllowedIps.Put(key[:], uint8(1))
+		putErr := h.objs.AllowedIps.Put(key[:], prio)
 		if putErr != nil {
 			h.logger.Error("put allow map", "ip", ip, "port", port, "error", putErr)
 
@@ -387,10 +387,38 @@ func (h *linuxEBPFHandle) AddAllowedIP(ip net.IP, ports []int) error {
 	return nil
 }
 
-func (h *linuxEBPFHandle) AddDeniedIP(ip net.IP, port int) error {
+// AddAllowedHost writes to the non-LRU static allow map. A full map is
+// reported rather than swallowed: silently dropping the entry would
+// present as an intermittent connection failure in the workload, which
+// is precisely the failure mode the non-LRU map exists to prevent.
+func (h *linuxEBPFHandle) AddAllowedHost(ip net.IP, port int, prio uint32) error {
 	key := PackAllowKey(ip, port)
 
-	putErr := h.objs.DeniedIps.Put(key[:], uint8(1))
+	putErr := h.objs.AllowedHosts.Put(key[:], prio)
+	if putErr != nil {
+		h.logger.Error("put static allow map", "ip", ip, "port", port, "error", putErr)
+
+		return fmt.Errorf("put static allow map: %w", putErr)
+	}
+
+	return nil
+}
+
+func (h *linuxEBPFHandle) RemoveAllowedHost(ip net.IP, port int) error {
+	key := PackAllowKey(ip, port)
+
+	delErr := h.objs.AllowedHosts.Delete(key[:])
+	if delErr != nil && !errors.Is(delErr, ebpf.ErrKeyNotExist) {
+		return fmt.Errorf("delete static allow map: %w", delErr)
+	}
+
+	return nil
+}
+
+func (h *linuxEBPFHandle) AddDeniedIP(ip net.IP, port int, prio uint32) error {
+	key := PackAllowKey(ip, port)
+
+	putErr := h.objs.DeniedIps.Put(key[:], prio)
 	if putErr != nil {
 		h.logger.Error("put deny map", "ip", ip, "port", port, "error", putErr)
 

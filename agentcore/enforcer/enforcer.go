@@ -88,14 +88,17 @@ type NetnsContext struct {
 	cgroupRecorders map[uint64]*ViolationRecorder // cgroup_id -> per-container recorder
 	pids            map[string]int                // containerID -> pid, for primaryPID update
 
-	// joinerDeny tracks which deny-map entries each joiner contributed
-	// so Detach can reverse them. Without this, two siblings of the
-	// same netns with disjoint deny lists union over the netns
-	// lifetime — an "allow" job inheriting deny IPs from a previous
-	// "block" sibling once per-job rule sets land. The sinkhole IP is
-	// owned by the netns init, not a joiner, and lives outside this map.
+	// joinerDeny / joinerAllow track which deny- and static-allow-map
+	// entries each joiner contributed so Detach can reverse them.
+	// Without this, two siblings of the same netns with disjoint IP
+	// rules union over the netns lifetime — an "allow" job inheriting
+	// deny IPs from a previous "block" sibling once per-job rule sets
+	// land, or worse, a job inheriting another job's IP allowances.
+	// The sinkhole IP is owned by the netns init, not a joiner, and
+	// lives outside these maps.
 	// Protected by Manager.mu (same as refcount).
-	joinerDeny map[string][]denyKey // containerID -> entries
+	joinerDeny  map[string][]ipRuleKey // containerID -> entries
+	joinerAllow map[string][]ipRuleKey // containerID -> entries
 
 	// projectInfo stores CI metadata from the first container that provides it
 	// (e.g., init-permissions). Siblings without CI_PROJECT_PATH inherit this
@@ -436,12 +439,12 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 		return nil, err
 	}
 
-	// Both creator and joiner paths register their deny IPs through
-	// the same per-container ownership map so Detach can reverse them.
-	// The sinkhole entry is netns-lifetime and was seeded once during
-	// initNetnsContext.
+	// Both creator and joiner paths register their IP allow/deny rules
+	// through the same per-container ownership maps so Detach can
+	// reverse them. The sinkhole entry is netns-lifetime and was seeded
+	// once during initNetnsContext.
 	m.mu.Lock()
-	m.addJoinerDenyIPs(nctx, info.ContainerID, pol)
+	m.addJoinerIPRules(nctx, info.ContainerID, pol)
 	m.mu.Unlock()
 
 	if !created {
@@ -702,53 +705,207 @@ func (m *Manager) finalizeAttach(info ContainerInfo, e *Enforcer, nctx *NetnsCon
 	}
 }
 
-// denyKey identifies one entry in the eBPF deny map.
-type denyKey struct {
+// parseRuleIP resolves a cidr-rule pattern to the single host address
+// the datapath maps are keyed on.
+//
+// Patterns reach us in three shapes: a bare address, and the /32 and
+// /128 single-host forms the server writes (IgnoreAnomaly appends /32,
+// and the CE loader normalises `ip:` entries the same way). net.ParseIP
+// rejects all of the prefixed forms, which is why those rules used to
+// be dropped here without a word — an operator would ignore an IP
+// anomaly, see the rule appear in the UI, and never find out it had no
+// effect on the wire.
+//
+// Genuine multi-host prefixes are not supported yet: the deny and allow
+// maps are exact-match hashes, so a /24 would need expansion or an LPM
+// trie. Reject them loudly rather than half-applying them.
+func parseRuleIP(pattern string, log *slog.Logger) (net.IP, bool) {
+	if !strings.Contains(pattern, "/") {
+		ip := net.ParseIP(pattern)
+		if ip == nil {
+			log.Warn("skip ip rule: unparseable address", "pattern", pattern)
+
+			return nil, false
+		}
+
+		return ip, true
+	}
+
+	ip, network, err := net.ParseCIDR(pattern)
+	if err != nil {
+		log.Warn("skip ip rule: unparseable cidr", "pattern", pattern, "error", err)
+
+		return nil, false
+	}
+
+	ones, bits := network.Mask.Size()
+	if ones != bits {
+		log.Warn("skip ip rule: multi-host prefixes are not supported",
+			"pattern", pattern, "prefix_len", ones)
+
+		return nil, false
+	}
+
+	return ip, true
+}
+
+// ipRuleKey identifies one entry in the eBPF deny or static-allow map.
+type ipRuleKey struct {
 	IP   string
 	Port int
 }
 
-// addJoinerDenyIPs installs a joiner's policy deny IPs and records
-// ownership so the entries can be reversed at Detach. Caller must hold
-// Manager.mu (same lock as nctx.refcount / joinerDeny).
+// ipRuleEntry is a resolved IP rule ready to install: a map key plus
+// the priority that decides it against a competing rule in egress.c.
+type ipRuleEntry struct {
+	Key  ipRuleKey
+	Prio uint32
+}
+
+// collectIPRules resolves a job's cidr rules into the deny and allow
+// entries to install, in composed-list order.
+//
+// Ordering is the whole point of the priority stamp: the datapath used
+// to hardcode "deny beats allow", which diverged from the first-match-
+// wins semantics the DNS proxy applies to fqdn rules. Carrying the list
+// index through means one consistent rule model for names and addresses
+// alike.
+//
+// pol.DenyIPs (the standalone blocklist — CE's `deny_ips:` stanza) fills
+// in only where no rule already covers the key, at SystemRulePriority.
+// On EE every entry in that field is generated from a cidr deny rule and
+// is therefore already covered; in CE it is a separate concept with no
+// position in any list, and must outrank everything.
+func collectIPRules(pol *policy.ResolvedPolicy, log *slog.Logger) (deny, allow []ipRuleEntry) {
+	// Each map holds one value per key, so a duplicate rule covering a
+	// key already claimed by an earlier one must be dropped rather than
+	// installed — writing it would replace a better (lower) priority
+	// with a worse one and quietly invert the ruleset. Walking the list
+	// in order means the first claim is the winning one.
+	seenDeny := make(map[ipRuleKey]bool)
+	seenAllow := make(map[ipRuleKey]bool)
+
+	for i, r := range pol.RulesForJob("") {
+		if r.PatternType != policy.PatternCIDR {
+			continue
+		}
+
+		ip, ok := parseRuleIP(r.Pattern, log)
+		if !ok {
+			continue
+		}
+
+		prio := policy.RulePriority(i)
+
+		// A cidr rule with no ports means "any port on this IP",
+		// which the datapath encodes as the port=0 wildcard.
+		ports := r.Ports
+		if len(ports) == 0 {
+			ports = []int{0}
+		}
+
+		for _, port := range ports {
+			entry := ipRuleEntry{Key: ipRuleKey{IP: ip.String(), Port: port}, Prio: prio}
+
+			seen := seenAllow
+			target := &allow
+
+			if r.Action == policy.ActionDeny {
+				seen = seenDeny
+				target = &deny
+			}
+
+			if seen[entry.Key] {
+				continue
+			}
+
+			seen[entry.Key] = true
+			*target = append(*target, entry)
+		}
+	}
+
+	for _, dip := range pol.DenyIPs {
+		ip, ok := parseRuleIP(dip.IP, log)
+		if !ok {
+			continue
+		}
+
+		key := ipRuleKey{IP: ip.String(), Port: dip.Port}
+		if seenDeny[key] {
+			continue
+		}
+
+		deny = append(deny, ipRuleEntry{Key: key, Prio: policy.SystemRulePriority})
+	}
+
+	return deny, allow
+}
+
+// addJoinerIPRules installs a joiner's IP allow and deny entries and
+// records ownership so they can be reversed at Detach. Caller must hold
+// Manager.mu (same lock as nctx.refcount / joinerDeny / joinerAllow).
 //
 // The sinkhole IP is seeded once per netns by seedSinkholeDeny — it is
 // not owned by any joiner and survives joiner detach.
-func (m *Manager) addJoinerDenyIPs(nctx *NetnsContext, containerID string, pol *policy.ResolvedPolicy) {
+func (m *Manager) addJoinerIPRules(nctx *NetnsContext, containerID string, pol *policy.ResolvedPolicy) {
 	if nctx.joinerDeny == nil {
-		nctx.joinerDeny = make(map[string][]denyKey)
+		nctx.joinerDeny = make(map[string][]ipRuleKey)
 	}
 
-	added := nctx.joinerDeny[containerID][:0]
+	if nctx.joinerAllow == nil {
+		nctx.joinerAllow = make(map[string][]ipRuleKey)
+	}
 
-	for _, dip := range pol.DenyIPs {
-		ip := net.ParseIP(dip.IP)
+	denyEntries, allowEntries := collectIPRules(pol, m.logger)
+
+	addedDeny := nctx.joinerDeny[containerID][:0]
+
+	for _, e := range denyEntries {
+		ip := net.ParseIP(e.Key.IP)
 		if ip == nil {
 			continue
 		}
 
-		if err := nctx.ebpf.AddDeniedIP(ip, dip.Port); err != nil {
-			m.logger.Warn("add joiner deny", "container", containerID, "ip", dip.IP, "port", dip.Port, "error", err)
+		if err := nctx.ebpf.AddDeniedIP(ip, e.Key.Port, e.Prio); err != nil {
+			m.logger.Warn("add joiner deny", "container", containerID, "ip", e.Key.IP, "port", e.Key.Port, "error", err)
 
 			continue
 		}
 
-		added = append(added, denyKey{IP: dip.IP, Port: dip.Port})
+		addedDeny = append(addedDeny, e.Key)
 	}
 
-	nctx.joinerDeny[containerID] = added
+	nctx.joinerDeny[containerID] = addedDeny
+
+	addedAllow := nctx.joinerAllow[containerID][:0]
+
+	for _, e := range allowEntries {
+		ip := net.ParseIP(e.Key.IP)
+		if ip == nil {
+			continue
+		}
+
+		// A failed static-allow install is louder than a failed deny:
+		// the map is bounded and non-evicting, so the only realistic
+		// cause is exhaustion, and the symptom is a destination the
+		// operator explicitly permitted getting dropped.
+		if err := nctx.ebpf.AddAllowedHost(ip, e.Key.Port, e.Prio); err != nil {
+			m.logger.Error("add joiner ip allow", "container", containerID, "ip", e.Key.IP, "port", e.Key.Port, "error", err)
+
+			continue
+		}
+
+		addedAllow = append(addedAllow, e.Key)
+	}
+
+	nctx.joinerAllow[containerID] = addedAllow
 }
 
-// removeJoinerDenyIPs reverses addJoinerDenyIPs. Idempotent: called on
+// removeJoinerIPRules reverses addJoinerIPRules. Idempotent: called on
 // Detach for every container, including those that never added any
 // entries. Caller must hold Manager.mu.
-func (m *Manager) removeJoinerDenyIPs(nctx *NetnsContext, containerID string) {
-	entries, ok := nctx.joinerDeny[containerID]
-	if !ok {
-		return
-	}
-
-	for _, k := range entries {
+func (m *Manager) removeJoinerIPRules(nctx *NetnsContext, containerID string) {
+	for _, k := range nctx.joinerDeny[containerID] {
 		ip := net.ParseIP(k.IP)
 		if ip == nil {
 			continue
@@ -760,6 +917,19 @@ func (m *Manager) removeJoinerDenyIPs(nctx *NetnsContext, containerID string) {
 	}
 
 	delete(nctx.joinerDeny, containerID)
+
+	for _, k := range nctx.joinerAllow[containerID] {
+		ip := net.ParseIP(k.IP)
+		if ip == nil {
+			continue
+		}
+
+		if err := nctx.ebpf.RemoveAllowedHost(ip, k.Port); err != nil {
+			m.logger.Warn("remove joiner ip allow", "container", containerID, "ip", k.IP, "port", k.Port, "error", err)
+		}
+	}
+
+	delete(nctx.joinerAllow, containerID)
 }
 
 // seedSinkholeDeny installs the always-present sinkhole IP into a
@@ -773,7 +943,7 @@ func (m *Manager) seedSinkholeDeny(handle EBPFHandle) {
 		return
 	}
 
-	if err := handle.AddDeniedIP(sinkIP, 0); err != nil {
+	if err := handle.AddDeniedIP(sinkIP, 0, policy.SystemRulePriority); err != nil {
 		m.logger.Warn("seed sinkhole deny", "error", err)
 	}
 }
@@ -803,7 +973,7 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 
 	// Sinkhole survives joiner detach — it's netns-lifetime, not
 	// joiner-owned. Joiner-specific deny IPs (including the creator's
-	// own) are installed separately via addJoinerDenyIPs so Detach can
+	// own) are installed separately via addJoinerIPRules so Detach can
 	// reverse them.
 	m.seedSinkholeDeny(ebpfHandle)
 
@@ -1389,7 +1559,7 @@ func (m *Manager) Detach(containerID string) *DetachResult {
 	// later sibling with a different policy doesn't inherit it. Done
 	// under m.mu (same lock that guards joinerDeny). The sinkhole entry
 	// is owned by the netns lifetime and survives.
-	m.removeJoinerDenyIPs(nctx, containerID)
+	m.removeJoinerIPRules(nctx, containerID)
 
 	// When refcount hits 0, don't tear down immediately — sibling containers
 	// (e.g., build after init-permissions) may join within seconds. Keep the

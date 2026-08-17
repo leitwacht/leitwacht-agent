@@ -241,7 +241,7 @@ func TestDefenseInDepth_DNSKill(t *testing.T) {
 		Upstreams:      []string{"1.1.1.1:53"},
 		LookupRecorder: func(_ uint64) *ViolationRecorder { return blockRec },
 		Logger:         slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
-		AddToAllowMap:  func(_ net.IP, _ []int) error { return nil },
+		AddToAllowMap:  func(_ net.IP, _ []int, _ uint32) error { return nil },
 		OnDNSViolation: func(cgroupID uint64, domain, action string) {
 			violations = append(violations, struct {
 				cgroupID uint64
@@ -277,7 +277,7 @@ func TestDefenseInDepth_DNSKill(t *testing.T) {
 		Upstreams:      []string{"1.1.1.1:53"},
 		LookupRecorder: func(_ uint64) *ViolationRecorder { return auditRec },
 		Logger:         slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
-		AddToAllowMap:  func(_ net.IP, _ []int) error { return nil },
+		AddToAllowMap:  func(_ net.IP, _ []int, _ uint32) error { return nil },
 		OnDNSViolation: func(_ uint64, _, _ string) {
 			violations = append(violations, struct {
 				cgroupID uint64

@@ -35,7 +35,7 @@ func testDNSConfig(action string, rules []policy.Rule) (*DNSProxyConfig, *policy
 		Upstreams:      []string{"1.1.1.1:53"},
 		LookupRecorder: func(_ uint64) *ViolationRecorder { return rec },
 		Logger:         slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
-		AddToAllowMap:  func(_ net.IP, _ []int) error { return nil },
+		AddToAllowMap:  func(_ net.IP, _ []int, _ uint32) error { return nil },
 	}
 
 	return cfg, pol, rec
@@ -324,7 +324,7 @@ func TestHandleDNSQuery_AllowedDomainForwarded(t *testing.T) {
 	var addedIPs []string
 
 	cfg, pol, rec := testDNSConfig("block", []policy.Rule{allowFQDN("example.com", 443)})
-	cfg.AddToAllowMap = func(ip net.IP, _ []int) error {
+	cfg.AddToAllowMap = func(ip net.IP, _ []int, _ uint32) error {
 		addedIPs = append(addedIPs, ip.String())
 
 		return nil
@@ -605,7 +605,7 @@ func TestDNSProxy_UpdatePolicy(t *testing.T) {
 		Upstreams:      []string{"1.1.1.1:53"},
 		LookupRecorder: func(_ uint64) *ViolationRecorder { return rec },
 		Logger:         slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
-		AddToAllowMap:  func(_ net.IP, _ []int) error { return nil },
+		AddToAllowMap:  func(_ net.IP, _ []int, _ uint32) error { return nil },
 	}
 
 	proxy := NewDNSProxy(cfg)

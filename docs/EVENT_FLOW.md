@@ -236,6 +236,32 @@ allow map is populated when the DNS proxy answers an allowed query
 with that domain's resolved IPs; everything else (loopback, trusted
 CIDRs, cloud metadata, and policy-explicit deny IPs aside) drops.
 
+### Rule ordering across both layers
+
+`cidr` rules never reach the DNS proxy — there is no name to match on
+— so they are installed into the eBPF maps at attach instead. To keep
+one rule model across names and addresses, every IP-map entry carries
+the **index of the rule that produced it** in the job's composed list,
+and the datapath picks the lowest. That reproduces first-match-wins:
+a `cidr` allow above a `cidr` deny wins, and a `fqdn` allow above a
+`cidr` deny wins too, because the allow-map entries the resolution
+seeds inherit that fqdn rule's index.
+
+Two things sit outside the ordering by design:
+
+- **Hard blocks** — cloud metadata (`169.254.169.254`), DoT
+  (port 853), and the loopback / link-local carve-outs. These are
+  invariants, not policy; no rule ordering can reach them.
+- **Trusted CIDRs** (`TRUSTED_CIDRS`, the Docker bridge / pod
+  network) hold no position in any rule list, so they are consulted
+  only after every rule has missed. An explicit deny rule still
+  overrides node-level trust.
+
+`cidr` allow rules must name a single host (a bare address, `/32` or
+`/128`) — the allow map is an exact-match hash. Wider prefixes are
+rejected at rule-creation time rather than silently installing
+nothing.
+
 The two layers cooperate against the realistic attack shapes:
 
 - **DNS-then-connect to a blocked domain.** Proxy returns the
@@ -248,7 +274,12 @@ The two layers cooperate against the realistic attack shapes:
   learns the IP. The egress filter's default-deny catches the SYN.
   One violation: `packet_dropped` (no `query_type` since no DNS
   event was involved). Domain field empty unless reverse-cache
-  reconciliation finds a prior resolution.
+  reconciliation finds a prior resolution. A destination that
+  legitimately has no name — a deploy target, a ClusterIP — is
+  permitted by a `cidr` allow rule, which the operator writes by hand
+  or by approving the resulting anomaly. It is never learned
+  automatically: a bare address gives a baseline review nothing to
+  judge, unlike a domain.
 
 This means a domain-only rule set still catches IP-bypass attempts
 without any extra `deny_ips` configuration. See

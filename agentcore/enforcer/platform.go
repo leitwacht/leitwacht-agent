@@ -52,12 +52,27 @@ type Platform interface {
 
 // EBPFHandle represents a loaded eBPF program with its maps.
 type EBPFHandle interface {
-	// AddAllowedIP adds an {ip, port} pair to the allow map.
-	AddAllowedIP(ip net.IP, ports []int) error
+	// AddAllowedIP adds an {ip, port} pair to the DNS-derived allow map.
+	// prio is the priority of the fqdn rule that authorised the
+	// resolution — see RulePriority.
+	AddAllowedIP(ip net.IP, ports []int, prio uint32) error
+
+	// AddAllowedHost adds an {ip, port} pair to the static allow map,
+	// for destinations that have no DNS name. Port 0 means allow all
+	// ports for this IP. prio is the allowing rule's priority.
+	//
+	// Distinct from AddAllowedIP: these entries are never re-seeded, so
+	// they live in a non-LRU map that cannot silently evict them.
+	AddAllowedHost(ip net.IP, port int, prio uint32) error
+
+	// RemoveAllowedHost deletes an {ip, port} entry from the static
+	// allow map. Idempotent: missing entries are not an error.
+	RemoveAllowedHost(ip net.IP, port int) error
 
 	// AddDeniedIP adds an IP (with optional port) to the deny map.
-	// Port 0 means deny all ports for this IP.
-	AddDeniedIP(ip net.IP, port int) error
+	// Port 0 means deny all ports for this IP. prio is the denying
+	// rule's priority.
+	AddDeniedIP(ip net.IP, port int, prio uint32) error
 
 	// RemoveDeniedIP deletes an {ip, port} entry from the deny map.
 	// Idempotent: missing entries are not an error.

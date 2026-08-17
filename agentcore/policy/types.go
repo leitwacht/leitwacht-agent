@@ -24,6 +24,27 @@ const (
 	PatternBuildVertex = "build_vertex"
 )
 
+// SystemRulePriority is the datapath priority reserved for entries that
+// hold no position in any composed rule list and must outrank every
+// rule: the DNS sinkhole deny, and CE's standalone `deny_ips:`
+// blocklist. See the priority contract in egress.c.
+const SystemRulePriority uint32 = 0
+
+// RulePriority converts a rule's index in the composed rule list into
+// the priority stored alongside its eBPF map entries. Lower wins, so
+// the datapath reproduces the list's first-match-wins ordering rather
+// than hardcoding a deny-beats-allow precedence.
+//
+// Offset by one to keep SystemRulePriority strictly ahead of the first
+// rule.
+func RulePriority(index int) uint32 {
+	if index < 0 {
+		return SystemRulePriority
+	}
+
+	return uint32(index) + 1 //nolint:gosec // composed lists are far below 2^32
+}
+
 // LSM feature mode values for the credwatch (credential-file access) and
 // proc_mem (/proc/<pid>/mem read) LSM detectors. Carried per-project and
 // per-job in the resolved policy so an operator can scope each detector

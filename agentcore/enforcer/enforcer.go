@@ -457,6 +457,17 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 	if attachErr != nil {
 		releaseSlot()
 
+		// Reverse the IP rules installed above. Detach can't do it for
+		// us: releaseSlot has already dropped this container from
+		// m.enforcers, so Detach returns early and never reaches
+		// removeJoinerIPRules. Without this the entries outlive a
+		// container that was never enforced — and on the joiner path
+		// the netns survives, so a *sibling* would inherit this
+		// container's allow rules.
+		m.mu.Lock()
+		m.removeJoinerIPRules(nctx, info.ContainerID)
+		m.mu.Unlock()
+
 		// Creator owns the netns context: failed attachEnforcer means
 		// no other container is using it yet, so tear it down rather
 		// than leaving an orphan. Joiners share the context with at
@@ -749,6 +760,22 @@ func parseRuleIP(pattern string, log *slog.Logger) (net.IP, bool) {
 	return ip, true
 }
 
+// ipv4Only rejects addresses the datapath cannot key on. PackAllowKey
+// returns an all-zero key for anything without a 4-byte form, so an
+// IPv6 rule would install a bogus 0.0.0.0 entry rather than the address
+// asked for — and the egress program drops all IPv6 unconditionally
+// anyway. Refusing loudly beats installing a rule that reads as
+// enforced and isn't.
+func ipv4Only(ip net.IP, pattern string, log *slog.Logger) bool {
+	if ip.To4() != nil {
+		return true
+	}
+
+	log.Warn("skip ip rule: IPv6 is not supported by the egress maps", "pattern", pattern)
+
+	return false
+}
+
 // ipRuleKey identifies one entry in the eBPF deny or static-allow map.
 type ipRuleKey struct {
 	IP   string
@@ -791,7 +818,7 @@ func collectIPRules(pol *policy.ResolvedPolicy, log *slog.Logger) (deny, allow [
 		}
 
 		ip, ok := parseRuleIP(r.Pattern, log)
-		if !ok {
+		if !ok || !ipv4Only(ip, r.Pattern, log) {
 			continue
 		}
 
@@ -826,7 +853,7 @@ func collectIPRules(pol *policy.ResolvedPolicy, log *slog.Logger) (deny, allow [
 
 	for _, dip := range pol.DenyIPs {
 		ip, ok := parseRuleIP(dip.IP, log)
-		if !ok {
+		if !ok || !ipv4Only(ip, dip.IP, log) {
 			continue
 		}
 
@@ -1565,6 +1592,17 @@ func (m *Manager) Detach(containerID string) *DetachResult {
 	// (e.g., build after init-permissions) may join within seconds. Keep the
 	// netns context in the map and schedule deferred teardown.
 	lastContainer := teardown // true when this is the last container (refcount==0)
+
+	// Drop the DNS-derived allow entries with the last container. They
+	// carry the priority of the rule that authorised them, and a job
+	// joining during the grace period brings a different rule list —
+	// leaving them would let one job's stale allow outrank another
+	// job's deny. No container remains that needs them.
+	if lastContainer && nctx.ebpf != nil {
+		if err := nctx.ebpf.FlushAllowedIPs(); err != nil {
+			m.logger.Warn("flush dns allow map", "container", containerID, "error", err)
+		}
+	}
 
 	if teardown && nctx.inode != 0 && m.NetnsGrace > 0 {
 		go m.deferredTeardown(nctx)

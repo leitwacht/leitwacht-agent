@@ -415,6 +415,37 @@ func (h *linuxEBPFHandle) RemoveAllowedHost(ip net.IP, port int) error {
 	return nil
 }
 
+// FlushAllowedIPs deletes every DNS-derived allow entry. Iterating and
+// deleting is safe here: the map is LRU and the kernel tolerates
+// deletion during iteration, and any entry a live query re-seeds after
+// the flush is by definition current.
+func (h *linuxEBPFHandle) FlushAllowedIPs() error {
+	var (
+		key  [6]byte
+		prio uint32
+	)
+
+	iter := h.objs.AllowedIps.Iterate()
+	keys := make([][6]byte, 0, 64)
+
+	for iter.Next(&key, &prio) {
+		keys = append(keys, key)
+	}
+
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("iterate allow map: %w", err)
+	}
+
+	for i := range keys {
+		delErr := h.objs.AllowedIps.Delete(keys[i][:])
+		if delErr != nil && !errors.Is(delErr, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("delete allow map entry: %w", delErr)
+		}
+	}
+
+	return nil
+}
+
 func (h *linuxEBPFHandle) AddDeniedIP(ip net.IP, port int, prio uint32) error {
 	key := PackAllowKey(ip, port)
 

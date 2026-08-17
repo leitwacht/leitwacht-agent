@@ -69,6 +69,16 @@ type EBPFHandle interface {
 	// allow map. Idempotent: missing entries are not an error.
 	RemoveAllowedHost(ip net.IP, port int) error
 
+	// FlushAllowedIPs empties the DNS-derived allow map.
+	//
+	// Those entries have no per-container owner — the DNS proxy serves
+	// the whole netns and doesn't know which container asked — so they
+	// can't be reversed at Detach the way deny and static-allow entries
+	// are. Called when the last container leaves the netns, before the
+	// grace period during which a different job may join and reuse
+	// these maps.
+	FlushAllowedIPs() error
+
 	// AddDeniedIP adds an IP (with optional port) to the deny map.
 	// Port 0 means deny all ports for this IP. prio is the denying
 	// rule's priority.

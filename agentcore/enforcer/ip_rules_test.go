@@ -2,6 +2,7 @@ package enforcer
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"gitlab.com/leitwacht/leitwacht-agent/agentcore/policy"
@@ -126,7 +127,11 @@ func TestCollectIPRulesSingleHostPrefixes(t *testing.T) {
 	}{
 		{name: "bare address", pattern: "10.0.0.1", want: true},
 		{name: "ipv4 single host", pattern: "10.0.0.1/32", want: true},
-		{name: "ipv6 single host", pattern: "2001:db8::1/128", want: true},
+		// IPv6 is refused rather than installed: PackAllowKey has no
+		// 4-byte form for it and would write an all-zero (0.0.0.0) key,
+		// producing a rule that reads as enforced and isn't.
+		{name: "ipv6 single host rejected", pattern: "2001:db8::1/128", want: false},
+		{name: "bare ipv6 rejected", pattern: "2001:db8::1", want: false},
 		{name: "multi host prefix rejected", pattern: "10.0.0.0/24", want: false},
 		{name: "unparseable rejected", pattern: "not-an-ip", want: false},
 	}
@@ -175,6 +180,36 @@ func TestCollectIPRulesDenyIPsFallback(t *testing.T) {
 
 	if got := byIP["10.0.0.2"]; got != policy.SystemRulePriority {
 		t.Fatalf("standalone deny prio = %d, want %d", got, policy.SystemRulePriority)
+	}
+}
+
+// TestJoinerIPRulesReversedOnFailedAttach covers the leak path: attach
+// installs IP rules before attaching the enforcer, and a failure there
+// removes the container from m.enforcers — so Detach returns early and
+// never reverses them. On the joiner path the netns outlives the
+// failure, which would leave a never-enforced container's *allow* rules
+// live for its siblings.
+func TestJoinerIPRulesReversedOnFailedAttach(t *testing.T) {
+	fp := &fakePlatform{
+		cgroupPath:      "/sys/fs/cgroup/test",
+		netnsByPID:      map[int]uint64{100: 4242},
+		attachCgroupErr: errors.New("synthetic attach failure"),
+	}
+
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr.NetnsGrace = 0
+
+	defer mgr.DetachAll()
+
+	pol := ipRulePolicy("block", cidrRule("10.0.0.9/32", policy.ActionAllow, 443))
+
+	_, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "failed000000"}, 100, pol)
+	if err == nil {
+		t.Fatal("expected attach to fail")
+	}
+
+	if contains(fp.allowedHosts, "10.0.0.9:443") {
+		t.Fatalf("allow entry survived a failed attach: %v", fp.allowedHosts)
 	}
 }
 

@@ -135,6 +135,11 @@ func (h *fakeEBPFHandle) AddAllowedHost(ip net.IP, port int, prio uint32) error 
 	return nil
 }
 
+func (h *fakeEBPFHandle) FlushAllowedIPs() error {
+	h.platform.allowedIPs = nil
+	return nil
+}
+
 func (h *fakeEBPFHandle) RemoveAllowedHost(ip net.IP, port int) error {
 	h.platform.allowedHosts = removeEntry(h.platform.allowedHosts, fmt.Sprintf("%s:%d", ip, port))
 	return nil

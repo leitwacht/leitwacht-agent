@@ -16,7 +16,7 @@ denials, and clean up leftover containers and nftables tables.
 
 - Linux x86_64, kernel ≥ 5.15
 - `root` (eBPF + nftables)
-- `go` ≥ 1.26
+- `go` ≥ 1.27
 - `docker`, `jq`, `curl`, `python3`
 - (optional) `containerd` and `ctr` for the agentcore phase
 

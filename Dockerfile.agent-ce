@@ -12,7 +12,7 @@
 # Operators set rules via a Kubernetes ConfigMap (or bind-mounted file
 # on Docker hosts) — there is no enrolment, no auth token, no backend.
 
-ARG GO_VERSION=1.26
+ARG GO_VERSION=1.27.1
 
 FROM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src

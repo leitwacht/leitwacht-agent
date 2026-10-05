@@ -10,7 +10,7 @@ stream + Prometheus counters.
 - Kernel ≥ 5.15 (eBPF CO-RE + BPF LSM bits the agent uses)
 - Docker daemon running and reachable
 - `root` (eBPF + nftables; the agent itself drops nothing)
-- `go` ≥ 1.26 in `PATH`
+- `go` ≥ 1.27 in `PATH`
 - `curl`, `jq`, `python3` (used by the webhook case)
 
 ## Running

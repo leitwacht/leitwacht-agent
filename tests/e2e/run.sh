@@ -10,7 +10,7 @@
 #   - Linux x86_64, kernel ≥ 5.15
 #   - Docker daemon running and reachable
 #   - root (eBPF + nftables)
-#   - go ≥ 1.26 in PATH
+#   - go ≥ 1.27 in PATH
 #   - curl, jq
 #
 # Usage:

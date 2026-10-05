@@ -14,7 +14,7 @@
 // See LICENSE (MPL-2.0) and NOTICE.
 module gitlab.com/leitwacht/leitwacht-agent
 
-go 1.26.3
+go 1.27.1
 
 require (
 	github.com/cilium/ebpf v0.21.0

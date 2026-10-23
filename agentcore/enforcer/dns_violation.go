@@ -1,5 +1,7 @@
 package enforcer
 
+import "gitlab.com/leitwacht/leitwacht-agent/agentcore/policy"
+
 // maxDNSViolationAttempts bounds how often a failing violation callback
 // (e.g. a kill that errored) is retried for one container.
 const maxDNSViolationAttempts = 3
@@ -14,7 +16,12 @@ const maxDNSViolationAttempts = 3
 // PID tracker misses (cgroup 0) or reports a cgroup that is not a known
 // container, acting would mean guessing. In block mode the query has already
 // been sinkholed, so skipping loses no containment, only the kill.
-func (m *Manager) handleDNSViolation(_ *NetnsContext, cgroupID uint64, domain, action string) {
+//
+// The proxy enforces the strictest member policy of the netns, so a query
+// that only a block-mode sibling's policy forbids can be attributed to an
+// audit/passive container sharing the netns. The callback (a kill) fires
+// only when the attributed container's OWN policy is block.
+func (m *Manager) handleDNSViolation(nctx *NetnsContext, cgroupID uint64, domain, action string) {
 	if cgroupID == 0 {
 		m.logger.Debug("dns violation: no cgroup attribution, no action", "action", action)
 
@@ -31,6 +38,14 @@ func (m *Manager) handleDNSViolation(_ *NetnsContext, cgroupID uint64, domain, a
 		if fn != nil {
 			m.logger.Debug("dns violation: container unresolved, no action", "action", action)
 		}
+
+		return
+	}
+
+	if !memberIsBlock(nctx, containerID) {
+		m.mu.Unlock()
+		m.logger.Debug("dns violation: attributed container is not block-mode, no action",
+			"container_id", shortID(containerID), "action", action)
 
 		return
 	}
@@ -92,4 +107,20 @@ func (m *Manager) containerIDFromEnforcersLocked(cgroupID uint64) string {
 	}
 
 	return ""
+}
+
+// memberIsBlock reports whether containerID is a member of nctx whose own
+// policy action is block. Caller holds Manager.mu.
+func memberIsBlock(nctx *NetnsContext, containerID string) bool {
+	if nctx == nil {
+		return false
+	}
+
+	for _, mem := range nctx.members {
+		if mem.id == containerID {
+			return mem.pol != nil && mem.pol.Action == policy.ActionBlock
+		}
+	}
+
+	return false
 }

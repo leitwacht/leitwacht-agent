@@ -596,3 +596,60 @@ func attachedBlockManager(t *testing.T) (*Manager, *Enforcer, func(uint64, strin
 
 	return mgr, e, nctx.dnsProxy.cfg.OnDNSViolation
 }
+
+// TestManager_DNSViolationOnlyKillsBlockModeContainer: in a shared netns the
+// proxy runs the strictest member policy, so a violation attributed to an
+// audit sibling must not invoke the (kill) callback; one attributed to the
+// block-mode container must.
+func TestManager_DNSViolationOnlyKillsBlockModeContainer(t *testing.T) {
+	fp := &fakePlatform{
+		cgroupPath: "/sys/fs/cgroup/test",
+		netnsByPID: map[int]uint64{100: 7777, 101: 7777},
+	}
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr.NetnsGrace = 0
+
+	t.Cleanup(func() { mgr.DetachAll() })
+
+	calls := make(chan string, 4)
+
+	mgr.SetOnDNSViolation(func(containerID, _, _ string) error {
+		calls <- containerID
+
+		return nil
+	})
+
+	ctx := context.Background()
+	const auditID, blockID = "audit0000000000", "block0000000000"
+
+	auditE, err := mgr.Attach(ctx, ContainerInfo{ContainerID: auditID, ProjectPath: "p/x"}, 100, testPolicy("audit"))
+	if err != nil || auditE == nil {
+		t.Fatalf("attach audit: %v", err)
+	}
+
+	blockE, err := mgr.Attach(ctx, ContainerInfo{ContainerID: blockID, ProjectPath: "p/x"}, 101, testPolicy("block"))
+	if err != nil || blockE == nil {
+		t.Fatalf("attach block: %v", err)
+	}
+
+	hook := auditE.ctx.dnsProxy.cfg.OnDNSViolation
+
+	hook(auditE.cgroupID, "evil.example.com", "dns_blocked")
+
+	select {
+	case id := <-calls:
+		t.Fatalf("callback fired for audit-mode container %q", id)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	hook(blockE.cgroupID, "evil.example.com", "dns_blocked")
+
+	select {
+	case id := <-calls:
+		if id != blockID {
+			t.Fatalf("callback container = %q, want %q", id, blockID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback not invoked for block-mode container")
+	}
+}

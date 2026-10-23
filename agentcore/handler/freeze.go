@@ -82,6 +82,12 @@ type Freezer struct {
 	// + freezeHoldSlack.
 	HoldLimit time.Duration
 
+	// CgroupRoot is the prefix a recovered marker's cgroup path must live
+	// under. Empty means /sys/fs/cgroup. A marker pointing elsewhere (or
+	// containing "..") is discarded: the state dir is trusted input only up
+	// to the point of writing into the filesystem.
+	CgroupRoot string
+
 	// StateDir is where freeze markers are persisted before a container is
 	// frozen. Empty means DefaultFreezeStateDir. Configurable for tests.
 	StateDir string
@@ -123,12 +129,16 @@ func (z *Freeze) Thaw() {
 		}
 
 		err := z.thaw()
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
+		thawFailed := err != nil && !errors.Is(err, os.ErrNotExist)
+
+		if thawFailed {
 			// A cgroup that is already gone (container exited) needs no thaw.
 			z.f.Logger.Error("thaw container failed", "container_id", truncID(z.id), "error", err)
 		}
 
-		if z.marker != "" {
+		// Keep the marker when the thaw did not take effect, so the next
+		// agent start retries it instead of forgetting a frozen container.
+		if z.marker != "" && !thawFailed {
 			_ = os.Remove(z.marker)
 		}
 
@@ -348,6 +358,12 @@ func (f *Freezer) RecoverFrozen(ctx context.Context) int {
 
 		switch kind {
 		case "cgroup":
+			if !f.validCgroupPath(value) {
+				f.Logger.Error("recover: ignoring marker with a cgroup path outside the cgroup mount", "path", value)
+
+				continue
+			}
+
 			if werr := writeCgroupFile(filepath.Join(value, "cgroup.freeze"), "0"); werr != nil && !errors.Is(werr, os.ErrNotExist) {
 				f.Logger.Error("recover: thaw cgroup failed", "cgroup", value, "error", werr)
 			} else {
@@ -486,4 +502,13 @@ func writeCgroupFile(path, value string) error {
 	}
 
 	return cerr //nolint:wrapcheck // surfaced with context by callers
+}
+
+func (f *Freezer) validCgroupPath(p string) bool {
+	root := f.CgroupRoot
+	if root == "" {
+		root = cgroupMount
+	}
+
+	return filepath.IsAbs(p) && !strings.Contains(p, "..") && strings.HasPrefix(filepath.Clean(p), strings.TrimRight(root, "/")+"/")
 }

@@ -41,7 +41,7 @@ func itContainer(t *testing.T, name string) int {
 
 	_ = exec.Command("podman", "rm", "-f", name).Run()
 
-	out, err := exec.Command("podman", "run", "-d", "--log-driver=none", "--name", name,
+	out, err := exec.Command("podman", "run", "-d", "--log-driver=none", "--pull=missing", "--name", name,
 		"--network", "none", itImage(), "sh", "-c", "while :; do :; done").CombinedOutput()
 	if err != nil {
 		t.Fatalf("podman run: %v\n%s", err, out)

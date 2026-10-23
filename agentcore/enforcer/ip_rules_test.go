@@ -605,3 +605,38 @@ func (h *sinkholeFailHandle) AddDeniedIP(ip net.IP, port int, prio uint32) error
 
 	return h.EBPFHandle.AddDeniedIP(ip, port, prio)
 }
+
+// TestSamePolicyMemberChurnKeepsDNSAllows: a service container with the
+// build's identical policy joining and leaving is not a policy change, so
+// DNS-derived allows must survive it.
+func TestSamePolicyMemberChurnKeepsDNSAllows(t *testing.T) {
+	mgr, fp := sharedNetnsManager(t)
+	ctx := context.Background()
+
+	mk := func() *policy.ResolvedPolicy {
+		return ipRulePolicy("block", cidrRule("10.0.0.7/32", policy.ActionDeny))
+	}
+
+	if _, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "build0000000"}, 100, mk()); err != nil {
+		t.Fatalf("attach build: %v", err)
+	}
+
+	mgr.mu.Lock()
+	h := mgr.enforcers["build0000000"].ctx.ebpf
+	mgr.mu.Unlock()
+
+	if err := h.AddAllowedIP(net.ParseIP("203.0.113.5"), []int{443}, 1); err != nil {
+		t.Fatalf("seed allow: %v", err)
+	}
+
+	// Distinct value, same content.
+	if _, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "service00000"}, 101, mk()); err != nil {
+		t.Fatalf("attach service: %v", err)
+	}
+
+	mgr.Detach("service00000")
+
+	if len(fp.allowedIPs) == 0 {
+		t.Fatal("dns allows flushed by an identical-policy member joining/leaving")
+	}
+}

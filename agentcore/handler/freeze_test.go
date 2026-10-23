@@ -83,7 +83,7 @@ func (p *fakePauser) UnpauseContainer(_ context.Context, id string) error {
 
 func TestFreezeCgroupWaitsForFrozenThenThaws(t *testing.T) {
 	dir := fakeCgroup(t, false)
-	f := &Freezer{Logger: quietLogger(), StateDir: t.TempDir()}
+	f := &Freezer{Logger: quietLogger(), StateDir: t.TempDir(), CgroupRoot: "/"}
 
 	// The kernel reports frozen a little after the write; the freezer must
 	// poll rather than trust the write.
@@ -117,7 +117,7 @@ func TestFreezeCgroupWaitsForFrozenThenThaws(t *testing.T) {
 
 func TestFreezeCgroupTimeoutReleasesContainer(t *testing.T) {
 	dir := fakeCgroup(t, false) // never reports frozen
-	f := &Freezer{Logger: quietLogger(), StateDir: t.TempDir()}
+	f := &Freezer{Logger: quietLogger(), StateDir: t.TempDir(), CgroupRoot: "/"}
 
 	z, err := f.Freeze(context.Background(), "c1", dir, 30*time.Millisecond)
 	if !errors.Is(err, ErrFreezeTimeout) {
@@ -137,7 +137,7 @@ func TestFreezeUnavailableFallsBackToPause(t *testing.T) {
 	dir := t.TempDir() // exists, but has no cgroup.freeze (cgroup v1 / old kernel)
 
 	// Without a pauser: unavailable, nothing frozen.
-	if _, err := (&Freezer{Logger: quietLogger(), StateDir: t.TempDir()}).Freeze(context.Background(), "c1", dir, time.Second); !errors.Is(err, ErrFreezeUnavailable) {
+	if _, err := (&Freezer{Logger: quietLogger(), StateDir: t.TempDir(), CgroupRoot: "/"}).Freeze(context.Background(), "c1", dir, time.Second); !errors.Is(err, ErrFreezeUnavailable) {
 		t.Fatalf("err = %v, want ErrFreezeUnavailable", err)
 	}
 
@@ -146,7 +146,7 @@ func TestFreezeUnavailableFallsBackToPause(t *testing.T) {
 	}
 
 	p := &fakePauser{}
-	f := &Freezer{Logger: quietLogger(), Pauser: p, StateDir: t.TempDir()}
+	f := &Freezer{Logger: quietLogger(), Pauser: p, StateDir: t.TempDir(), CgroupRoot: "/"}
 
 	z, err := f.Freeze(context.Background(), "c1", dir, time.Second)
 	if err != nil {
@@ -165,7 +165,7 @@ func TestFreezeUnavailableFallsBackToPause(t *testing.T) {
 }
 
 func TestFreezeGoneCgroupIsNotExist(t *testing.T) {
-	f := &Freezer{Logger: quietLogger(), StateDir: t.TempDir()}
+	f := &Freezer{Logger: quietLogger(), StateDir: t.TempDir(), CgroupRoot: "/"}
 
 	_, err := f.Freeze(context.Background(), "c1", filepath.Join(t.TempDir(), "gone"), time.Second)
 	if !errors.Is(err, os.ErrNotExist) {
@@ -175,7 +175,7 @@ func TestFreezeGoneCgroupIsNotExist(t *testing.T) {
 
 func TestFreezeHardLimitThaws(t *testing.T) {
 	dir := fakeCgroup(t, true)
-	f := &Freezer{Logger: quietLogger(), HoldLimit: 30 * time.Millisecond, StateDir: t.TempDir()}
+	f := &Freezer{Logger: quietLogger(), HoldLimit: 30 * time.Millisecond, StateDir: t.TempDir(), CgroupRoot: "/"}
 
 	z, err := f.Freeze(context.Background(), "c1", dir, time.Second)
 	if err != nil {
@@ -195,7 +195,7 @@ func TestFreezeHardLimitThaws(t *testing.T) {
 }
 
 func TestThawAllReleasesEverything(t *testing.T) {
-	f := &Freezer{Logger: quietLogger(), StateDir: t.TempDir()}
+	f := &Freezer{Logger: quietLogger(), StateDir: t.TempDir(), CgroupRoot: "/"}
 	dirs := []string{fakeCgroup(t, true), fakeCgroup(t, true)}
 
 	for i, d := range dirs {
@@ -220,7 +220,7 @@ func TestRecoverFrozenThawsAfterProcessDeath(t *testing.T) {
 	dir := fakeCgroup(t, true)
 	state := t.TempDir()
 
-	dying := &Freezer{Logger: quietLogger(), StateDir: state}
+	dying := &Freezer{Logger: quietLogger(), StateDir: state, CgroupRoot: "/"}
 	if _, err := dying.Freeze(context.Background(), "c1", dir, time.Second); err != nil {
 		t.Fatalf("Freeze: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestRecoverFrozenThawsAfterProcessDeath(t *testing.T) {
 		t.Fatalf("cgroup.freeze = %q, want held", got)
 	}
 
-	restarted := &Freezer{Logger: quietLogger(), StateDir: state}
+	restarted := &Freezer{Logger: quietLogger(), StateDir: state, CgroupRoot: "/"}
 	if n := restarted.RecoverFrozen(context.Background()); n != 1 {
 		t.Fatalf("RecoverFrozen processed %d markers, want 1", n)
 	}
@@ -252,7 +252,7 @@ func TestRecoverFrozenUnpausesAndSkipsGoneCgroups(t *testing.T) {
 	state := t.TempDir()
 	p := &fakePauser{}
 
-	dying := &Freezer{Logger: quietLogger(), StateDir: state, Pauser: p}
+	dying := &Freezer{Logger: quietLogger(), StateDir: state, CgroupRoot: "/", Pauser: p}
 	if _, err := dying.Freeze(context.Background(), "ctr-paused", "", time.Second); err != nil {
 		t.Fatalf("pause: %v", err)
 	}
@@ -265,7 +265,7 @@ func TestRecoverFrozenUnpausesAndSkipsGoneCgroups(t *testing.T) {
 	_ = os.RemoveAll(gone) // container exited while the agent was down
 
 	p2 := &fakePauser{}
-	if n := (&Freezer{Logger: quietLogger(), StateDir: state, Pauser: p2}).RecoverFrozen(context.Background()); n != 2 {
+	if n := (&Freezer{Logger: quietLogger(), StateDir: state, CgroupRoot: "/", Pauser: p2}).RecoverFrozen(context.Background()); n != 2 {
 		t.Fatalf("processed %d markers, want 2", n)
 	}
 
@@ -279,7 +279,7 @@ func TestHardLimitKillsWhenFlagged(t *testing.T) {
 
 	killed := make(chan string, 1)
 	f := &Freezer{
-		Logger: quietLogger(), StateDir: t.TempDir(), HoldLimit: 20 * time.Millisecond,
+		Logger: quietLogger(), StateDir: t.TempDir(), CgroupRoot: "/", HoldLimit: 20 * time.Millisecond,
 		Kill: func(id, scope string) { killed <- id + "|" + scope },
 	}
 
@@ -306,5 +306,44 @@ func TestHardLimitKillsWhenFlagged(t *testing.T) {
 
 	if got := readFreezeFile(t, dir); got != "0" {
 		t.Fatalf("cgroup.freeze = %q after expiry, want thawed", got)
+	}
+}
+
+func TestRecoverFrozenRejectsMarkerOutsideCgroupMount(t *testing.T) {
+	state := t.TempDir()
+	victim := t.TempDir()
+	writeFile(t, filepath.Join(victim, "cgroup.freeze"), "1")
+
+	for i, path := range []string{victim, "/sys/fs/cgroup/../" + victim} {
+		writeFile(t, filepath.Join(state, "m"+string(rune('a'+i))), "cgroup "+path+"\n")
+	}
+
+	// Default CgroupRoot (/sys/fs/cgroup): neither path qualifies.
+	(&Freezer{Logger: quietLogger(), StateDir: state}).RecoverFrozen(context.Background())
+
+	if got := readFreezeFile(t, victim); got != "1" {
+		t.Fatalf("recovery wrote to a path outside the cgroup mount (cgroup.freeze = %q)", got)
+	}
+}
+
+func TestThawFailureKeepsMarker(t *testing.T) {
+	dir := fakeCgroup(t, true)
+	state := t.TempDir()
+	f := &Freezer{Logger: quietLogger(), StateDir: state, CgroupRoot: "/"}
+
+	z, err := f.Freeze(context.Background(), "c1", dir, time.Second)
+	if err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+
+	// Make the thaw write fail with something other than ENOENT: replace
+	// cgroup.freeze with a directory.
+	_ = os.Remove(filepath.Join(dir, "cgroup.freeze"))
+	_ = os.Mkdir(filepath.Join(dir, "cgroup.freeze"), 0o755)
+
+	z.Thaw()
+
+	if entries, _ := os.ReadDir(state); len(entries) != 1 {
+		t.Fatalf("marker removed although the thaw failed (%d left)", len(entries))
 	}
 }

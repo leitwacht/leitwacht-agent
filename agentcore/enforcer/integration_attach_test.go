@@ -39,7 +39,7 @@ func startPodmanContainer(t *testing.T, name, network, script string) int {
 
 	_ = exec.Command("podman", "rm", "-f", name).Run()
 
-	out, err := exec.Command("podman", "run", "-d", "--log-driver=none", "--name", name,
+	out, err := exec.Command("podman", "run", "-d", "--log-driver=none", "--pull=missing", "--name", name,
 		"--network", network, testImage(), "sh", "-c", script).CombinedOutput()
 	if err != nil {
 		t.Fatalf("podman run %s: %v\n%s", name, err, out)
@@ -150,7 +150,11 @@ func TestIntegrationSharedNetnsDenySurvivesSiblingDetach(t *testing.T) {
 		t.Fatalf("attach B: %v", err)
 	}
 
-	if eB.ctx != mgr.enforcers[idA].ctx {
+	mgr.mu.Lock()
+	eA := mgr.enforcers[idA]
+	mgr.mu.Unlock()
+
+	if eA == nil || eB.ctx != eA.ctx {
 		t.Fatal("containers did not share a netns context; test setup is wrong")
 	}
 

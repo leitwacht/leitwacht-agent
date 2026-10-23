@@ -2,6 +2,8 @@ package enforcer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -79,10 +81,11 @@ type NetnsContext struct {
 	// egressAttached gates the DNS attach-liveness signal (the reserved
 	// `attached` reply) on the cgroup_skb/egress program actually being
 	// linked, not merely the DNS proxy being up. Set true once egress is
-	// live AND the netns policy is reconciled: at the end of Attach (every
-	// container Attach, including passive sentinels), or for a sibling
-	// prepared on a netns without a pod link. A pod-level attach alone does
-	// NOT set it: it only carries the audit-all placeholder. Without this,
+	// live: in attachPodLink (K8s pod cgroup, before any container runs),
+	// at the end of Attach, and for a prepared sibling. On K8s the pod-level
+	// attach carries the audit-all placeholder, so until the build
+	// container's Attach reconciles the netns, egress is allowed and logged
+	// (a known, short window). Without this,
 	// the DNS proxy answers `attached` as soon as it starts in initNetnsContext — which on the non-pod path precedes
 	// AttachCgroup — so a gated entrypoint (probe-detonate's waitForAgent /
 	// leitwacht-init) could proceed in the window before egress enforcement
@@ -425,9 +428,7 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 	if pol.Action == "allow" {
 		m.logger.Info("skipping enforcement (allow mode)", "container_id", truncID(info.ContainerID))
 
-		// Nothing to enforce for this job, so a pod-level netns primed in
-		// audit-all mode is already the right state: release the gate or
-		// the init container would wait out its deadline.
+		// Nothing to enforce for this job: make sure the gate is open.
 		if ino, err := m.platform.NetnsInode(pid); err == nil && ino != 0 {
 			m.mu.Lock()
 			nctx := m.netnsContexts[ino]
@@ -554,12 +555,9 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 	}
 
 	// Egress is live and the netns has been reconciled to the effective
-	// policy including this container's (addNetnsMember/reconcile above;
-	// the creator initialised with it). Arm the DNS attach-liveness signal
-	// so the reserved `attached` reply only fires now: a gated entrypoint
-	// (leitwacht-initc, probe-detonate's waitForAgent) cannot run before
-	// enforcement is in force. A passive or audit policy gets the signal
-	// here too, promptly.
+	// policy including this container's. Arm the DNS attach-liveness signal
+	// (already armed on K8s by the pod-level attach; this is what arms it
+	// on the Docker/non-pod path).
 	nctx.egressAttached.Store(true)
 
 	m.finalizeAttach(info, e, nctx) //nolint:contextcheck // bucket reporters use context.Background() intentionally — outlive caller
@@ -652,25 +650,44 @@ func (m *Manager) removeNetnsMember(nctx *NetnsContext, containerID string) bool
 // helper's audit-all placeholder" behaviour. No-op with no members (the
 // context is on its way out). Caller must hold Manager.mu.
 func (m *Manager) reconcileNetnsPolicy(nctx *NetnsContext) {
-	var best *policy.ResolvedPolicy
-
 	bestRank := -1
 
 	for _, mem := range nctx.members {
-		if r := policyStrictness(mem.pol); r >= bestRank {
-			best, bestRank = mem.pol, r
+		if r := policyStrictness(mem.pol); r > bestRank {
+			bestRank = r
 		}
 	}
 
-	if best == nil {
+	if bestRank < 0 {
 		return
+	}
+
+	// Among equally strict members keep the policy already in force if it is
+	// still a member (by identity or fingerprint); otherwise the most recent
+	// joiner wins.
+	var best *policy.ResolvedPolicy
+
+	for _, mem := range nctx.members {
+		if policyStrictness(mem.pol) != bestRank {
+			continue
+		}
+
+		if nctx.effective != nil && (mem.pol == nctx.effective || policyFingerprint(mem.pol) == policyFingerprint(nctx.effective)) {
+			best = nctx.effective
+
+			break
+		}
+
+		best = mem.pol
 	}
 
 	// DNS-derived allow entries carry the priority of the rule that
 	// authorised them under the policy in force at resolution time. When
-	// the effective policy changes they are stale and could outrank the new
-	// policy's deny rules; drop them and let live queries re-seed.
-	if nctx.effective != nil && nctx.effective != best && nctx.ebpf != nil {
+	// the effective policy actually changes (different fingerprint) they
+	// are stale and could outrank the new policy's denies; drop them and
+	// let live queries re-seed. A sibling joining or leaving with an
+	// identical policy does not count as a change.
+	if nctx.effective != nil && nctx.ebpf != nil && policyFingerprint(nctx.effective) != policyFingerprint(best) {
 		if err := nctx.ebpf.FlushAllowedIPs(); err != nil {
 			m.logger.Warn("flush dns allow map on policy change", "netns_inode", nctx.inode, "error", err)
 		}
@@ -702,6 +719,25 @@ func (m *Manager) reconcileNetnsPolicy(nctx *NetnsContext) {
 		"audit", wantAudit,
 		"members", len(nctx.members),
 	)
+}
+
+// policyFingerprint identifies a policy by content: project, action,
+// version and the rule list that drives the datapath. Two members running
+// the same job's policy have equal fingerprints even as distinct values.
+func policyFingerprint(pol *policy.ResolvedPolicy) string {
+	h := sha256.New()
+
+	fmt.Fprintf(h, "%s|%s|%d\n", pol.ProjectPath, pol.Action, pol.Version)
+
+	for _, r := range pol.RulesForJob("") {
+		fmt.Fprintf(h, "r|%s|%s|%s|%v\n", r.Pattern, r.PatternType, r.Action, r.Ports)
+	}
+
+	for _, d := range pol.DenyIPs {
+		fmt.Fprintf(h, "d|%s|%d\n", d.IP, d.Port)
+	}
+
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // PrepareNetns sets up the netns-level DNS infrastructure (proxy, nftables,
@@ -785,15 +821,12 @@ func (m *Manager) PrepareNetns(containerID string, pid int, cgroupPath string) e
 
 	m.mu.Lock()
 	m.enforcers[containerID] = e
-	podAttached := nctx.podAttached
 	m.mu.Unlock()
 
-	// A sibling prepared on a pod-attached netns only runs the audit-all
-	// placeholder, so it must not open the gate (see AttachPodSandbox). On
-	// a netns without a pod link its cgroup attach is the enforcement.
-	if !podAttached {
-		nctx.egressAttached.Store(true)
-	}
+	// The sibling's attach (or the pod link on a pod-attached netns) is
+	// live: arm the DNS attach-liveness signal. leitwacht-initc is such a
+	// sibling and must be released here.
+	nctx.egressAttached.Store(true)
 
 	if created {
 		m.logger.Info("netns prepared for sibling",

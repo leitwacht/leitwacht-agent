@@ -146,6 +146,10 @@ spec:
             - name: LEITWACHT_CE_BUILDKIT_DISABLE_CGROUP_ATTACH
               value: "true"
             {{- end }}
+            {{- if .maxSessionAge }}
+            - name: LEITWACHT_CE_BUILDKIT_MAX_SESSION_AGE
+              value: {{ .maxSessionAge | quote }}
+            {{- end }}
             {{- if .denyVertexPatterns }}
             - name: LEITWACHT_CE_BUILDKIT_DENY_VERTEX_PATTERNS
               value: {{ join "," .denyVertexPatterns | quote }}

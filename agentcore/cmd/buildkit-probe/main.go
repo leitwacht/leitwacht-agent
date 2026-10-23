@@ -163,8 +163,8 @@ func pollRegistry(ctx context.Context, registry *enforcer.SessionRegistry, inter
 				if !seenVertices[k] {
 					seenVertices[k] = true
 
-					fmt.Printf("[%s] VERTEX  STARTED ref=%s digest=%s name=%q\n",
-						time.Now().Format("15:04:05.000"), ref, shortDigest(d), v.Name)
+					fmt.Printf("[%s] VERTEX  STARTED ref=%s digest=%s name_hash=%s\n",
+						time.Now().Format("15:04:05.000"), ref, shortDigest(d), enforcer.VertexNameHash(v.Name))
 				}
 
 				if v.Completed && !completedVertices[k] {
@@ -199,10 +199,10 @@ func pollRegistry(ctx context.Context, registry *enforcer.SessionRegistry, inter
 				ambig = fmt.Sprintf(" AMBIGUOUS candidates=%d", len(binding.AmbiguousCandidates))
 			}
 
-			fmt.Printf("[%s] CGROUP  LINKED  cgroup_id=%d container=%s → ref=%s digest=%s name=%q%s\n",
+			fmt.Printf("[%s] CGROUP  LINKED  cgroup_id=%d container=%s → ref=%s digest=%s name_hash=%s%s\n",
 				time.Now().Format("15:04:05.000"),
 				cgID, binding.ContainerID,
-				binding.SessionRef, shortDigest(binding.VertexDigest), binding.VertexName,
+				binding.SessionRef, shortDigest(binding.VertexDigest), enforcer.VertexNameHash(binding.VertexName),
 				ambig,
 			)
 		}

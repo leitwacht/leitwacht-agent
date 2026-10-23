@@ -380,7 +380,7 @@ func NewManager(
 // objects) but each get their own cgroup attachment and ViolationRecorder.
 func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *policy.ResolvedPolicy) (*Enforcer, error) {
 	if pol.Action == "allow" {
-		m.logger.Info("skipping enforcement (allow mode)", "container_id", info.ContainerID[:12])
+		m.logger.Info("skipping enforcement (allow mode)", "container_id", truncID(info.ContainerID))
 
 		return nil, nil //nolint:nilnil // nil,nil signals "skip, no error"
 	}
@@ -388,7 +388,7 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 	netnsIno, netnsErr := m.platform.NetnsInode(pid)
 	if netnsErr != nil {
 		m.logger.Warn("netns inode lookup failed; using standalone context",
-			"container_id", info.ContainerID[:12],
+			"container_id", truncID(info.ContainerID),
 			"pid", pid,
 			"error", netnsErr,
 		)
@@ -401,7 +401,7 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 	if len(m.enforcers) >= m.maxConc {
 		m.mu.Unlock()
 		m.logger.Warn("max concurrent enforcement reached, skipping",
-			"container_id", info.ContainerID[:12],
+			"container_id", truncID(info.ContainerID),
 			"max", m.maxConc,
 		)
 
@@ -411,7 +411,7 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 	if _, exists := m.enforcers[info.ContainerID]; exists {
 		m.mu.Unlock()
 		m.logger.Warn("container already enforced, skipping duplicate",
-			"container_id", info.ContainerID[:12],
+			"container_id", truncID(info.ContainerID),
 		)
 
 		return nil, nil //nolint:nilnil // nil,nil signals "skip, no error"
@@ -517,7 +517,7 @@ func (m *Manager) applyJoinerPolicy(info ContainerInfo, nctx *NetnsContext, pol 
 	// reader's view must not disagree on what mode is in effect.
 	nctx.auditMode.Store(joinerAudit)
 	m.logger.Info("ebpf mode updated on sibling join",
-		"container_id", info.ContainerID[:12],
+		"container_id", truncID(info.ContainerID),
 		"audit", joinerAudit,
 	)
 }
@@ -599,12 +599,12 @@ func (m *Manager) PrepareNetns(containerID string, pid int, cgroupPath string) e
 
 	if created {
 		m.logger.Info("netns prepared for sibling",
-			"container_id", containerID[:12],
+			"container_id", truncID(containerID),
 			"netns_inode", netnsIno,
 		)
 	} else {
 		m.logger.Info("sibling joined existing netns",
-			"container_id", containerID[:12], "netns_inode", netnsIno)
+			"container_id", truncID(containerID), "netns_inode", netnsIno)
 	}
 
 	return nil
@@ -1237,7 +1237,7 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 		policy:            pol,
 		cgroup:            cgroupPath,
 		pid:               pid,
-		logger:            m.logger.With("container_id", info.ContainerID[:12]),
+		logger:            m.logger.With("container_id", truncID(info.ContainerID)),
 		ctx:               nctx,
 		cgroupLink:        cgroupLink,
 		cgroupID:          cgID,
@@ -1263,7 +1263,7 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 			attachPath = "per_container_k8s_fallback"
 
 			m.logger.Warn("container attached per-container despite K8s pod shape (pod-attach didn't engage)",
-				"container_id", info.ContainerID[:12],
+				"container_id", truncID(info.ContainerID),
 				"cgroup", cgroupPath,
 			)
 		}
@@ -1333,7 +1333,7 @@ func (m *Manager) runPacketBucketReporter(ctx context.Context, e *Enforcer) {
 		case <-ticker.C:
 			if inFlight.Load() {
 				m.logger.Debug("packet bucket report still in-flight, skipping tick",
-					"container_id", e.info.ContainerID[:12])
+					"container_id", truncID(e.info.ContainerID))
 
 				continue
 			}
@@ -1358,7 +1358,7 @@ func (m *Manager) runPacketBucketReporter(ctx context.Context, e *Enforcer) {
 				// one. Drop the bucket silently; emitting an empty
 				// report would only wedge the drain queue.
 				m.logger.Debug("skipping packet bucket flush — no project attribution",
-					"container_id", e.info.ContainerID[:12])
+					"container_id", truncID(e.info.ContainerID))
 
 				continue
 			}

@@ -125,7 +125,7 @@ func findCgroupByID(root, containerID string) (string, error) {
 	}
 
 	if result == "" {
-		return "", fmt.Errorf("%w: %s under %s", errCgroupNotFound, containerID[:12], root)
+		return "", fmt.Errorf("%w: %s under %s", errCgroupNotFound, truncID(containerID), root)
 	}
 
 	return result, nil

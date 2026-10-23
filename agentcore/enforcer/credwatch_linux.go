@@ -283,13 +283,13 @@ func (m *Manager) AttachCredwatch(containerID, cgroupPath string, allowCredWatch
 
 	cgID, err := cgroupID(cgroupPath)
 	if err != nil {
-		m.logger.Warn("credwatch: failed to get cgroup id", "container", containerID[:12], "error", err)
+		m.logger.Warn("credwatch: failed to get cgroup id", "container", truncID(containerID), "error", err)
 
 		return
 	}
 
 	if err := populateCredwatchMaps(lsm.objs, cgID, allowCredWatch, observeOnly); err != nil {
-		m.logger.Warn("credwatch: failed to populate maps", "container", containerID[:12], "error", err)
+		m.logger.Warn("credwatch: failed to populate maps", "container", truncID(containerID), "error", err)
 
 		return
 	}
@@ -303,7 +303,7 @@ func (m *Manager) AttachCredwatch(containerID, cgroupPath string, allowCredWatch
 	m.mu.Unlock()
 
 	m.logger.Info("credwatch maps populated",
-		"container", containerID[:12],
+		"container", truncID(containerID),
 		"cgroup_id", cgID,
 		"allow_credwatch", allowCredWatch,
 		"observe_only", observeOnly,
@@ -334,7 +334,7 @@ func (m *Manager) DetachCredwatch(containerID string) {
 	}
 
 	removeCredwatchMaps(lsm.objs, state.CgroupID)
-	m.logger.Debug("credwatch maps cleaned", "container", containerID[:12])
+	m.logger.Debug("credwatch maps cleaned", "container", truncID(containerID))
 }
 
 // handleCredwatchBPFEvent is called by the ring buffer reader for each event.

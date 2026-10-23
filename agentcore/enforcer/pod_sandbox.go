@@ -111,7 +111,7 @@ func (m *Manager) AttachPodSandbox(info PodSandboxInfo) error {
 
 	m.logger.Info("pod sandbox attached at pod cgroup",
 		"pod_uid", info.PodUID,
-		"sandbox_id", info.SandboxID[:min(len(info.SandboxID), shortContainerIDLen)],
+		"sandbox_id", truncID(info.SandboxID),
 		"pod_cgroup", podCgroup,
 		"netns_inode", netnsIno,
 		"duration_ms", time.Since(start).Milliseconds(),
@@ -149,7 +149,7 @@ func (m *Manager) handleExistingPodSandbox(netnsIno uint64, podCgroup string, in
 
 	if nctx.sandboxID == info.SandboxID {
 		m.mu.Unlock()
-		m.logger.Debug("duplicate pod_sandbox_start ignored", "sandbox_id", info.SandboxID[:12])
+		m.logger.Debug("duplicate pod_sandbox_start ignored", "sandbox_id", truncID(info.SandboxID))
 
 		return true, nil
 	}
@@ -229,7 +229,7 @@ func (m *Manager) attachPodLink(nctx *NetnsContext, podCgroup string, info PodSa
 
 	m.logger.Debug("pod cgroup link bound",
 		"pod_uid", info.PodUID,
-		"sandbox_id", info.SandboxID[:min(len(info.SandboxID), shortContainerIDLen)],
+		"sandbox_id", truncID(info.SandboxID),
 		"pod_cgroup", podCgroup,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
@@ -290,11 +290,9 @@ func (m *Manager) DetachPodSandbox(podUID, sandboxID string) {
 
 	m.logger.Info("pod sandbox detached",
 		"pod_uid", podUID,
-		"sandbox_id", sandboxID[:min(len(sandboxID), shortContainerIDLen)],
+		"sandbox_id", truncID(sandboxID),
 		"refcount", target.refcount,
 		"teardown", teardown,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 }
-
-const shortContainerIDLen = 12

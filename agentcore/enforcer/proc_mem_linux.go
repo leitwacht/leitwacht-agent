@@ -227,13 +227,13 @@ func (m *Manager) AttachProcMem(containerID, cgroupPath string, allowProcRead, o
 
 	cgID, err := cgroupID(cgroupPath)
 	if err != nil {
-		m.logger.Warn("proc_mem: failed to get cgroup id", "container", containerID[:12], "error", err)
+		m.logger.Warn("proc_mem: failed to get cgroup id", "container", truncID(containerID), "error", err)
 
 		return
 	}
 
 	if err := populateProcMemMaps(lsm.objs, cgID, allowProcRead, observeOnly); err != nil {
-		m.logger.Warn("proc_mem: failed to populate maps", "container", containerID[:12], "error", err)
+		m.logger.Warn("proc_mem: failed to populate maps", "container", truncID(containerID), "error", err)
 
 		return
 	}
@@ -244,7 +244,7 @@ func (m *Manager) AttachProcMem(containerID, cgroupPath string, allowProcRead, o
 	m.mu.Unlock()
 
 	m.logger.Info("proc_mem maps populated",
-		"container", containerID[:12],
+		"container", truncID(containerID),
 		"cgroup_id", cgID,
 		"allow_proc_read", allowProcRead,
 		"observe_only", observeOnly,
@@ -275,7 +275,7 @@ func (m *Manager) DetachProcMem(containerID string) {
 	}
 
 	removeProcMemMaps(lsm.objs, state.CgroupID)
-	m.logger.Debug("proc_mem maps cleaned", "container", containerID[:12])
+	m.logger.Debug("proc_mem maps cleaned", "container", truncID(containerID))
 }
 
 // handleProcMemBPFEvent is called by the ring buffer reader for each event.

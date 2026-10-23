@@ -156,12 +156,12 @@ func (w *Watcher) handleEvent(ctx context.Context, ev events.Message, ch chan<- 
 	info, err := w.client.ContainerInspect(ctx, containerID)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
-			w.logger.Debug("container gone before inspect", "container_id", containerID[:12])
+			w.logger.Debug("container gone before inspect", "container_id", truncID(containerID))
 
 			return
 		}
 
-		w.logger.Error("inspect container", "container_id", containerID[:12], "error", err)
+		w.logger.Error("inspect container", "container_id", truncID(containerID), "error", err)
 
 		return
 	}
@@ -180,13 +180,13 @@ func (w *Watcher) handleEvent(ctx context.Context, ev events.Message, ch chan<- 
 		w.scope,
 	)
 	if event == nil {
-		w.logger.Debug("skipping non-build container", "container_id", containerID[:12])
+		w.logger.Debug("skipping non-build container", "container_id", truncID(containerID))
 
 		return
 	}
 
 	w.logger.Info("build container detected",
-		"container_id", containerID[:12],
+		"container_id", truncID(containerID),
 		"project", event.ProjectPath,
 		"job_id", event.JobID,
 	)
@@ -222,7 +222,7 @@ func (w *Watcher) RecoverRunning(ctx context.Context) ([]ContainerEvent, error) 
 	for _, c := range containers {
 		info, err := w.client.ContainerInspect(ctx, c.ID)
 		if err != nil {
-			w.logger.Warn("inspect running container", "container_id", c.ID[:12], "error", err)
+			w.logger.Warn("inspect running container", "container_id", truncID(c.ID), "error", err)
 
 			continue
 		}

@@ -169,7 +169,8 @@ func (m *Manager) handleExistingPodSandbox(netnsIno uint64, podCgroup string, in
 	oldCgID := nctx.podCgroupID
 	m.mu.Unlock()
 
-	// Attach the new link BEFORE closing the old one: closing first leaves
+	// Attach the new link BEFORE closing the old one (requires cgroup
+	// bpf_link multi-attach, Linux >= 5.7; the agent already needs links): closing first leaves
 	// a window with no egress filter on the pod cgroup while containers
 	// are running. Links are independently attachable to one cgroup, so the
 	// program briefly runs twice, which is harmless. On failure the old
@@ -241,13 +242,14 @@ func (m *Manager) attachPodLink(nctx *NetnsContext, podCgroup string, info PodSa
 	nctx.refcount++
 	m.mu.Unlock()
 
-	// Deliberately NOT arming the DNS attach-liveness signal here. The
-	// pod-level attach runs the audit-all placeholder policy; signalling
-	// "attached" now would let a pod whose real policy is block-mode start
-	// its entrypoints before that policy is in force. The signal is armed
-	// by the first container Attach, which reconciles the netns to the
-	// strictest member policy (see Attach), or by a sibling prepared on a
-	// netns without a pod link.
+	// Egress is live at the pod cgroup before any user container runs, so
+	// arm the DNS attach-liveness signal here: leitwacht-initc (an init
+	// container that carries no job env, so it never reaches Attach itself)
+	// must be released as soon as the pod-level program is linked, or every
+	// job pod would wait out its deadline. Known window: until the build
+	// container's own Attach reconciles the netns to its policy, egress
+	// runs under this audit-all placeholder (allowed and logged).
+	nctx.egressAttached.Store(true)
 
 	m.logger.Debug("pod cgroup link bound",
 		"pod_uid", info.PodUID,

@@ -298,6 +298,9 @@ for the regression covering this case end-to-end.
   Docker-compatible socket with `LEITWACHT_CE_CONTAINER_RUNTIME=docker`).
   It is never applied to containerd/CRI (Kubernetes) events. K8s jobs
   are gated by the `leitwacht-initc` init container instead; see below.
+  Plain containerd outside Kubernetes (`nerdctl`, `ctr`) is the same
+  watcher and therefore has no freeze: the pre-attach window of finding
+  #3 remains for that shape.
 
 - While a container is frozen (from its start event until attach
   completes, typically tens to hundreds of ms) `exec` into it and
@@ -311,22 +314,29 @@ for the regression covering this case end-to-end.
   `LEITWACHT_CE_FREEZE_STATE_DIR` are swept (and the containers thawed)
   at the next start, before running containers are enumerated.
 
-## Kubernetes: the leitwacht-initc gate
+## Kubernetes: the leitwacht-initc gate and the audit window
 
 The pod-sandbox event attaches egress at the pod cgroup with an
-**audit-all placeholder** policy. The reserved
-`_leitwacht.attached.local` TXT "attached" answer, which
-`leitwacht-initc` polls before letting the job's containers start, is
-therefore **not** armed by the pod-level attach. It is armed by the first
-container `Attach`, after the netns has been reconciled to the strictest
-attached policy (so a block-mode job's init container is released only
-once block mode is in force), and promptly for passive (non-enrolled),
-audit and allow-mode policies. A sibling prepared on a pod-attached netns
-runs only the placeholder and does not arm it.
+**audit-all placeholder** policy and arms the reserved
+`_leitwacht.attached.local` TXT "attached" answer that
+`leitwacht-initc` polls. initc is an init container whose pod-spec patch
+carries no job environment, so its start is only a sibling
+(`PrepareNetns`); it never reaches `Attach` and must be released as soon
+as the pod-level program is linked. The build, helper and service
+containers (the ones that carry `CI_PROJECT_PATH` and reach `Attach`)
+cannot start until initc exits.
+
+**Known window:** from the build container's start until its own `Attach`
+reconciles the netns to the job's policy, egress runs under the
+audit-all placeholder (allowed and logged, not blocked). That is
+typically tens of milliseconds. The Docker/Podman freeze does not apply
+to Kubernetes (containerd/CRI) events.
 
 `leitwacht-initc` exits 1 if the signal is not seen within its deadline
-(`LEITWACHT_INIT_DEADLINE`, default 20s), so the job **fails closed**.
-This requires a container carrying the job's identity
-(`CI_PROJECT_PATH`) to start, and be attached, before or while the init
-container runs; if the init container itself is not such a container,
-size the deadline accordingly or the job will time out.
+(`LEITWACHT_INIT_DEADLINE`, default 20s), so a job whose agent never
+attached fails closed.
+
+Possible future hardening (operator decision, not implemented): carry
+the job's block/audit intent to the pod at sandbox time (pod annotations
+exposed to the init container through the downward API) and withhold the
+attached signal until the netns is enforcing for a block-mode job.

@@ -18,6 +18,8 @@ import (
 	"sync"
 	"time"
 
+	cerrdefs "github.com/containerd/errdefs"
+
 	"gitlab.com/leitwacht/leitwacht-agent/agentcore/advisory"
 	"gitlab.com/leitwacht/leitwacht-agent/agentcore/enforcer"
 	"gitlab.com/leitwacht/leitwacht-agent/agentcore/internal/idutil"
@@ -201,6 +203,12 @@ func (h *Handler) killContainer(containerID, scope string) error {
 		return nil
 	}
 
+	// Already exited / no longer known to the runtime: the goal (it is not
+	// running) is met.
+	if errors.Is(err, os.ErrNotExist) || cerrdefs.IsNotFound(err) {
+		return nil
+	}
+
 	h.Logger.Error("runtime kill failed", "container_id", truncID(containerID), "error", err)
 
 	if scope != "" {
@@ -343,9 +351,10 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 	// program once at that level. Every container that subsequently joins
 	// the pod (init, helper, build) is filtered automatically; the build
 	// container's first packet hits an already-attached program, which
-	// runs the audit-all placeholder until this container's policy joins:
-	// the leitwacht-initc gate (not a freeze) holds entrypoints until the
-	// netns is reconciled to that policy (see Manager.Attach). The
+	// runs the audit-all placeholder until this container's own Attach
+	// reconciles the netns to its policy: a known window of tens of ms in
+	// which egress is allowed and logged. leitwacht-initc releases on the
+	// pod-level attach, not on that reconcile. The
 	// per-container AttachCgroup call below is skipped when the
 	// NetnsContext is podAttached, and stays as the fallback path for
 	// Docker/Podman/plain-containerd shapes that have no pod cgroup.

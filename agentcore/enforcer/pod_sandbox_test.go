@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"gitlab.com/leitwacht/leitwacht-agent/agentcore/policy"
 )
 
 const (
@@ -384,4 +386,138 @@ func TestPodSandbox_ConcurrentEventsRace(t *testing.T) {
 	})
 
 	wg.Wait()
+}
+
+func podGateManager(t *testing.T) (*Manager, string) {
+	t.Helper()
+
+	sandboxCgroup, _, _ := makePodCgroupTree(t)
+
+	fp := &fakePlatform{
+		cgroupPath: "/sys/fs/cgroup/test",
+		netnsByPID: map[int]uint64{
+			testSandboxPID: testSharedNetnsIno, testBuildPID: testSharedNetnsIno, 300: testSharedNetnsIno,
+		},
+	}
+
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	t.Cleanup(func() { mgr.DetachAll() })
+
+	return mgr, sandboxCgroup
+}
+
+func gateOpen(t *testing.T, mgr *Manager) bool {
+	t.Helper()
+
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	return mgr.netnsContexts[testSharedNetnsIno].egressAttached.Load()
+}
+
+// TestAttachedSignalWaitsForContainerReconcile: the pod-level attach only
+// installs the audit-all placeholder, so the init container's attach signal
+// must stay withheld until a container Attach has reconciled the netns.
+func TestAttachedSignalWaitsForContainerReconcile(t *testing.T) {
+	mgr, sandboxCgroup := podGateManager(t)
+
+	if err := mgr.AttachPodSandbox(PodSandboxInfo{
+		PodUID: testPodUID, SandboxID: testSandboxID, PID: testSandboxPID, CgroupPath: sandboxCgroup,
+	}); err != nil {
+		t.Fatalf("AttachPodSandbox: %v", err)
+	}
+
+	if gateOpen(t, mgr) {
+		t.Fatal("attached signal armed by the pod-level audit placeholder")
+	}
+
+	// A helper prepared on the pod-attached netns is still the placeholder.
+	if err := mgr.PrepareNetns("helper0000000000", 300, "/sys/fs/cgroup/helper"); err != nil {
+		t.Fatalf("PrepareNetns: %v", err)
+	}
+
+	if gateOpen(t, mgr) {
+		t.Fatal("audit-all sibling opened the gate on a pod-attached netns")
+	}
+
+	if _, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "build0000000", ProjectPath: "team/app"},
+		testBuildPID, testPolicy("block")); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	if !gateOpen(t, mgr) {
+		t.Fatal("gate still closed after the block-mode container reconciled the netns")
+	}
+
+	mgr.mu.Lock()
+	audit := mgr.netnsContexts[testSharedNetnsIno].auditMode.Load()
+	mgr.mu.Unlock()
+
+	if audit {
+		t.Fatal("netns not in block mode when the gate opened")
+	}
+}
+
+// Passive / audit / allow policies are signalled promptly at their Attach
+// (non-enrolled projects must not hang initc).
+func TestAttachedSignalOpensForPassiveAuditAndAllow(t *testing.T) {
+	for name, pol := range map[string]func() *policyForTest{
+		"passive": func() *policyForTest { return &policyForTest{action: "audit", empty: true} },
+		"audit":   func() *policyForTest { return &policyForTest{action: "audit"} },
+		"allow":   func() *policyForTest { return &policyForTest{action: "allow"} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			mgr, sandboxCgroup := podGateManager(t)
+
+			if err := mgr.AttachPodSandbox(PodSandboxInfo{
+				PodUID: testPodUID, SandboxID: testSandboxID, PID: testSandboxPID, CgroupPath: sandboxCgroup,
+			}); err != nil {
+				t.Fatalf("AttachPodSandbox: %v", err)
+			}
+
+			if gateOpen(t, mgr) {
+				t.Fatal("gate open before any container attach")
+			}
+
+			p := pol()
+
+			if _, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "build0000000"}, testBuildPID, p.build()); err != nil {
+				t.Fatalf("Attach: %v", err)
+			}
+
+			if !gateOpen(t, mgr) {
+				t.Fatalf("gate closed after a %s attach; initc would wait out its deadline", name)
+			}
+		})
+	}
+}
+
+// Without a pod link (Docker-style / fallback) a sibling's attach is the
+// enforcement, so it arms the signal as before.
+func TestAttachedSignalSiblingWithoutPodLink(t *testing.T) {
+	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test", netnsByPID: map[int]uint64{300: testSharedNetnsIno}}
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+
+	defer mgr.DetachAll()
+
+	if err := mgr.PrepareNetns("helper0000000000", 300, "/sys/fs/cgroup/helper"); err != nil {
+		t.Fatalf("PrepareNetns: %v", err)
+	}
+
+	if !gateOpen(t, mgr) {
+		t.Fatal("sibling on a non-pod netns did not arm the attached signal")
+	}
+}
+
+type policyForTest struct {
+	action string
+	empty  bool
+}
+
+func (p *policyForTest) build() *policy.ResolvedPolicy {
+	if p.empty {
+		return ipRulePolicy(p.action)
+	}
+
+	return testPolicy(p.action)
 }

@@ -79,10 +79,11 @@ type NetnsContext struct {
 	// egressAttached gates the DNS attach-liveness signal (the reserved
 	// `attached` reply) on the cgroup_skb/egress program actually being
 	// linked, not merely the DNS proxy being up. Set true once egress is
-	// live for this netns: in attachPodLink (K8s pod cgroup, before any
-	// container runs) and at the end of attachEnforcer (per-container /
-	// non-pod). Without this, the DNS proxy answers `attached` as soon as
-	// it starts in initNetnsContext — which on the non-pod path precedes
+	// live AND the netns policy is reconciled: at the end of Attach (every
+	// container Attach, including passive sentinels), or for a sibling
+	// prepared on a netns without a pod link. A pod-level attach alone does
+	// NOT set it: it only carries the audit-all placeholder. Without this,
+	// the DNS proxy answers `attached` as soon as it starts in initNetnsContext — which on the non-pod path precedes
 	// AttachCgroup — so a gated entrypoint (probe-detonate's waitForAgent /
 	// leitwacht-init) could proceed in the window before egress enforcement
 	// is live and miss the first packets. Atomic: Stored from attach paths,
@@ -335,26 +336,6 @@ func (m *Manager) CgroupPathForPID(pid int) (string, error) {
 	return m.platform.GetCgroupPath(pid)
 }
 
-// PodAttachedForPID reports whether the pid's network namespace already has
-// a pod-level egress attach (K8s sandbox path). The pre-attach freeze is
-// skipped for such containers: on K8s the pre-job gate is the
-// leitwacht-initc init container, not a freeze. Note this does not mean the
-// pod is enforcing yet: the sandbox primes the netns in audit-all mode and
-// the real policy is applied when the build container's Attach joins it.
-func (m *Manager) PodAttachedForPID(pid int) bool {
-	ino, err := m.platform.NetnsInode(pid)
-	if err != nil || ino == 0 {
-		return false
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	nctx := m.netnsContexts[ino]
-
-	return nctx != nil && nctx.podAttached
-}
-
 // ContainerIDForCgroup resolves a cgroup ID to a container ID by searching
 // the credwatch and proc_mem cgroup-to-container maps.
 func (m *Manager) ContainerIDForCgroup(cgroupID uint64) string {
@@ -443,6 +424,19 @@ func NewManager(
 func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *policy.ResolvedPolicy) (*Enforcer, error) {
 	if pol.Action == "allow" {
 		m.logger.Info("skipping enforcement (allow mode)", "container_id", truncID(info.ContainerID))
+
+		// Nothing to enforce for this job, so a pod-level netns primed in
+		// audit-all mode is already the right state: release the gate or
+		// the init container would wait out its deadline.
+		if ino, err := m.platform.NetnsInode(pid); err == nil && ino != 0 {
+			m.mu.Lock()
+			nctx := m.netnsContexts[ino]
+			m.mu.Unlock()
+
+			if nctx != nil {
+				nctx.egressAttached.Store(true)
+			}
+		}
 
 		return nil, nil //nolint:nilnil // nil,nil signals "skip, no error"
 	}
@@ -558,6 +552,15 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 
 		return nil, attachErr
 	}
+
+	// Egress is live and the netns has been reconciled to the effective
+	// policy including this container's (addNetnsMember/reconcile above;
+	// the creator initialised with it). Arm the DNS attach-liveness signal
+	// so the reserved `attached` reply only fires now: a gated entrypoint
+	// (leitwacht-initc, probe-detonate's waitForAgent) cannot run before
+	// enforcement is in force. A passive or audit policy gets the signal
+	// here too, promptly.
+	nctx.egressAttached.Store(true)
 
 	m.finalizeAttach(info, e, nctx) //nolint:contextcheck // bucket reporters use context.Background() intentionally — outlive caller
 
@@ -782,7 +785,15 @@ func (m *Manager) PrepareNetns(containerID string, pid int, cgroupPath string) e
 
 	m.mu.Lock()
 	m.enforcers[containerID] = e
+	podAttached := nctx.podAttached
 	m.mu.Unlock()
+
+	// A sibling prepared on a pod-attached netns only runs the audit-all
+	// placeholder, so it must not open the gate (see AttachPodSandbox). On
+	// a netns without a pod link its cgroup attach is the enforcement.
+	if !podAttached {
+		nctx.egressAttached.Store(true)
+	}
 
 	if created {
 		m.logger.Info("netns prepared for sibling",
@@ -1614,12 +1625,6 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 			)
 		}
 	}
-
-	// Egress is now live for this netns (AttachCgroup above, or already
-	// covered by the pod link when podAttached). Arm the DNS attach-liveness
-	// signal so the reserved `attached` reply only fires now — closing the
-	// window where a gated entrypoint could run before enforcement.
-	nctx.egressAttached.Store(true)
 
 	e.logger.Info("enforcement attached",
 		"project", pol.ProjectPath,

@@ -241,12 +241,13 @@ func (m *Manager) attachPodLink(nctx *NetnsContext, podCgroup string, info PodSa
 	nctx.refcount++
 	m.mu.Unlock()
 
-	// Egress is live at the pod cgroup before any user container runs, so
-	// arm the DNS attach-liveness signal here — the reserved `attached`
-	// reply is answerable from pod-sandbox time, exactly as before this
-	// gating existed (no change to K8s timing). The per-container
-	// attachEnforcer path sets the same flag for non-pod runtimes.
-	nctx.egressAttached.Store(true)
+	// Deliberately NOT arming the DNS attach-liveness signal here. The
+	// pod-level attach runs the audit-all placeholder policy; signalling
+	// "attached" now would let a pod whose real policy is block-mode start
+	// its entrypoints before that policy is in force. The signal is armed
+	// by the first container Attach, which reconciles the netns to the
+	// strictest member policy (see Attach), or by a sibling prepared on a
+	// netns without a pod link.
 
 	m.logger.Debug("pod cgroup link bound",
 		"pod_uid", info.PodUID,

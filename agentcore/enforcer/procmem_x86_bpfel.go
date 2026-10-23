@@ -27,6 +27,17 @@ type procMemProcMemEvent struct {
 	TimestampNs uint64
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	procMemMapKnownContainers     = "known_containers"
+	procMemMapPathBuf             = "path_buf"
+	procMemMapProcMemEvents       = "proc_mem_events"
+	procMemProgProcMemFileOpen    = "proc_mem_file_open"
+	procMemVarProcMemEventBtfHint = "__proc_mem_event_btf_hint"
+)
+
 // loadProcMem returns the embedded CollectionSpec for procMem.
 func loadProcMem() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_ProcMemBytes)
@@ -47,7 +58,7 @@ func loadProcMem() (*ebpf.CollectionSpec, error) {
 //	*procMemMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadProcMemObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadProcMemObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadProcMem()
 	if err != nil {
 		return err

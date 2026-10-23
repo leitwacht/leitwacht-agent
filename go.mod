@@ -17,7 +17,7 @@ module gitlab.com/leitwacht/leitwacht-agent
 go 1.27.3
 
 require (
-	github.com/cilium/ebpf v0.21.0
+	github.com/cilium/ebpf v0.22.0
 	github.com/containerd/containerd/api v1.11.0
 	github.com/containerd/containerd/v2 v2.3.0
 	github.com/containerd/errdefs v1.0.0

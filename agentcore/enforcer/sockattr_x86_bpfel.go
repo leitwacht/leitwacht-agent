@@ -22,6 +22,17 @@ type sockAttrSockOwner struct {
 	BinaryPath [256]int8
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	sockAttrMapSockKnownCgroups = "sock_known_cgroups"
+	sockAttrMapSockOwners       = "sock_owners"
+	sockAttrProgSockAttrConnect = "sock_attr_connect"
+	sockAttrProgSockAttrSendmsg = "sock_attr_sendmsg"
+	sockAttrVarSockOwnerBtfHint = "__sock_owner_btf_hint"
+)
+
 // loadSockAttr returns the embedded CollectionSpec for sockAttr.
 func loadSockAttr() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_SockAttrBytes)
@@ -42,7 +53,7 @@ func loadSockAttr() (*ebpf.CollectionSpec, error) {
 //	*sockAttrMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadSockAttrObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadSockAttrObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadSockAttr()
 	if err != nil {
 		return err

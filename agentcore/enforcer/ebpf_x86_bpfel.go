@@ -46,6 +46,24 @@ type ebpfSockOwner struct {
 	BinaryPath [256]int8
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	ebpfMapAllowedHosts     = "allowed_hosts"
+	ebpfMapAllowedIps       = "allowed_ips"
+	ebpfMapConfig           = "config"
+	ebpfMapDeniedIps        = "denied_ips"
+	ebpfMapDropDedup        = "drop_dedup"
+	ebpfMapDropEvents       = "drop_events"
+	ebpfMapSockOwners       = "sock_owners"
+	ebpfMapStats            = "stats"
+	ebpfMapTrustedNets      = "trusted_nets"
+	ebpfProgEgressFilter    = "egress_filter"
+	ebpfVarDropEventBtfHint = "__drop_event_btf_hint"
+	ebpfVarSockOwnerBtfHint = "__sock_owner_btf_hint"
+)
+
 // loadEbpf returns the embedded CollectionSpec for ebpf.
 func loadEbpf() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_EbpfBytes)
@@ -66,7 +84,7 @@ func loadEbpf() (*ebpf.CollectionSpec, error) {
 //	*ebpfMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadEbpfObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadEbpfObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadEbpf()
 	if err != nil {
 		return err

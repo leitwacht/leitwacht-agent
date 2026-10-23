@@ -27,6 +27,19 @@ type credwatchCredwatchEvent struct {
 	TimestampNs uint64
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	credwatchMapCredwatchEvents       = "credwatch_events"
+	credwatchMapKnownContainers       = "known_containers"
+	credwatchMapPathBuf               = "path_buf"
+	credwatchMapWatchedFilenames      = "watched_filenames"
+	credwatchMapWatchedSuffixes       = "watched_suffixes"
+	credwatchProgCredwatchFileOpen    = "credwatch_file_open"
+	credwatchVarCredwatchEventBtfHint = "__credwatch_event_btf_hint"
+)
+
 // loadCredwatch returns the embedded CollectionSpec for credwatch.
 func loadCredwatch() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_CredwatchBytes)
@@ -47,7 +60,7 @@ func loadCredwatch() (*ebpf.CollectionSpec, error) {
 //	*credwatchMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadCredwatchObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadCredwatchObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadCredwatch()
 	if err != nil {
 		return err

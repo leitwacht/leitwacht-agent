@@ -37,6 +37,19 @@ type dnspidProcessInfo struct {
 	CgroupId   uint64
 }
 
+// Names of all BPF objects in the ELF.
+//
+// Used for safe lookups in a Collection or CollectionSpec.
+const (
+	dnspidMapDnsKnownCgroups   = "dns_known_cgroups"
+	dnspidMapDnsPidAttribution = "dns_pid_attribution"
+	dnspidMapProcessInfo       = "process_info"
+	dnspidProgDnsPidBprm       = "dns_pid_bprm"
+	dnspidProgDnsPidExec       = "dns_pid_exec"
+	dnspidProgDnsPidSendmsg    = "dns_pid_sendmsg"
+	dnspidProgDnsPidTcpConnect = "dns_pid_tcp_connect"
+)
+
 // loadDnspid returns the embedded CollectionSpec for dnspid.
 func loadDnspid() (*ebpf.CollectionSpec, error) {
 	reader := bytes.NewReader(_DnspidBytes)
@@ -57,7 +70,7 @@ func loadDnspid() (*ebpf.CollectionSpec, error) {
 //	*dnspidMaps
 //
 // See ebpf.CollectionSpec.LoadAndAssign documentation for details.
-func loadDnspidObjects(obj interface{}, opts *ebpf.CollectionOptions) error {
+func loadDnspidObjects(obj any, opts *ebpf.CollectionOptions) error {
 	spec, err := loadDnspid()
 	if err != nil {
 		return err

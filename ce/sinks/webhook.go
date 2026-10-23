@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -36,8 +37,12 @@ type Webhook struct {
 	header   string
 	log      *slog.Logger
 
-	parent context.Context
-	sem    chan struct{}
+	// ctx is the sink's own context, deliberately independent of the
+	// daemon's shutdown context: the final per-container reports are
+	// emitted after that context is cancelled and must still go out.
+	ctx context.Context
+	sem chan struct{}
+	wg  sync.WaitGroup
 
 	dropped atomic.Int64
 }
@@ -49,8 +54,10 @@ type Webhook struct {
 const DefaultWebhookConcurrency = 32
 
 // NewWebhook returns a Webhook sink with default concurrency limits.
-// parent is the daemon-lifetime context — when it cancels, in-flight
-// posts are best-effort cancelled and new posts are dropped.
+// parent is accepted for API compatibility but is intentionally not
+// used for cancellation: shutdown-time reports (emitted after the
+// daemon context is cancelled) must still be delivered. Call Flush
+// before exit to wait for in-flight posts.
 // authHeader (e.g., "Bearer abc...") is sent verbatim if non-empty;
 // surrounding whitespace is trimmed.
 func NewWebhook(parent context.Context, url string, timeout time.Duration, hostname, authHeader string, log *slog.Logger) *Webhook {
@@ -60,15 +67,12 @@ func NewWebhook(parent context.Context, url string, timeout time.Duration, hostn
 // NewWebhookWithLimits exposes the concurrency cap so tests and tuned
 // production deployments can override it. maxInflight <= 0 falls back
 // to DefaultWebhookConcurrency.
-func NewWebhookWithLimits(parent context.Context, url string, timeout time.Duration, hostname, authHeader string, maxInflight int, log *slog.Logger) *Webhook {
+func NewWebhookWithLimits(_ context.Context, url string, timeout time.Duration, hostname, authHeader string, maxInflight int, log *slog.Logger) *Webhook {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 	if maxInflight <= 0 {
 		maxInflight = DefaultWebhookConcurrency
-	}
-	if parent == nil {
-		parent = context.Background()
 	}
 	return &Webhook{
 		client:   &http.Client{Timeout: timeout},
@@ -76,8 +80,33 @@ func NewWebhookWithLimits(parent context.Context, url string, timeout time.Durat
 		hostname: hostname,
 		header:   strings.TrimSpace(authHeader),
 		log:      log,
-		parent:   parent,
+		ctx:      context.Background(),
 		sem:      make(chan struct{}, maxInflight),
+	}
+}
+
+// Flush blocks until all in-flight posts finish or timeout elapses,
+// whichever comes first, and reports whether everything drained. Call it
+// once after the last report has been emitted. Posts are still bounded
+// individually by the HTTP client timeout.
+func (w *Webhook) Flush(timeout time.Duration) bool {
+	done := make(chan struct{})
+
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		w.log.Warn("webhook sink: flush timed out with posts still in flight", "timeout", timeout)
+
+		return false
 	}
 }
 
@@ -144,14 +173,8 @@ func (w *Webhook) ReportAdvisory(_ context.Context, a *advisory.Advisory) error 
 // dispatch acquires a slot in the in-flight semaphore and runs post on
 // a goroutine. When the cap is reached it drops the report rather than
 // queueing — better to lose a few records than to OOM the agent on a
-// stuck upstream. The parent context is checked first so a shutting-
-// down daemon stops issuing new posts.
+// stuck upstream.
 func (w *Webhook) dispatch(body any) {
-	if err := w.parent.Err(); err != nil {
-		w.dropped.Add(1)
-		return
-	}
-
 	select {
 	case w.sem <- struct{}{}:
 	default:
@@ -161,8 +184,11 @@ func (w *Webhook) dispatch(body any) {
 		return
 	}
 
+	w.wg.Add(1)
+
 	go func() {
 		defer func() { <-w.sem }()
+		defer w.wg.Done()
 		w.post(body)
 	}()
 }
@@ -175,9 +201,8 @@ func (w *Webhook) post(body any) {
 		return
 	}
 
-	// Bound the call by the client timeout, derived from the parent so
-	// daemon shutdown short-circuits in-flight posts.
-	postCtx, cancel := context.WithTimeout(w.parent, w.client.Timeout)
+	// Bound the call by the client timeout.
+	postCtx, cancel := context.WithTimeout(w.ctx, w.client.Timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(postCtx, http.MethodPost, w.url, bytes.NewReader(buf))

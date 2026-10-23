@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -116,4 +117,52 @@ func TestWebhookCountsDroppedOnNon2xx(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Errorf("Dropped() = %d, want >=1 after 5xx response", sink.Dropped())
+}
+
+// TestWebhookDeliversAfterParentCancelAndFlush covers shutdown: the final
+// reports are emitted after the daemon context is cancelled and must still
+// reach the upstream; Flush waits for them.
+func TestWebhookDeliversAfterParentCancelAndFlush(t *testing.T) {
+	var got atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(150 * time.Millisecond) // still in flight when Flush starts
+		got.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	parent, cancel := context.WithCancel(context.Background())
+	sink := NewWebhook(parent, srv.URL, 2*time.Second, "node-1", "", slog.Default())
+
+	cancel()
+
+	for i := 0; i < 3; i++ {
+		sink.ReportAsync(parent, enforcer.ContainerInfo{ContainerID: "c1"}, &enforcer.EgressStats{}, false, time.Time{})
+	}
+
+	if !sink.Flush(3 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+
+	if n := got.Load(); n != 3 {
+		t.Fatalf("delivered %d posts after parent cancel, want 3 (dropped=%d)", n, sink.Dropped())
+	}
+}
+
+func TestWebhookFlushTimesOut(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+
+	defer srv.Close()
+	defer close(release)
+
+	sink := NewWebhook(context.Background(), srv.URL, 5*time.Second, "node-1", "", slog.Default())
+	sink.ReportAsync(context.Background(), enforcer.ContainerInfo{}, nil, false, time.Time{})
+
+	if sink.Flush(50 * time.Millisecond) {
+		t.Fatal("Flush reported drained while a post was blocked")
+	}
 }

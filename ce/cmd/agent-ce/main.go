@@ -232,7 +232,15 @@ func main() {
 
 	recoverRunning(ctx, w, h, log)
 	runEventLoop(ctx, log, h, mgr, w, w.Watch(ctx), multi)
+
+	// The final DetachAll reports are emitted after ctx is cancelled;
+	// give in-flight webhook posts a bounded window to complete.
+	if webhook != nil {
+		webhook.Flush(webhookFlushTimeout)
+	}
 }
+
+const webhookFlushTimeout = 5 * time.Second
 
 func parseLevel(v string) slog.Level {
 	switch strings.ToLower(v) {

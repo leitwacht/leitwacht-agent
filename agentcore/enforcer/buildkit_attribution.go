@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"regexp"
 	"sync"
 	"sync/atomic"
@@ -72,7 +73,23 @@ type SessionRegistry struct {
 	// PatternType=build_vertex+Action=deny, or from the CE env var
 	// LEITWACHT_CE_BUILDKIT_DENY_VERTEX_PATTERNS.
 	denyVertexPatterns []*regexp.Regexp
+
+	// maxSessionAge bounds how long a session that never reported
+	// COMPLETE (missed event across a reconnect, crashed client) may
+	// stay in the registry. Zero means defaultMaxSessionAge.
+	maxSessionAge time.Duration
+
+	// statFn resolves a cgroup path to its cgroup id (inode). Used on
+	// lookup to verify a binding still names the same cgroup: cgroup
+	// inodes can be recycled once a directory is removed, and a missed
+	// remove event would otherwise attribute a stranger's traffic to
+	// a stale binding. Nil disables the check.
+	statFn func(path string) (uint64, error)
 }
+
+// defaultMaxSessionAge is the age after which a session still not
+// marked COMPLETE is swept anyway.
+const defaultMaxSessionAge = 6 * time.Hour
 
 // CgroupBinding ties a kernel cgroup_id to the build session and
 // vertex that own the runc container occupying that cgroup. Returned
@@ -83,6 +100,7 @@ type CgroupBinding struct {
 	VertexDigest  string
 	VertexName    string
 	ContainerID   string // runc container id (also the cgroup directory name)
+	CgroupPath    string // cgroup directory the binding was made for; verified on lookup
 	LinkedAt      time.Time
 	FrontendAttrs map[string]string
 
@@ -194,6 +212,15 @@ type SessionState struct {
 
 	Vertices map[string]*VertexState // keyed by digest
 
+	// registeredAt is the local time the registry first saw the
+	// session; drives the max-age sweep.
+	registeredAt time.Time
+
+	// placeholder is true for a session created from a Status event
+	// before its history STARTED record arrived. RegisterSession
+	// fills it in; until then its attrs are unknown.
+	placeholder bool
+
 	// Authorized is the kill-switch decision computed at
 	// RegisterSession time from the registry's require-CI-metadata
 	// policy. True when policy is disabled OR all required
@@ -253,15 +280,69 @@ func (r *SessionRegistry) UnlinkCgroup(cgroupID uint64) {
 	delete(r.cgroupIndex, cgroupID)
 }
 
-// LookupByCgroupID returns the binding for a cgroup, or false when
-// the cgroup isn't tracked (the common case — most egress events
-// fire from cgroups outside BuildKit's tree).
-func (r *SessionRegistry) LookupByCgroupID(cgroupID uint64) (CgroupBinding, bool) {
+// SetStatFn installs the cgroup-path → cgroup-id resolver used to
+// verify bindings on lookup. The joiner installs its own at
+// construction.
+func (r *SessionRegistry) SetStatFn(fn func(path string) (uint64, error)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.statFn = fn
+}
+
+// SetMaxSessionAge sets the age after which a session that never
+// completed is swept. Zero or negative restores the default.
+func (r *SessionRegistry) SetMaxSessionAge(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.maxSessionAge = d
+}
+
+// EnforcementEnabled reports whether the operator opted into any kill
+// policy (require-CI-metadata or deny patterns). Only then does the
+// join layer kill cgroups it cannot attribute.
+func (r *SessionRegistry) EnforcementEnabled() bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	binding, ok := r.cgroupIndex[cgroupID]
 
-	return binding, ok
+	return r.requireCIMetadata || len(r.denyVertexPatterns) > 0
+}
+
+// LookupByCgroupID returns the binding for a cgroup, or false when
+// the cgroup isn't tracked (the common case — most egress events
+// fire from cgroups outside BuildKit's tree). A binding whose cgroup
+// directory is gone, or now has a different inode (id reuse after a
+// missed remove event), is dropped and reported as untracked.
+func (r *SessionRegistry) LookupByCgroupID(cgroupID uint64) (CgroupBinding, bool) {
+	r.mu.RLock()
+	binding, ok := r.cgroupIndex[cgroupID]
+	statFn := r.statFn
+	r.mu.RUnlock()
+
+	if !ok {
+		return binding, false
+	}
+
+	if binding.CgroupPath == "" || statFn == nil {
+		return binding, true
+	}
+
+	id, err := statFn(binding.CgroupPath)
+	if err == nil && id == cgroupID {
+		return binding, true
+	}
+
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		// Transient/unsupported stat failure: keep the binding.
+		return binding, true
+	}
+
+	r.mu.Lock()
+	if cur, still := r.cgroupIndex[cgroupID]; still && cur.LinkedAt.Equal(binding.LinkedAt) {
+		delete(r.cgroupIndex, cgroupID)
+	}
+	r.mu.Unlock()
+
+	return CgroupBinding{}, false
 }
 
 // CgroupSnapshot returns a copy of the current cgroup_id → binding
@@ -307,6 +388,7 @@ func (r *SessionRegistry) PendingVertices() []PendingVertex {
 				VertexName:    v.Name,
 				FrontendAttrs: cloneStringMap(s.FrontendAttrs),
 				Authorized:    s.Authorized,
+				Placeholder:   s.placeholder,
 			})
 		}
 	}
@@ -324,6 +406,11 @@ type PendingVertex struct {
 	VertexName    string
 	FrontendAttrs map[string]string
 	Authorized    bool
+
+	// Placeholder is true when the session's history record has not
+	// been seen yet, so Authorized reflects missing attrs rather than
+	// a real decision. The joiner retries instead of acting on it.
+	Placeholder bool
 }
 
 // SetCIRequirement configures the registry's kill-switch policy.
@@ -404,7 +491,14 @@ func (r *SessionRegistry) RegisterSession(ref string, startedAt time.Time, attrs
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if _, exists := r.sessions[ref]; exists {
+	if existing, exists := r.sessions[ref]; exists {
+		if existing.placeholder {
+			existing.placeholder = false
+			existing.StartedAt = startedAt
+			existing.FrontendAttrs = attrs
+			existing.Authorized = r.evaluateAuthorization(attrs)
+		}
+
 		return
 	}
 
@@ -414,6 +508,7 @@ func (r *SessionRegistry) RegisterSession(ref string, startedAt time.Time, attrs
 		FrontendAttrs: attrs,
 		Vertices:      make(map[string]*VertexState),
 		Authorized:    r.evaluateAuthorization(attrs),
+		registeredAt:  time.Now(),
 	}
 }
 
@@ -454,8 +549,11 @@ func (r *SessionRegistry) UpsertVertex(ref string, v VertexState) {
 		// BuildHistory STARTED). Create a placeholder; the
 		// subsequent STARTED will populate FrontendAttrs.
 		s = &SessionState{
-			Ref:      ref,
-			Vertices: make(map[string]*VertexState),
+			Ref:          ref,
+			Vertices:     make(map[string]*VertexState),
+			Authorized:   r.evaluateAuthorization(nil),
+			registeredAt: time.Now(),
+			placeholder:  true,
 		}
 		r.sessions[ref] = s
 	}
@@ -488,22 +586,69 @@ func (r *SessionRegistry) UpsertVertex(ref string, v VertexState) {
 	}
 }
 
-// Sweep removes sessions completed before cutoff. Call periodically
-// from a separate goroutine (the watcher's Run loop wires this up).
+// Sweep removes sessions completed before cutoff, and sessions that
+// never completed but were first seen longer than the max session age
+// ago (a missed COMPLETE would otherwise keep them, and their
+// vertices, matchable forever). Call periodically from a separate
+// goroutine (the watcher's Run loop wires this up).
 func (r *SessionRegistry) Sweep(cutoff time.Time) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	maxAge := r.maxSessionAge
+	if maxAge <= 0 {
+		maxAge = defaultMaxSessionAge
+	}
+
+	ageCutoff := time.Now().Add(-maxAge)
+
 	var dropped int
 
 	for ref, s := range r.sessions {
-		if s.Completed && s.CompletedAt.Before(cutoff) {
+		expired := s.Completed && s.CompletedAt.Before(cutoff)
+		aged := !s.Completed && !s.registeredAt.IsZero() && s.registeredAt.Before(ageCutoff)
+
+		if expired || aged {
 			delete(r.sessions, ref)
 			dropped++
 		}
 	}
 
 	return dropped
+}
+
+// CloseSessionsNotIn marks as completed every still-open session that
+// was registered before cutoff and is absent from seen. Called after a
+// reconnect replay: an active-only history replay lists every build
+// still running, so an older session missing from it finished while
+// the stream was down and its COMPLETE event was lost.
+func (r *SessionRegistry) CloseSessionsNotIn(seen map[string]struct{}, cutoff time.Time) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+
+	var closed int
+
+	for ref, s := range r.sessions {
+		if s.Completed {
+			continue
+		}
+
+		if _, ok := seen[ref]; ok {
+			continue
+		}
+
+		if s.registeredAt.IsZero() || !s.registeredAt.Before(cutoff) {
+			continue
+		}
+
+		s.Completed = true
+		s.CompletedAt = now
+		closed++
+	}
+
+	return closed
 }
 
 // Snapshot returns a defensive copy of the current registry state.
@@ -573,6 +718,49 @@ type AttributionWatcher struct {
 	// sweepInterval governs how often Sweep is called to GC
 	// completed sessions. Default 1m.
 	sweepInterval time.Duration
+
+	// replayGrace is how long after a (re)connect the watcher waits for
+	// the active-build replay before closing sessions the replay did not
+	// mention. Default 10s.
+	replayGrace time.Duration
+
+	// newClient builds the control client for one connection. Nil uses
+	// the gRPC dial path; tests inject a fake.
+	newClient func(ctx context.Context) (controlapi.ControlClient, func(), error)
+}
+
+// historyConn is the per-connection record of which sessions the
+// history stream announced, and whether it ever delivered a message.
+type historyConn struct {
+	mu       sync.Mutex
+	seen     map[string]struct{}
+	received atomic.Bool
+}
+
+func newHistoryConn() *historyConn {
+	return &historyConn{seen: make(map[string]struct{})}
+}
+
+func (h *historyConn) markSeen(ref string) {
+	if h == nil {
+		return
+	}
+
+	h.mu.Lock()
+	h.seen[ref] = struct{}{}
+	h.mu.Unlock()
+}
+
+func (h *historyConn) seenSet() map[string]struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	out := make(map[string]struct{}, len(h.seen))
+	for k := range h.seen {
+		out[k] = struct{}{}
+	}
+
+	return out
 }
 
 // WatcherOption tunes an AttributionWatcher at construction.
@@ -591,6 +779,12 @@ func WithBackoff(minB, maxB time.Duration) WatcherOption {
 		w.minBackoff = minB
 		w.maxBackoff = maxB
 	}
+}
+
+// WithReplayGrace overrides how long the watcher waits after a
+// (re)connect before closing sessions absent from the replay.
+func WithReplayGrace(d time.Duration) WatcherOption {
+	return func(w *AttributionWatcher) { w.replayGrace = d }
 }
 
 // WithSweepInterval overrides the session-sweep cadence.
@@ -614,6 +808,7 @@ func NewAttributionWatcher(addr string, registry *SessionRegistry, logger *slog.
 		minBackoff:    time.Second,
 		maxBackoff:    time.Minute,
 		sweepInterval: time.Minute,
+		replayGrace:   10 * time.Second,
 	}
 
 	for _, opt := range opts {
@@ -634,19 +829,27 @@ func (w *AttributionWatcher) Run(ctx context.Context) error {
 
 	backoff := w.minBackoff
 
+	sleep := func() error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+
+		return nil
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		conn, err := w.connect(ctx)
+		client, closeConn, err := w.dial(ctx)
 		if err != nil {
 			w.logger.Warn("buildkit connect failed", "addr", w.addr, "err", err, "backoff", backoff)
 
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(backoff):
+			if sleepErr := sleep(); sleepErr != nil {
+				return sleepErr
 			}
 
 			backoff = nextBackoff(backoff, w.maxBackoff)
@@ -654,27 +857,75 @@ func (w *AttributionWatcher) Run(ctx context.Context) error {
 			continue
 		}
 
-		// Connected; reset backoff before consuming.
-		backoff = w.minBackoff
+		// grpc.NewClient is lazy, so a successful dial proves nothing:
+		// the backoff is reset only once the stream delivers a message.
+		hc := newHistoryConn()
+		connCtx, cancelConn := context.WithCancel(ctx)
+		connStart := time.Now()
 
-		client := controlapi.NewControlClient(conn)
+		go w.closeUnreplayed(connCtx, hc, connStart)
 
-		err = w.listenHistory(ctx, client)
+		err = w.listenHistory(connCtx, client, hc)
 
-		_ = conn.Close()
+		cancelConn()
+		closeConn()
 
 		// Cancelled context propagates as ctx.Err; any other error
 		// triggers reconnect. listenHistory returns nil on a clean
 		// stream EOF (BuildKit closed the stream — happens on
 		// daemon restart).
-		if errors.Is(err, context.Canceled) {
-			return err
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if hc.received.Load() {
+			backoff = w.minBackoff
 		}
 
 		if err != nil {
-			w.logger.Warn("buildkit history stream ended", "err", err)
+			w.logger.Warn("buildkit history stream ended", "err", err, "backoff", backoff)
+		}
+
+		if sleepErr := sleep(); sleepErr != nil {
+			return sleepErr
+		}
+
+		if !hc.received.Load() {
+			backoff = nextBackoff(backoff, w.maxBackoff)
 		}
 	}
+}
+
+// closeUnreplayed waits out the replay grace on a fresh connection and
+// then closes sessions older than the connection that the active-only
+// replay never mentioned. Exits early if the connection ends first.
+func (w *AttributionWatcher) closeUnreplayed(ctx context.Context, hc *historyConn, connStart time.Time) {
+	t := time.NewTimer(w.replayGrace)
+	defer t.Stop()
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-t.C:
+	}
+
+	if n := w.registry.CloseSessionsNotIn(hc.seenSet(), connStart); n > 0 {
+		w.logger.Info("buildkit sessions closed: absent from history replay", "count", n)
+	}
+}
+
+// dial returns the control client for one connection plus its closer.
+func (w *AttributionWatcher) dial(ctx context.Context) (controlapi.ControlClient, func(), error) {
+	if w.newClient != nil {
+		return w.newClient(ctx)
+	}
+
+	conn, err := w.connect(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return controlapi.NewControlClient(conn), func() { _ = conn.Close() }, nil
 }
 
 func (w *AttributionWatcher) connect(_ context.Context) (*grpc.ClientConn, error) {
@@ -703,7 +954,7 @@ func (w *AttributionWatcher) connect(_ context.Context) (*grpc.ClientConn, error
 // and dispatches per-ref Status streams in their own goroutines.
 // Returns nil on clean EOF, ctx.Err() on cancellation, or the
 // underlying error otherwise.
-func (w *AttributionWatcher) listenHistory(ctx context.Context, client controlapi.ControlClient) error {
+func (w *AttributionWatcher) listenHistory(ctx context.Context, client controlapi.ControlClient, hc *historyConn) error {
 	stream, err := client.ListenBuildHistory(ctx, &controlapi.BuildHistoryRequest{ActiveOnly: true})
 	if err != nil {
 		return fmt.Errorf("listen build history: %w", err)
@@ -719,11 +970,15 @@ func (w *AttributionWatcher) listenHistory(ctx context.Context, client controlap
 			return err //nolint:wrapcheck // surfaced to the reconnect loop verbatim
 		}
 
-		w.handleHistoryEvent(ctx, client, evt)
+		if hc != nil {
+			hc.received.Store(true)
+		}
+
+		w.handleHistoryEvent(ctx, client, evt, hc)
 	}
 }
 
-func (w *AttributionWatcher) handleHistoryEvent(ctx context.Context, client controlapi.ControlClient, evt *controlapi.BuildHistoryEvent) {
+func (w *AttributionWatcher) handleHistoryEvent(ctx context.Context, client controlapi.ControlClient, evt *controlapi.BuildHistoryEvent, hc *historyConn) {
 	rec := evt.GetRecord()
 	if rec == nil {
 		return
@@ -733,6 +988,8 @@ func (w *AttributionWatcher) handleHistoryEvent(ctx context.Context, client cont
 	if ref == "" {
 		return
 	}
+
+	hc.markSeen(ref)
 
 	switch evt.GetType() {
 	case controlapi.BuildHistoryEventType_STARTED:

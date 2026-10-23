@@ -51,10 +51,10 @@ type BuildKitEgressAttach struct {
 
 // StartBuildKitEgressAttach loads an EBPFHandle, attaches it at every
 // path in paths, and starts a ringbuf reader that routes events from
-// BuildKit-bound cgroups (those LookupBuildKitBinding recognises) into
-// a shared recorder. When bucketInterval > 0 and report is non-nil, a
-// flusher goroutine sends accumulated violations to report on each
-// tick.
+// the watched cgroups into a shared recorder; events from cgroups with
+// no BuildKit binding are flagged build_unattributed. When
+// bucketInterval > 0 and report is non-nil, a flusher goroutine sends
+// accumulated violations to report on each tick.
 //
 // If paths is empty, returns (nil, nil) — the caller has opted out at
 // the cgroup level and no attach is performed.
@@ -112,16 +112,13 @@ func StartBuildKitEgressAttach(
 
 	stopRing, err := handle.StartRingbufReader(
 		ctx,
-		func(cgroupID uint64) *ViolationRecorder {
-			// Drop events from cgroups we don't recognise as BuildKit
-			// RUN-steps. The /sys/fs/cgroup/buildkit/ subtree may
-			// contain unrelated daemon traffic during early-boot — we
-			// only want events that the cgroup-join layer has bound
-			// to a session+vertex.
-			if _, ok := LookupBuildKitBinding(cgroupID); !ok {
-				return nil
-			}
-
+		func(_ uint64) *ViolationRecorder {
+			// Every event from the watched subtree is recorded. Events
+			// from cgroups the cgroup-join layer has not bound to a
+			// session+vertex are flagged build_unattributed when the
+			// bucket flushes, rather than dropped: an unbound RUN
+			// cgroup is exactly where a mis-join or a join race would
+			// hide egress.
 			return recorder
 		},
 		auditMode,
@@ -187,6 +184,8 @@ func (b *BuildKitEgressAttach) runFlusher(
 				continue
 			}
 
+			markUnattributed(violations)
+
 			stats := &EgressStats{
 				DNSActivity:   dns,
 				Violations:    violations,
@@ -200,6 +199,17 @@ func (b *BuildKitEgressAttach) runFlusher(
 				"dns_entries", len(dns),
 				"overflow", overflow,
 			)
+		}
+	}
+}
+
+// markUnattributed flags violations that carry no BuildKit binding
+// (neither a session/vertex nor an ambiguous candidate set).
+func markUnattributed(violations []Violation) {
+	for i := range violations {
+		v := &violations[i]
+		if v.BuildSessionRef == "" && !v.BuildAmbiguous {
+			v.BuildUnattributed = true
 		}
 	}
 }

@@ -29,6 +29,10 @@ func TestIntegrationPodCgroupAttach(t *testing.T) {
 		t.Skip("requires root")
 	}
 
+	if _, err := exec.LookPath("bpftool"); err != nil {
+		t.Skip("requires bpftool on PATH")
+	}
+
 	if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
 		t.Skip("requires cgroupv2 unified hierarchy")
 	}

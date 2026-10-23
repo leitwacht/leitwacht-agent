@@ -35,6 +35,7 @@ type dnspidProcessInfo struct {
 	BinaryPath [256]int8
 	ExecTs     uint64
 	CgroupId   uint64
+	ExecId     uint64
 }
 
 // Names of all BPF objects in the ELF.
@@ -94,6 +95,7 @@ type dnspidSpecs struct {
 type dnspidProgramSpecs struct {
 	DnsPidBprm       *ebpf.ProgramSpec `ebpf:"dns_pid_bprm"`
 	DnsPidExec       *ebpf.ProgramSpec `ebpf:"dns_pid_exec"`
+	DnsPidExit       *ebpf.ProgramSpec `ebpf:"dns_pid_exit"`
 	DnsPidSendmsg    *ebpf.ProgramSpec `ebpf:"dns_pid_sendmsg"`
 	DnsPidTcpConnect *ebpf.ProgramSpec `ebpf:"dns_pid_tcp_connect"`
 }
@@ -158,6 +160,7 @@ type dnspidVariables struct {
 type dnspidPrograms struct {
 	DnsPidBprm       *ebpf.Program `ebpf:"dns_pid_bprm"`
 	DnsPidExec       *ebpf.Program `ebpf:"dns_pid_exec"`
+	DnsPidExit       *ebpf.Program `ebpf:"dns_pid_exit"`
 	DnsPidSendmsg    *ebpf.Program `ebpf:"dns_pid_sendmsg"`
 	DnsPidTcpConnect *ebpf.Program `ebpf:"dns_pid_tcp_connect"`
 }
@@ -166,6 +169,7 @@ func (p *dnspidPrograms) Close() error {
 	return _DnspidClose(
 		p.DnsPidBprm,
 		p.DnsPidExec,
+		p.DnsPidExit,
 		p.DnsPidSendmsg,
 		p.DnsPidTcpConnect,
 	)

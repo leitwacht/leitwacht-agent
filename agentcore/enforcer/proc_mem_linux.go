@@ -80,6 +80,10 @@ func startProcMemReader(objs *procMemObjects, logger *slog.Logger, onEvent func(
 	})
 
 	wg.Go(func() {
+		monitorReserveFailures(done, "proc_mem", func() uint64 { return readReserveFailures(objs.ReserveFailures) }, logger, reserveFailureInterval)
+	})
+
+	wg.Go(func() {
 		for {
 			record, err := reader.Read()
 			if err != nil {
@@ -314,4 +318,15 @@ func (m *Manager) handleProcMemBPFEvent(evt procMemEventBPF) {
 	if m.OnProcMemEvent != nil {
 		m.OnProcMemEvent(event)
 	}
+}
+
+// ProcMemReserveFailures returns the number of proc_mem events lost
+// because the ring buffer was full (summed across CPUs).
+func (m *Manager) ProcMemReserveFailures() uint64 {
+	lsm, ok := m.procMemState.(*procMemLSMImpl)
+	if !ok || lsm.objs == nil {
+		return 0
+	}
+
+	return readReserveFailures(lsm.objs.ReserveFailures)
 }

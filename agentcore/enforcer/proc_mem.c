@@ -54,6 +54,14 @@ struct {
     __uint(max_entries, 64 * 1024);  /* 64KB */
 } proc_mem_events SEC(".maps");
 
+/* Count of ringbuf reserve failures (ring full): lost evidence. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} reserve_failures SEC(".maps");
+
 /* Force clang to emit BTF for proc_mem_event. Without a live reference, the
  * ringbuf-reserve path uses void* and BTF drops the struct — which blocks
  * the userspace struct-size self-check at load time. Concrete instance
@@ -134,6 +142,11 @@ int BPF_PROG(proc_mem_file_open, struct file *file)
         bpf_get_current_comm(&evt->comm, sizeof(evt->comm));
         __builtin_memcpy(&evt->path, buf, sizeof(evt->path));
         bpf_ringbuf_submit(evt, 0);
+    } else {
+        __u64 *fails = bpf_map_lookup_elem(&reserve_failures, &zero);
+
+        if (fails)
+            *fails += 1;
     }
 
     /* 7. Deny the open — unless this container is in observe-only

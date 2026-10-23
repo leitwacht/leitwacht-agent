@@ -90,6 +90,7 @@ type procMemMapSpecs struct {
 	KnownContainers *ebpf.MapSpec `ebpf:"known_containers"`
 	PathBuf         *ebpf.MapSpec `ebpf:"path_buf"`
 	ProcMemEvents   *ebpf.MapSpec `ebpf:"proc_mem_events"`
+	ReserveFailures *ebpf.MapSpec `ebpf:"reserve_failures"`
 }
 
 // procMemVariableSpecs contains global variables before they are loaded into the kernel.
@@ -122,6 +123,7 @@ type procMemMaps struct {
 	KnownContainers *ebpf.Map `ebpf:"known_containers"`
 	PathBuf         *ebpf.Map `ebpf:"path_buf"`
 	ProcMemEvents   *ebpf.Map `ebpf:"proc_mem_events"`
+	ReserveFailures *ebpf.Map `ebpf:"reserve_failures"`
 }
 
 func (m *procMemMaps) Close() error {
@@ -129,6 +131,7 @@ func (m *procMemMaps) Close() error {
 		m.KnownContainers,
 		m.PathBuf,
 		m.ProcMemEvents,
+		m.ReserveFailures,
 	)
 }
 

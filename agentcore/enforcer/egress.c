@@ -124,13 +124,28 @@ struct {
 } drop_dedup SEC(".maps");
 
 /* Operator-denied IPs. Value is the denying rule's priority; port=0
-   means deny all ports for that IP. */
+   means deny all ports for that IP.
+
+   Plain HASH, not an LRU: these entries (including the priority-0
+   sinkhole and CE deny_ips) are seeded once and never re-seeded, so
+   an LRU would silently evict a deny and turn it into an allow.
+   A full map makes the userspace Put fail with E2BIG instead. */
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct allow_key);
     __type(value, __u32);
     __uint(max_entries, 4096);
 } denied_ips SEC(".maps");
+
+/* Count of drop-event ringbuf reserve failures (ring full). Drop events
+   are evidence only; the verdict does not depend on them, but a full
+   ring loses them silently, so userspace reads this counter. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __type(key, __u32);
+    __type(value, __u64);
+    __uint(max_entries, 1);
+} reserve_failures SEC(".maps");
 
 /* Operator-allowed IPs — the static counterpart to allowed_ips, for
    destinations that have no DNS name at all (deploy targets, ClusterIPs,
@@ -170,7 +185,7 @@ struct {
 struct sock_owner {
     __u64 cgroup_id;
     __u32 pid;
-    __u32 _reserved;
+    __u32 exec_id32;   /* low 32 bits of task->self_exec_id at capture */
     char  comm[16];
     char  binary_path[BINARY_PATH_LEN];
 };
@@ -256,8 +271,14 @@ static __always_inline void emit_drop_event(struct __sk_buff *skb,
         return;
 
     struct drop_event *ev = bpf_ringbuf_reserve(&drop_events, sizeof(struct drop_event), 0);
-    if (!ev)
+    if (!ev) {
+        __u32 zero = 0;
+        __u64 *fails = bpf_map_lookup_elem(&reserve_failures, &zero);
+
+        if (fails)
+            *fails += 1;
         return;
+    }
 
     /* Ringbuf reserve returns uninitialised slot memory — zero the
      * whole struct so stale bytes from a prior event can't leak into
@@ -389,9 +410,21 @@ int egress_filter(struct __sk_buff *skb) {
 
     /* --- Hard blocks: checked BEFORE the allow map so DNS rebinding can't bypass them --- */
 
-    /* Cloud metadata: 169.254.169.254 — always block regardless of allow map.
-       Prevents DNS rebinding attacks (attacker domain resolving to metadata IP). */
-    if (dst_ip == bpf_htonl(0xA9FEA9FE))
+    /* Cloud metadata / workload-credential endpoints — always block
+       regardless of allow map. Prevents DNS rebinding attacks (attacker
+       domain resolving to one of these IPs):
+         169.254.169.254  AWS/GCP/Azure/etc. instance metadata
+         169.254.170.2    ECS task role credentials
+         169.254.170.23   EKS Pod Identity agent
+         100.100.100.200  Alibaba Cloud metadata
+         169.254.0.23     Tencent Cloud metadata
+       IPv6 (e.g. fd00:ec2::254) needs no entry: all non-loopback IPv6
+       is dropped above in block mode. */
+    if (dst_ip == bpf_htonl(0xA9FEA9FE) ||
+        dst_ip == bpf_htonl(0xA9FEAA02) ||
+        dst_ip == bpf_htonl(0xA9FEAA17) ||
+        dst_ip == bpf_htonl(0x646464C8) ||
+        dst_ip == bpf_htonl(0xA9FE0017))
         return apply_drop(skb, dst_ip, dst_port, protocol, DROP_REASON_POLICY);
 
     /* DoT: always block port 853 */
@@ -402,7 +435,8 @@ int egress_filter(struct __sk_buff *skb) {
     if ((dst_ip & bpf_htonl(0xFF000000)) == bpf_htonl(0x7F000000))
         return 1;
 
-    /* Link-local: 169.254.0.0/16 (metadata already caught above) */
+    /* Link-local: 169.254.0.0/16 (known metadata/credential endpoints
+       already caught above) */
     if ((dst_ip & bpf_htonl(0xFFFF0000)) == bpf_htonl(0xA9FE0000))
         return 1;
 

@@ -457,8 +457,26 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 	// reverse them. The sinkhole entry is netns-lifetime and was seeded
 	// once during initNetnsContext.
 	m.mu.Lock()
-	m.addJoinerIPRules(nctx, info.ContainerID, pol)
+	ruleErr := m.addJoinerIPRules(nctx, info.ContainerID, pol)
 	m.mu.Unlock()
+
+	if ruleErr != nil {
+		releaseSlot()
+
+		m.mu.Lock()
+		m.removeJoinerIPRules(nctx, info.ContainerID)
+
+		if created && netnsIno != 0 {
+			delete(m.netnsContexts, netnsIno)
+		}
+		m.mu.Unlock()
+
+		if created {
+			m.teardownNetnsContext(nctx)
+		}
+
+		return nil, ruleErr
+	}
 
 	if !created {
 		// Joiner-only: swap DNS proxy policy and flip eBPF mode if
@@ -901,7 +919,13 @@ func collectIPRules(pol *policy.ResolvedPolicy, log *slog.Logger) (deny, allow [
 //
 // The sinkhole IP is seeded once per netns by seedSinkholeDeny — it is
 // not owned by any joiner and survives joiner detach.
-func (m *Manager) addJoinerIPRules(nctx *NetnsContext, containerID string, pol *policy.ResolvedPolicy) {
+//
+// A deny entry that cannot be installed (denied_ips is a non-evicting
+// map, so a full map is the realistic cause) is returned as an error in
+// block mode: continuing would enforce a policy with a missing deny.
+func (m *Manager) addJoinerIPRules(nctx *NetnsContext, containerID string, pol *policy.ResolvedPolicy) error {
+	var denyErr error
+
 	if nctx.joinerDeny == nil {
 		nctx.joinerDeny = make(map[string][]ipRuleKey)
 	}
@@ -922,6 +946,10 @@ func (m *Manager) addJoinerIPRules(nctx *NetnsContext, containerID string, pol *
 
 		if err := nctx.ebpf.AddDeniedIP(ip, e.Key.Port, e.Prio); err != nil {
 			m.logger.Warn("add joiner deny", "container", containerID, "ip", e.Key.IP, "port", e.Key.Port, "error", err)
+
+			if denyErr == nil {
+				denyErr = fmt.Errorf("install deny rule %s:%d: %w", e.Key.IP, e.Key.Port, err)
+			}
 
 			continue
 		}
@@ -953,6 +981,12 @@ func (m *Manager) addJoinerIPRules(nctx *NetnsContext, containerID string, pol *
 	}
 
 	nctx.joinerAllow[containerID] = addedAllow
+
+	if denyErr != nil && pol.Action != policy.ActionAudit {
+		return denyErr
+	}
+
+	return nil
 }
 
 // removeJoinerIPRules reverses addJoinerIPRules. Idempotent: called on
@@ -991,15 +1025,17 @@ func (m *Manager) removeJoinerIPRules(nctx *NetnsContext, containerID string) {
 // proxy points blocked A responses; connect attempts to it get dropped
 // and tagged as sinkhole_hit. Owned by the netns lifetime, not by any
 // joiner — survives sibling detach.
-func (m *Manager) seedSinkholeDeny(handle EBPFHandle) {
+func (m *Manager) seedSinkholeDeny(handle EBPFHandle) error {
 	sinkIP := net.ParseIP(SinkholeIPv4)
 	if sinkIP == nil {
-		return
+		return nil
 	}
 
 	if err := handle.AddDeniedIP(sinkIP, 0, policy.SystemRulePriority); err != nil {
-		m.logger.Warn("seed sinkhole deny", "error", err)
+		return fmt.Errorf("seed sinkhole deny: %w", err)
 	}
+
+	return nil
 }
 
 //nolint:funlen // sequential setup + per-step timings, splitting obscures the rollback chain
@@ -1029,7 +1065,15 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 	// joiner-owned. Joiner-specific deny IPs (including the creator's
 	// own) are installed separately via addJoinerIPRules so Detach can
 	// reverse them.
-	m.seedSinkholeDeny(ebpfHandle)
+	if sinkErr := m.seedSinkholeDeny(ebpfHandle); sinkErr != nil {
+		m.logger.Warn("seed sinkhole deny", "error", sinkErr)
+
+		if !auditMode {
+			_ = ebpfHandle.Close()
+
+			return sinkErr
+		}
+	}
 
 	// Step 2: Bind sockets inside the container netns.
 	stepStart = time.Now()

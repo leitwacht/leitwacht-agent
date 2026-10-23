@@ -351,7 +351,7 @@ func wireCredwatchKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *
 		_ = sink.ReportAdvisory(context.Background(), &advisory.Advisory{
 			ContainerID: ev.ContainerID,
 			Kind:        advisory.KindCredFileOpen,
-			Message:     fmt.Sprintf("credential file access detected: pid=%d comm=%q path=%q", ev.PID, ev.Comm, ev.Path),
+			Message:     fmt.Sprintf("credential file access detected: pid=%d comm=%q path=%q reason=%s", ev.PID, ev.Comm, ev.Path, ev.Reason),
 			ActionTaken: action,
 		})
 		if !ev.ObserveOnly {

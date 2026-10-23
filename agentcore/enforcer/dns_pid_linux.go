@@ -33,9 +33,9 @@ const (
 // u64 netns_cookie (8) + u16 src_port (2) + 6B padding = 16B.
 const dnsAttrKeySize = 16
 
-// processInfoSize = binary_path(256) + exec_ts(8) + cgroup_id(8) = 272.
+// processInfoSize = binary_path(256) + exec_ts(8) + cgroup_id(8) + exec_id(8) = 280.
 // Must match struct process_info in dns_pid.c and processInfoEntry below.
-const processInfoSize = binaryPathLen + 8 + 8
+const processInfoSize = binaryPathLen + 8 + 8 + 8
 
 // verifyDnspidBytecode asserts that the three structs this file decodes
 // via byte offsets still have the sizes the userspace code assumes. See
@@ -80,12 +80,13 @@ func encodeDNSAttrKey(netnsCookie uint64, srcPort uint16) [dnsAttrKeySize]byte {
 	return key
 }
 
-// processInfoEntry matches struct process_info in dns_pid.c (packed 272 B):
-// binary_path(256) + exec_ts(8) + cgroup_id(8).
+// processInfoEntry matches struct process_info in dns_pid.c (packed 280 B):
+// binary_path(256) + exec_ts(8) + cgroup_id(8) + exec_id(8).
 type processInfoEntry struct {
 	BinaryPath [binaryPathLen]byte
 	ExecTs     uint64
 	CgroupID   uint64
+	ExecID     uint64
 }
 
 // DNSPIDTracker populates src_port → (pid, comm, parent_comm, cgroup_id)
@@ -169,6 +170,19 @@ func NewDNSPIDTracker(logger *slog.Logger) (*DNSPIDTracker, error) {
 	default:
 		logger.Warn("dns_pid sched_process_exec tracepoint failed and LSM is unavailable — binary_path attribution will be empty",
 			"error", execErr)
+	}
+
+	// Drop process_info entries on process exit so a recycled pid cannot
+	// inherit a previous process's binary_path. Best-effort: without it
+	// the map still works, bounded by LRU, with the original staleness
+	// risk.
+	if objs.DnsPidExit != nil {
+		exit, exitErr := link.Tracepoint("sched", "sched_process_exit", objs.DnsPidExit, nil)
+		if exitErr != nil {
+			logger.Debug("dns_pid sched_process_exit tracepoint unavailable", "error", exitErr)
+		} else {
+			tracker.links = append(tracker.links, exit)
+		}
 	}
 
 	// Seed process_info for pre-existing processes. The path is the
@@ -255,6 +269,7 @@ func loadWithoutLSM(objs *dnspidObjects) error {
 	objs.DnsPidSendmsg = coll.Programs["dns_pid_sendmsg"]
 	objs.DnsPidTcpConnect = coll.Programs["dns_pid_tcp_connect"]
 	objs.DnsPidExec = coll.Programs["dns_pid_exec"]
+	objs.DnsPidExit = coll.Programs["dns_pid_exit"]
 	objs.DnsKnownCgroups = coll.Maps["dns_known_cgroups"]
 	objs.DnsPidAttribution = coll.Maps["dns_pid_attribution"]
 	objs.ProcessInfo = coll.Maps["process_info"]

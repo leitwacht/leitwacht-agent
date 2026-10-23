@@ -249,13 +249,33 @@ seeds inherit that fqdn rule's index.
 
 Two things sit outside the ordering by design:
 
-- **Hard blocks** — cloud metadata (`169.254.169.254`), DoT
-  (port 853), and the loopback / link-local carve-outs. These are
-  invariants, not policy; no rule ordering can reach them.
+- **Hard blocks** — cloud metadata and workload-credential
+  endpoints (`169.254.169.254`, the ECS task-role endpoint
+  `169.254.170.2`, the EKS Pod Identity endpoint `169.254.170.23` and
+  Alibaba's `100.100.100.200` and Tencent's `169.254.0.23`), DoT (port 853), and the loopback /
+  link-local carve-outs. These are invariants, not policy; no rule
+  ordering can reach them. IPv6 metadata addresses (for example
+  `fd00:ec2::254`) need no entry of their own: in block mode all
+  non-loopback IPv6 is dropped.
 - **Trusted CIDRs** (`TRUSTED_CIDRS`, the Docker bridge / pod
   network) hold no position in any rule list, so they are consulted
   only after every rule has missed. An explicit deny rule still
   overrides node-level trust.
+
+**Known exposure — link-local.** Apart from the endpoints listed
+above, the rest of `169.254.0.0/16` is allowed before any policy is
+evaluated (it carries node-local services such as NodeLocal DNS), and
+deny rules cannot reach it. A platform that serves credentials or
+metadata from another link-local address (for example GKE's
+`169.254.169.252` metadata-server proxy, which is not blocked here) is
+therefore not covered: block it at the network layer, or patch
+`egress.c`'s hard-block list and rebuild.
+
+**Allow keys carry no protocol.** Entries in the allow maps are keyed
+by `{ip, port}` only. A rule that allows `tcp/443` therefore also
+permits `udp/443` (QUIC) to the same address. Narrowing this would
+need the protocol added to the map key; it is intentionally unchanged.
+
 
 `cidr` allow rules must name a single host (a bare IPv4 address or
 `/32`) — the allow map is an exact-match hash. Wider prefixes are
@@ -338,3 +358,31 @@ socket stamped with the agent's `SO_MARK`.
   attributed to a known container by cgroup; with no attribution (or an
   unknown cgroup) the agent takes no kill action rather than guessing
   among sibling containers.
+
+## Credential-file watch: scope and residual gaps
+
+`credwatch` denies (or, for observe-only containers, reports) opens of
+regular files whose resolved path ends in a watched suffix. The path is
+resolved into a 512-byte buffer and only its tail is matched. If the
+path still cannot be resolved, a watched `(parent directory, file name)`
+pair decides; anything else is let through so generic names such as
+`config` do not kill unrelated builds.
+
+`path_rename` and `path_link` close the move/hard-link bypass for a
+watched regular file (matched on the same `(parent, name)` pair, also for
+the second operand of `RENAME_EXCHANGE`) and for directories named after
+the immediate parent of a watched suffix (`.ssh`, `.aws`, `.kube`, ...).
+Each event carries a reason: `open`, `rename`, `link` or `dpath_fail`.
+
+Residual gaps:
+
+- Generic parent directories (`.config`, `secrets`, `rancher`, `etc`,
+  the home directory, ...) are deliberately not protected against being
+  renamed, and only the immediate parent of a watched suffix is.
+- Renaming or linking a file *onto* a watched name is allowed; only the
+  source is checked.
+- Suffixes are matched on names; bind mounts and files reached through
+  a different mount namespace layout are matched on the path as seen by
+  the opening process.
+- Rename/link hooks need `CONFIG_SECURITY_PATH`; without it credwatch
+  runs with the `file_open` check only.

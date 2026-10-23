@@ -39,9 +39,9 @@ variables:
   # the current digest, then bump the @sha256 here. Bump the human-
   # readable :<tag> alongside so the file still tells you what version
   # you're on at a glance.
-  GO_VERSION: "1.27.1"
-  GO_IMAGE: "golang:1.27.1@sha256:e0174e51e81218523251d85d248a90d24c3d5e81543b4f07a5d66229397db190"
-  GO_BOOKWORM_IMAGE: "golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195"
+  GO_VERSION: "1.27.3"
+  GO_IMAGE: "golang:1.27.3@sha256:f20d83a83e18dbd2a4714b8ffd4b30b287b6243962dd75608e86abcc63ba4efc"
+  GO_BOOKWORM_IMAGE: "golang:1.27.3-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5"
   ALPINE_IMAGE: "alpine:3.21@sha256:48b0309ca019d89d40f670aa1bc06e426dc0931948452e8491e3d65087abc07d"
   CRANE_IMAGE: "gcr.io/go-containerregistry/crane:v0.20.3@sha256:fc86bcad43a000c2a1ca926a1e167db26c053cebc3fa5d14285c72773fb8c11d"
   REGISTRY: "${CI_REGISTRY_IMAGE}"

@@ -41,6 +41,7 @@ type Config struct {
 	EventBuffer        int           // size of the watcher's event channel; back-pressures containerd subscriptions when full
 	NetnsGrace         time.Duration // how long a netns context survives after its last container detaches
 	FreezeTimeout      time.Duration // pre-attach container freeze budget; 0 disables the freeze
+	FreezeStateDir     string        // where freeze markers are persisted for crash recovery; empty = built-in default
 	BucketInterval     time.Duration
 
 	// Sinks.
@@ -209,6 +210,7 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	c.FreezeTimeout = freeze
+	c.FreezeStateDir = os.Getenv("LEITWACHT_CE_FREEZE_STATE_DIR")
 
 	wto, err := envDuration("LEITWACHT_CE_WEBHOOK_TIMEOUT", 5*time.Second)
 	if err != nil {

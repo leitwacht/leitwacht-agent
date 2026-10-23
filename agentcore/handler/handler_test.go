@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -96,8 +99,9 @@ type fakeLink struct{}
 func (fakeLink) Close() error { return nil }
 
 type fakeWatcher struct {
-	mu     sync.Mutex
-	killed []string
+	mu      sync.Mutex
+	killed  []string
+	killErr error
 }
 
 func (w *fakeWatcher) Watch(context.Context) <-chan watcher.ContainerEvent { return nil }
@@ -113,7 +117,7 @@ func (w *fakeWatcher) KillContainer(_ context.Context, id string) error {
 
 	w.killed = append(w.killed, id)
 
-	return nil
+	return w.killErr
 }
 
 func (w *fakeWatcher) killCount() int {
@@ -195,14 +199,15 @@ func newRig(t *testing.T, action string, loadErr error, frozenAtOnce bool, maxCo
 
 	return &rig{
 		h: &Handler{
-			Watcher:       w,
-			Policy:        fakePolicy{pol: pol},
-			Enforcer:      mgr,
-			ViolationSink: nopViolations{},
-			AdvisorySink:  adv,
-			Logger:        log,
-			DefaultAction: action,
-			FreezeTimeout: 200 * time.Millisecond,
+			Watcher:        w,
+			Policy:         fakePolicy{pol: pol},
+			Enforcer:       mgr,
+			ViolationSink:  nopViolations{},
+			AdvisorySink:   adv,
+			Logger:         log,
+			DefaultAction:  action,
+			FreezeTimeout:  200 * time.Millisecond,
+			FreezeStateDir: t.TempDir(),
 		},
 		w: w, adv: adv, plat: plat, dir: dir, mgr: mgr,
 	}
@@ -346,5 +351,49 @@ func TestHandlerShutdownThawsHeldContainers(t *testing.T) {
 
 	if got := readFreezeFile(t, r.dir); got != "0" {
 		t.Fatalf("cgroup.freeze = %q after Shutdown, want thawed", got)
+	}
+}
+
+func TestKillFallsBackToCgroupKill(t *testing.T) {
+	r := newRig(t, "block", errors.New("synthetic bpf load failure"), true, 8)
+	r.w.killErr = errors.New("runtime kill unavailable")
+	writeFile(t, filepath.Join(r.dir, "cgroup.kill"), "0")
+
+	r.h.HandleStart(context.Background(), startEvent("ctr-kill-fallback-01", 4110))
+
+	if got := r.adv.actions(); len(got) != 1 || got[0] != "killed" {
+		t.Fatalf("advisory actions = %v, want [killed] via cgroup.kill", got)
+	}
+
+	b, _ := os.ReadFile(filepath.Join(r.dir, "cgroup.kill"))
+	if strings.TrimSpace(string(b)) != "1" {
+		t.Fatalf("cgroup.kill = %q, want 1", b)
+	}
+}
+
+func TestKillFailureIsReportedAsKillFailed(t *testing.T) {
+	r := newRig(t, "block", errors.New("synthetic bpf load failure"), true, 8)
+	r.w.killErr = errors.New("runtime kill unavailable") // and no cgroup.kill file
+
+	r.h.HandleStart(context.Background(), startEvent("ctr-kill-failed-0001", 4111))
+
+	if got := r.adv.actions(); len(got) != 1 || got[0] != "kill_failed" {
+		t.Fatalf("advisory actions = %v, want [kill_failed]", got)
+	}
+}
+
+func TestContainerScopeIgnoresPathsOutsideCgroupMount(t *testing.T) {
+	h := &Handler{Logger: quietLogger()}
+
+	if got := h.containerScope(watcher.ContainerEvent{CgroupPath: "kubepods.slice:cri-containerd:abc"}); got != "" {
+		t.Fatalf("systemd-style spec path accepted: %q", got)
+	}
+
+	if got := h.containerScope(watcher.ContainerEvent{CgroupPath: "/etc/passwd"}); got != "" {
+		t.Fatalf("non-cgroup path accepted: %q", got)
+	}
+
+	if got := h.containerScope(watcher.ContainerEvent{CgroupPath: "/sys/fs/cgroup/system.slice/docker-x.scope/init"}); got != "/sys/fs/cgroup/system.slice/docker-x.scope" {
+		t.Fatalf("valid path = %q", got)
 	}
 }

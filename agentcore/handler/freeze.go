@@ -3,6 +3,8 @@ package handler
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -30,6 +32,12 @@ const (
 
 	freezePollMin = time.Millisecond
 	freezePollMax = 16 * time.Millisecond
+
+	// DefaultFreezeStateDir holds one marker per held container so a
+	// restarted agent can release what a crashed one left frozen. It must
+	// survive an agent process restart (tmpfs under /run does; on K8s mount
+	// it from the host).
+	DefaultFreezeStateDir = "/run/leitwacht/frozen"
 
 	// thawTimeout bounds the runtime-API unpause fallback, which runs on a
 	// fresh context because the handler's own may already be cancelled.
@@ -74,6 +82,15 @@ type Freezer struct {
 	// + freezeHoldSlack.
 	HoldLimit time.Duration
 
+	// StateDir is where freeze markers are persisted before a container is
+	// frozen. Empty means DefaultFreezeStateDir. Configurable for tests.
+	StateDir string
+
+	// Kill is invoked when a hard limit expires on a freeze whose
+	// KillOnExpire flag is set (block mode): a container whose enforcement
+	// was never confirmed must not simply be released. Nil means thaw only.
+	Kill func(containerID, cgroupPath string)
+
 	mu     sync.Mutex
 	active map[*Freeze]struct{}
 }
@@ -81,11 +98,17 @@ type Freezer struct {
 // Freeze is one held container. Thaw is idempotent and safe to call from
 // any goroutine.
 type Freeze struct {
-	f     *Freezer
-	id    string
-	thaw  func() error
-	once  sync.Once
-	timer atomic.Pointer[time.Timer] // set after construction; the timer callback may race the store
+	f      *Freezer
+	id     string
+	cgroup string // freeze target; empty for the runtime-pause fallback
+	marker string // persisted marker path; removed on Thaw
+	thaw   func() error
+
+	// KillOnExpire makes the hard-limit timer kill the container instead of
+	// only releasing it. The handler sets it for block-mode policies.
+	killOnExpire atomic.Bool
+	once         sync.Once
+	timer        atomic.Pointer[time.Timer] // set after construction; the timer callback may race the store
 }
 
 // Thaw releases the container. It is a no-op after the first call.
@@ -105,10 +128,22 @@ func (z *Freeze) Thaw() {
 			z.f.Logger.Error("thaw container failed", "container_id", truncID(z.id), "error", err)
 		}
 
+		if z.marker != "" {
+			_ = os.Remove(z.marker)
+		}
+
 		z.f.mu.Lock()
 		delete(z.f.active, z)
 		z.f.mu.Unlock()
 	})
+}
+
+// SetKillOnExpire selects what the hard-limit timer does: kill (true) or
+// only release (false). Nil-safe.
+func (z *Freeze) SetKillOnExpire(v bool) {
+	if z != nil {
+		z.killOnExpire.Store(v)
+	}
 }
 
 // ThawAll releases every container still held. Called on agent shutdown.
@@ -140,25 +175,35 @@ func (f *Freezer) Freeze(ctx context.Context, containerID, cgroupPath string, ti
 	}
 
 	var (
-		thaw func() error
-		err  error
+		thaw   func() error
+		err    error
+		marker string
+		target = cgroupPath
 	)
 
 	if cgroupPath != "" {
+		marker = f.writeMarker("cgroup", cgroupPath)
 		thaw, err = freezeCgroup(ctx, cgroupPath, timeout)
+
+		if err != nil {
+			f.removeMarker(marker)
+			marker = ""
+		}
 	} else {
 		err = ErrFreezeUnavailable
 	}
 
 	if errors.Is(err, ErrFreezeUnavailable) && f.Pauser != nil {
-		thaw, err = f.pauseContainer(ctx, containerID)
+		target = ""
+
+		thaw, marker, err = f.pauseContainerMarked(ctx, containerID)
 	}
 
 	if err != nil {
 		return nil, err
 	}
 
-	z := &Freeze{f: f, id: containerID, thaw: thaw}
+	z := &Freeze{f: f, id: containerID, cgroup: target, marker: marker, thaw: thaw}
 
 	hold := f.HoldLimit
 	if hold <= 0 {
@@ -174,19 +219,171 @@ func (f *Freezer) Freeze(ctx context.Context, containerID, cgroupPath string, ti
 	f.mu.Unlock()
 
 	z.timer.Store(time.AfterFunc(hold, func() {
-		f.Logger.Error("freeze hard limit reached, thawing container without enforcement confirmed",
-			"container_id", truncID(containerID), "hold", hold)
+		kill := z.killOnExpire.Load() && f.Kill != nil
+
+		f.Logger.Error("freeze hard limit reached without confirmed enforcement",
+			"container_id", truncID(containerID), "hold", hold, "kill", kill)
+
+		if kill {
+			f.Kill(containerID, target)
+		}
+
 		z.Thaw()
 	}))
 
 	return z, nil
 }
 
-// pauseContainer is the runtime-API fallback.
-func (f *Freezer) pauseContainer(ctx context.Context, containerID string) (func() error, error) {
+// FreezePause freezes through the runtime pause API only. Used when the
+// cgroup route failed in a way that does not mean the container is gone.
+func (f *Freezer) FreezePause(ctx context.Context, containerID string) (*Freeze, error) {
+	if f.Pauser == nil {
+		return nil, ErrFreezeUnavailable
+	}
+
+	thaw, marker, err := f.pauseContainerMarked(ctx, containerID)
+	if err != nil {
+		return nil, err
+	}
+
+	z := &Freeze{f: f, id: containerID, marker: marker, thaw: thaw}
+
+	f.mu.Lock()
+	if f.active == nil {
+		f.active = make(map[*Freeze]struct{})
+	}
+
+	f.active[z] = struct{}{}
+	f.mu.Unlock()
+
+	hold := f.HoldLimit
+	if hold <= 0 {
+		hold = handleStartTimeout + freezeHoldSlack
+	}
+
+	z.timer.Store(time.AfterFunc(hold, func() {
+		kill := z.killOnExpire.Load() && f.Kill != nil
+
+		f.Logger.Error("pause hard limit reached without confirmed enforcement",
+			"container_id", truncID(containerID), "hold", hold, "kill", kill)
+
+		if kill {
+			f.Kill(containerID, "")
+		}
+
+		z.Thaw()
+	}))
+
+	return z, nil
+}
+
+func (f *Freezer) stateDir() string {
+	if f.StateDir != "" {
+		return f.StateDir
+	}
+
+	return DefaultFreezeStateDir
+}
+
+// writeMarker persists "kind value" before the container is frozen, so a
+// restarted agent can release it. Returns the marker path, or "" when the
+// marker could not be written (logged: the freeze still proceeds, because
+// refusing would turn a /run problem into an outage).
+func (f *Freezer) writeMarker(kind, value string) string {
+	dir := f.stateDir()
+
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		f.Logger.Warn("freeze marker dir unavailable; a crash while frozen could not be recovered", "dir", dir, "error", err)
+
+		return ""
+	}
+
+	sum := sha256.Sum256([]byte(kind + ":" + value))
+	path := filepath.Join(dir, hex.EncodeToString(sum[:]))
+
+	if err := os.WriteFile(path, []byte(kind+" "+value+"\n"), 0o600); err != nil {
+		f.Logger.Warn("freeze marker write failed; a crash while frozen could not be recovered", "path", path, "error", err)
+
+		return ""
+	}
+
+	return path
+}
+
+func (f *Freezer) removeMarker(path string) {
+	if path != "" {
+		_ = os.Remove(path)
+	}
+}
+
+// RecoverFrozen releases every container a previous agent process left
+// frozen: it reads the persisted markers, thaws each cgroup that still
+// exists (or unpauses the container for the runtime fallback), and deletes
+// the markers. Call it at startup, before enumerating running containers.
+// Returns the number of markers processed.
+func (f *Freezer) RecoverFrozen(ctx context.Context) int {
+	entries, err := os.ReadDir(f.stateDir())
+	if err != nil {
+		return 0
+	}
+
+	n := 0
+
+	for _, e := range entries {
+		path := filepath.Join(f.stateDir(), e.Name())
+
+		b, readErr := os.ReadFile(path)
+		_ = os.Remove(path)
+
+		if readErr != nil {
+			continue
+		}
+
+		kind, value, ok := strings.Cut(strings.TrimSpace(string(b)), " ")
+		if !ok || value == "" {
+			continue
+		}
+
+		n++
+
+		switch kind {
+		case "cgroup":
+			if werr := writeCgroupFile(filepath.Join(value, "cgroup.freeze"), "0"); werr != nil && !errors.Is(werr, os.ErrNotExist) {
+				f.Logger.Error("recover: thaw cgroup failed", "cgroup", value, "error", werr)
+			} else {
+				f.Logger.Warn("recovered container left frozen by a previous agent process", "cgroup", value)
+			}
+		case "pause":
+			if f.Pauser == nil {
+				continue
+			}
+
+			uctx, cancel := context.WithTimeout(ctx, thawTimeout)
+			uerr := f.Pauser.UnpauseContainer(uctx, value)
+
+			cancel()
+
+			if uerr != nil {
+				f.Logger.Warn("recover: unpause failed (container may be gone)", "container_id", truncID(value), "error", uerr)
+			} else {
+				f.Logger.Warn("recovered container left paused by a previous agent process", "container_id", truncID(value))
+			}
+		}
+	}
+
+	return n
+}
+
+// pauseContainerMarked is the runtime-API fallback. The marker is written
+// before the pause so a crash between pause and thaw is recoverable.
+func (f *Freezer) pauseContainerMarked(ctx context.Context, containerID string) (func() error, string, error) {
+	marker := f.writeMarker("pause", containerID)
+
 	err := f.Pauser.PauseContainer(ctx, containerID)
 	if err != nil {
-		return nil, fmt.Errorf("pause container: %w", err)
+		f.removeMarker(marker)
+
+		return nil, "", fmt.Errorf("pause container: %w", err)
 	}
 
 	return func() error {
@@ -194,7 +391,7 @@ func (f *Freezer) pauseContainer(ctx context.Context, containerID string) (func(
 		defer cancel()
 
 		return f.Pauser.UnpauseContainer(uctx, containerID)
-	}, nil
+	}, marker, nil
 }
 
 // freezeCgroup writes cgroup.freeze and waits for cgroup.events to report

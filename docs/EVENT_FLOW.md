@@ -202,6 +202,7 @@ mid-flush and the final bucket is lost. Either lower
 | `LEITWACHT_CE_MAX_CONCURRENT` | 64      | `ErrMaxConcurrent` in logs                | OOMKilled at scale (rare)    |
 | `LEITWACHT_CE_NETNS_GRACE`    | 30s     | "torn down after grace period" warnings   | nctx leaks; many `deferredTeardown` sleepers under churn |
 | `LEITWACHT_CE_FREEZE_TIMEOUT` | 5s      | "pre-attach freeze failed" in logs         | `0` disables the freeze (job runs unfiltered until attach completes) |
+| `LEITWACHT_CE_FREEZE_STATE_DIR` | /run/leitwacht/frozen | n/a | Must survive an agent restart; used to thaw containers a crashed agent left frozen |
 | `LEITWACHT_CE_BUCKET_INTERVAL`| 5m      | Want fresher data in reports              | `DetachAll` shutdown wait too long for kubelet grace period |
 | `LEITWACHT_CE_DNS_UPSTREAM`   | (required) | n/a — no default, must be set explicitly | n/a |
 | `handleStartTimeout`          | 10s (constant) | Slow upstreams routinely time out  | n/a — bounds policy lookup + attach; the freeze has its own hard limit |
@@ -289,3 +290,17 @@ This means a domain-only rule set still catches IP-bypass attempts
 without any extra `deny_ips` configuration. See
 `agentcore/enforcer/integration_test.go::TestIntegrationBareIPBlocked`
 for the regression covering this case end-to-end.
+
+## Pre-attach freeze: operational notes
+
+- While a container is frozen (from its start event until attach
+  completes, typically tens to hundreds of ms) `exec` into it and
+  container health checks fail or time out. Do not alert on a single
+  failure at container start.
+- Freezes are not reference-counted per cgroup: a second freeze of the
+  same cgroup would share one marker and the first thaw would release
+  both. This is safe only because `HandleStart` events are dispatched
+  serially (see above); a future fan-out must refcount per cgroup.
+- A crashed agent cannot thaw what it froze. Markers under
+  `LEITWACHT_CE_FREEZE_STATE_DIR` are swept (and the containers thawed)
+  at the next start, before running containers are enumerated.

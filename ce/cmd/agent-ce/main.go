@@ -161,11 +161,11 @@ func main() {
 		DefaultAction:      cfg.DefaultAction,
 		UnknownProjectMode: unknownMode,
 		FreezeTimeout:      cfg.FreezeTimeout,
+		FreezeStateDir:     cfg.FreezeStateDir,
 	}
-	if cfg.FreezeTimeout == 0 {
-		// Handler treats 0 as "default"; the operator's 0 means off.
-		h.FreezeTimeout = -1
-	}
+	// The handler treats a zero FreezeTimeout as "default, enabled"; the
+	// operator's 0 means off.
+	h.DisableFreeze = cfg.FreezeTimeout == 0
 
 	wireCredwatchKill(mgr, w, multi, log)
 	emitCredwatchAdvisory(credwatchCfg, mgr, multi)
@@ -233,6 +233,13 @@ func main() {
 	if err := startMetricsServer(ctx, promReg, cfg.PromAddr, cfg.PromEnabled, log); err != nil {
 		log.Error("metrics server bind failed", "addr", cfg.PromAddr, "error", err)
 		os.Exit(1)
+	}
+
+	// Release anything a previous agent process left frozen BEFORE
+	// enumerating running containers: a frozen or paused workload is not
+	// reported as running and would stay stopped forever.
+	if n := h.RecoverFrozen(ctx); n > 0 {
+		log.Warn("released containers left frozen by a previous agent process", "count", n)
 	}
 
 	recoverRunning(ctx, w, h, log)

@@ -116,7 +116,7 @@ func TestIntegrationFreezerHoldsRealContainer(t *testing.T) {
 		t.Fatal("busy container shows no cpu usage before the freeze")
 	}
 
-	f := &Freezer{Logger: quietLogger()}
+	f := &Freezer{Logger: quietLogger(), StateDir: t.TempDir()}
 
 	z, err := f.Freeze(context.Background(), name, cg, 5*time.Second)
 	if err != nil {
@@ -200,6 +200,7 @@ func TestIntegrationBlockModeKillsOnAttachFailure(t *testing.T) {
 	h := &Handler{
 		Watcher: &podmanKiller{}, Policy: fakePolicy{pol: pol}, Enforcer: mgr,
 		ViolationSink: nopViolations{}, AdvisorySink: adv, Logger: log, DefaultAction: "block",
+		FreezeStateDir: t.TempDir(),
 	}
 
 	h.HandleStart(context.Background(), watcher.ContainerEvent{

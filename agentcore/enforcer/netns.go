@@ -28,10 +28,19 @@ func inNetns(pid int, fn func() error) error {
 // inNetnsHandle is inNetns for an already-open netns handle, so the target
 // namespace stays reachable after every process that was in it has exited.
 //
-// If the original namespace cannot be restored the thread is left locked, so
-// the Go runtime discards it when the goroutine returns instead of reusing a
-// thread that is stuck in the wrong namespace.
+// The work runs in a dedicated goroutine whose result is passed back on a
+// channel. If the original namespace cannot be restored that goroutine exits
+// while still locked to its thread, so the Go runtime discards the thread at
+// once; the caller never continues on a thread stuck in the job netns.
 func inNetnsHandle(target netns.NsHandle, fn func() error) error {
+	done := make(chan error, 1)
+
+	go func() { done <- inNetnsHandleLocked(target, fn) }()
+
+	return <-done
+}
+
+func inNetnsHandleLocked(target netns.NsHandle, fn func() error) error {
 	runtime.LockOSThread()
 
 	origNs, err := netns.Get()

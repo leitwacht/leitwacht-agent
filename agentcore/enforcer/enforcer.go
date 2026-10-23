@@ -1108,6 +1108,10 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 	if err != nil {
 		nctx.dnsProxy.Stop()
 
+		if nctx.upstreamDialer != nil {
+			_ = nctx.upstreamDialer.Close()
+		}
+
 		_ = m.platform.RemoveDNSRedirect(pid)
 		_ = ebpfHandle.Close()
 

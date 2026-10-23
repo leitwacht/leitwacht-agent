@@ -102,6 +102,7 @@ type fakeWatcher struct {
 	mu      sync.Mutex
 	killed  []string
 	killErr error
+	runtime string
 }
 
 func (w *fakeWatcher) Watch(context.Context) <-chan watcher.ContainerEvent { return nil }
@@ -109,7 +110,16 @@ func (w *fakeWatcher) RecoverRunning(context.Context) ([]watcher.ContainerEvent,
 	return nil, nil
 }
 func (w *fakeWatcher) ChannelDepth() int { return 0 }
-func (w *fakeWatcher) Close() error      { return nil }
+
+// Runtime defaults to the Docker API runtime, the only one that freezes.
+func (w *fakeWatcher) Runtime() string {
+	if w.runtime != "" {
+		return w.runtime
+	}
+
+	return watcher.RuntimeDocker
+}
+func (w *fakeWatcher) Close() error { return nil }
 
 func (w *fakeWatcher) KillContainer(_ context.Context, id string) error {
 	w.mu.Lock()
@@ -397,3 +407,47 @@ func TestContainerScopeIgnoresPathsOutsideCgroupMount(t *testing.T) {
 		t.Fatalf("valid path = %q", got)
 	}
 }
+
+// TestHandleStartNeverFreezesContainerd: K8s (containerd/CRI) events are
+// gated by leitwacht-initc, never frozen, whatever else is true.
+func TestHandleStartNeverFreezesContainerd(t *testing.T) {
+	r := newRig(t, "block", nil, true, 8)
+	r.w.runtime = watcher.RuntimeContainerd
+
+	r.h.HandleStart(context.Background(), startEvent("ctr-k8s-no-freeze-001", 4120))
+
+	if r.plat.freezeAtLoad != "0" {
+		t.Fatalf("cgroup.freeze = %q during attach on a containerd event, want untouched 0", r.plat.freezeAtLoad)
+	}
+
+	if !r.mgr.IsEnforced("ctr-k8s-no-freeze-001") {
+		t.Fatal("containerd container should still be attached")
+	}
+}
+
+// A watcher that does not identify its runtime is not frozen.
+func TestHandleStartUnknownRuntimeNotFrozen(t *testing.T) {
+	r := newRig(t, "block", nil, true, 8)
+	r.h.Watcher = unnamedWatcher{r.w}
+
+	r.h.HandleStart(context.Background(), startEvent("ctr-unnamed-0000001", 4121))
+
+	if r.plat.freezeAtLoad != "0" {
+		t.Fatalf("cgroup.freeze = %q, want untouched for an unidentified runtime", r.plat.freezeAtLoad)
+	}
+}
+
+// unnamedWatcher hides the Runtime method of the wrapped watcher.
+type unnamedWatcher struct{ w *fakeWatcher }
+
+func (u unnamedWatcher) Watch(ctx context.Context) <-chan watcher.ContainerEvent {
+	return u.w.Watch(ctx)
+}
+func (u unnamedWatcher) RecoverRunning(ctx context.Context) ([]watcher.ContainerEvent, error) {
+	return u.w.RecoverRunning(ctx)
+}
+func (u unnamedWatcher) KillContainer(ctx context.Context, id string) error {
+	return u.w.KillContainer(ctx, id)
+}
+func (u unnamedWatcher) ChannelDepth() int { return 0 }
+func (u unnamedWatcher) Close() error      { return nil }

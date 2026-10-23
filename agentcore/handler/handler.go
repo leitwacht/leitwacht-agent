@@ -113,7 +113,10 @@ type Handler struct {
 	UnknownProjectMode UnknownProjectMode
 
 	// FreezeTimeout bounds how long HandleStart waits for the container's
-	// cgroup to report frozen. BEHAVIOUR CHANGE: the zero value means
+	// cgroup to report frozen. The freeze applies ONLY to the Docker API
+	// runtime (Docker, and Podman through its Docker-compatible socket);
+	// containerd/CRI (Kubernetes) events are never frozen, since K8s relies
+	// on the leitwacht-initc pre-job gate. BEHAVIOUR CHANGE: the zero value means
 	// DefaultFreezeTimeout (5s) with the freeze ENABLED, so a Handler
 	// constructed without this field now freezes every container it
 	// attaches. To turn the freeze off set DisableFreeze (or a negative
@@ -242,6 +245,14 @@ func (h *Handler) containerScope(ev watcher.ContainerEvent) string {
 
 const cgroupMount = "/sys/fs/cgroup"
 
+// freezeRuntime reports whether the Watcher's runtime is one the pre-attach
+// freeze applies to: the Docker API (including Podman's compatible API).
+func (h *Handler) freezeRuntime() bool {
+	rn, ok := h.Watcher.(watcher.RuntimeNamer)
+
+	return ok && rn.Runtime() == watcher.RuntimeDocker
+}
+
 // freezeBeforeAttach stops the container until enforcement is attached.
 // It returns a nil *Freeze (whose Thaw is a no-op) when no freeze is
 // needed or possible, and an error only when a freeze was attempted and
@@ -253,14 +264,13 @@ func (h *Handler) freezeBeforeAttach(ctx context.Context, ev watcher.ContainerEv
 		return nil, nil //nolint:nilnil // nil Freeze is a valid no-op handle
 	}
 
-	// K8s: no freeze when the sandbox start event has already attached
-	// egress at the pod cgroup. The netns may still be in its audit-all
-	// placeholder mode at that point; the K8s pre-job gate is the
-	// leitwacht-initc init container (it holds the job entrypoint until the
-	// DNS proxy reports attached), not a freeze.
-	if h.Enforcer != nil && h.Enforcer.PodAttachedForPID(ev.PID) {
-		h.Logger.Debug("pod-level attach active, skipping pre-attach freeze (K8s relies on initc)", "container_id", truncID(ev.ContainerID))
-
+	// Freeze applies to the Docker API runtime only (Docker, and Podman via
+	// its Docker-compatible socket). It is never applied to containerd/CRI
+	// (Kubernetes) events, whatever the pod-attach state: K8s pods are
+	// gated by the leitwacht-initc init container, which holds entrypoints
+	// until the DNS proxy reports the netns enforcing. A watcher that does
+	// not identify its runtime is treated as non-freezable.
+	if !h.freezeRuntime() {
 		return nil, nil //nolint:nilnil // nil Freeze is a valid no-op handle
 	}
 
@@ -315,8 +325,8 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 		"job_id", ev.JobID,
 	)
 
-	// Close the pre-attach window first: on Docker, Podman and plain
-	// containerd there is no pod sandbox, so without a freeze the job runs
+	// Close the pre-attach window first. Docker and Podman only (see
+	// freezeBeforeAttach; never containerd/K8s): there is no pod sandbox, so without a freeze the job runs
 	// with unfiltered egress and no DNS redirect until policy lookup, eBPF
 	// load, nftables setup and cgroup attach finish. The deferred Thaw is
 	// the safety net for every early return below.
@@ -332,7 +342,10 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 	// agent derives the parent pod cgroup and attaches the cgroup_skb
 	// program once at that level. Every container that subsequently joins
 	// the pod (init, helper, build) is filtered automatically; the build
-	// container's first packet hits an already-attached program. The
+	// container's first packet hits an already-attached program, which
+	// runs the audit-all placeholder until this container's policy joins:
+	// the leitwacht-initc gate (not a freeze) holds entrypoints until the
+	// netns is reconciled to that policy (see Manager.Attach). The
 	// per-container AttachCgroup call below is skipped when the
 	// NetnsContext is podAttached, and stays as the fallback path for
 	// Docker/Podman/plain-containerd shapes that have no pod cgroup.

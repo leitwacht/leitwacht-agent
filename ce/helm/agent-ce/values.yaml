@@ -127,8 +127,8 @@ eventBuffer: 64
 # "netns context torn down after grace period" warnings paired with
 # missed-attach failures.
 netnsGrace: 30s
-# Pre-attach freeze. On Docker/Podman/plain containerd (no K8s pod sandbox)
-# a container is frozen (cgroup v2 cgroup.freeze, runtime pause as fallback)
+# Pre-attach freeze (Docker/Podman runtime only; never on containerd/K8s,
+# which uses the leitwacht-initc gate). A container is frozen (cgroup v2 cgroup.freeze, runtime pause as fallback)
 # from its start event until egress enforcement is attached, so it cannot
 # open connections in the gap. This is the budget to confirm the freeze; a
 # container that cannot be held or attached is killed in block mode and

@@ -258,6 +258,12 @@ func (w *Watcher) KillContainer(ctx context.Context, containerID string) error {
 	return nil
 }
 
+// Runtime identifies this watcher as the Docker-API one. Podman served
+// through its Docker-compatible socket is configured as the "docker"
+// runtime and takes this path too; it is the only runtime whose containers
+// the handler freezes before attach.
+func (w *Watcher) Runtime() string { return RuntimeDocker }
+
 // PauseContainer freezes every process in the container via the runtime's
 // pause API. Fallback for hosts where the cgroup v2 freezer is not usable.
 func (w *Watcher) PauseContainer(ctx context.Context, containerID string) error {

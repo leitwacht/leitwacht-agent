@@ -293,6 +293,12 @@ for the regression covering this case end-to-end.
 
 ## Pre-attach freeze: operational notes
 
+- **Scope: Docker and Podman only.** The freeze is applied only to
+  events from the Docker-API watcher (Podman is run through its
+  Docker-compatible socket with `LEITWACHT_CE_CONTAINER_RUNTIME=docker`).
+  It is never applied to containerd/CRI (Kubernetes) events. K8s jobs
+  are gated by the `leitwacht-initc` init container instead; see below.
+
 - While a container is frozen (from its start event until attach
   completes, typically tens to hundreds of ms) `exec` into it and
   container health checks fail or time out. Do not alert on a single
@@ -304,3 +310,23 @@ for the regression covering this case end-to-end.
 - A crashed agent cannot thaw what it froze. Markers under
   `LEITWACHT_CE_FREEZE_STATE_DIR` are swept (and the containers thawed)
   at the next start, before running containers are enumerated.
+
+## Kubernetes: the leitwacht-initc gate
+
+The pod-sandbox event attaches egress at the pod cgroup with an
+**audit-all placeholder** policy. The reserved
+`_leitwacht.attached.local` TXT "attached" answer, which
+`leitwacht-initc` polls before letting the job's containers start, is
+therefore **not** armed by the pod-level attach. It is armed by the first
+container `Attach`, after the netns has been reconciled to the strictest
+attached policy (so a block-mode job's init container is released only
+once block mode is in force), and promptly for passive (non-enrolled),
+audit and allow-mode policies. A sibling prepared on a pod-attached netns
+runs only the placeholder and does not arm it.
+
+`leitwacht-initc` exits 1 if the signal is not seen within its deadline
+(`LEITWACHT_INIT_DEADLINE`, default 20s), so the job **fails closed**.
+This requires a container carrying the job's identity
+(`CI_PROJECT_PATH`) to start, and be attached, before or while the init
+container runs; if the init container itself is not such a container,
+size the deadline accordingly or the job will time out.

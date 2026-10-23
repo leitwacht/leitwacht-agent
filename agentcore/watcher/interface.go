@@ -24,3 +24,18 @@ type ContainerWatcher interface {
 	// Close releases the underlying client connection.
 	Close() error
 }
+
+// Runtime names returned by RuntimeNamer.
+const (
+	// RuntimeDocker covers the Docker API and Podman's Docker-compatible API.
+	RuntimeDocker = "docker"
+	// RuntimeContainerd covers containerd/CRI (Kubernetes).
+	RuntimeContainerd = "containerd"
+)
+
+// RuntimeNamer is implemented by watchers that identify their runtime. The
+// handler uses it to decide, explicitly, whether the pre-attach freeze
+// applies (Docker/Podman only).
+type RuntimeNamer interface {
+	Runtime() string
+}

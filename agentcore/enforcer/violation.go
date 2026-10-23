@@ -71,11 +71,14 @@ type DNSActivityEntry struct {
 	QueryType   string   `json:"query_type"` // "A", "AAAA", "TXT", "CNAME", "MX", ...
 	QueryCount  int64    `json:"query_count"`
 	ResolvedIPs []string `json:"resolved_ips"` //nolint:tagliatelle // IPs is a well-known abbreviation
-	Action      string   `json:"action"`       // dns_allowed, dns_blocked, dns_observed, dns_denied
-	PID         uint32   `json:"pid,omitempty"`
-	Comm        string   `json:"comm,omitempty"`
-	ParentComm  string   `json:"parent_comm,omitempty"`
-	BinaryPath  string   `json:"binary_path,omitempty"`
+	// ResolvedIPsDropped counts resolved-IP sightings not recorded in
+	// ResolvedIPs because the per-entry cap was reached.
+	ResolvedIPsDropped int64  `json:"resolved_ips_dropped,omitempty"` //nolint:tagliatelle // IPs is a well-known abbreviation
+	Action             string `json:"action"`                         // dns_allowed, dns_blocked, dns_observed, dns_denied
+	PID                uint32 `json:"pid,omitempty"`
+	Comm               string `json:"comm,omitempty"`
+	ParentComm         string `json:"parent_comm,omitempty"`
+	BinaryPath         string `json:"binary_path,omitempty"`
 	// EnvNames mirrors Violation.EnvNames: env-var names (never values)
 	// for the PID that issued this query. Populated only when the
 	// recorder has an enricher configured.
@@ -96,7 +99,20 @@ const (
 	maxViolationsPerContainer = 1000
 	maxViolationsPerBucket    = 100
 	maxDNSEntriesPerContainer = 10000
+	// dnsEnforcementHeadroom is carved out of maxDNSEntriesPerContainer for
+	// blocked/denied entries: allowed/observed names can fill at most
+	// (max - headroom) slots, so a job resolving thousands of allowed names
+	// can never crowd out the evidence of its blocked ones.
+	dnsEnforcementHeadroom = 1000
+	// maxResolvedIPsPerEntry caps the distinct IPs kept per DNS entry.
+	maxResolvedIPsPerEntry = 64
 )
+
+// isEnforcementDNSAction reports whether a DNS action is a block/deny event
+// (as opposed to allowed/observed), which gets reserved capacity.
+func isEnforcementDNSAction(action string) bool {
+	return action == "dns_blocked" || action == "dns_denied"
+}
 
 // ViolationRecorder collects violations and DNS activity for a single container.
 // Bare-IP packet violations are reconciled against dnsCache at pre-flush
@@ -114,6 +130,13 @@ type ViolationRecorder struct {
 	mu          sync.Mutex
 	violations  []Violation
 	dnsActivity map[dnsKey]*DNSActivityEntry
+	// dnsIPSets mirrors each entry's ResolvedIPs for O(1) dedup.
+	dnsIPSets map[dnsKey]map[string]struct{}
+	// dnsAllowedEntries counts non-enforcement entries in dnsActivity.
+	dnsAllowedEntries int
+	// dnsOverflow counts DNS (domain, qtype) entries dropped at the cap
+	// this bucket; folded into the overflow count at SnapshotAndReset.
+	dnsOverflow int64
 	capped      bool
 	capCount    int64 // count of violations after cap
 	bucketMode  bool  // when true, uses maxViolationsPerBucket instead of maxViolationsPerContainer
@@ -145,6 +168,7 @@ type ViolationRecorder struct {
 func NewViolationRecorder(dnsCache *DNSCache) *ViolationRecorder {
 	return &ViolationRecorder{
 		dnsActivity: make(map[dnsKey]*DNSActivityEntry),
+		dnsIPSets:   make(map[dnsKey]map[string]struct{}),
 		dnsCache:    dnsCache,
 	}
 }
@@ -215,8 +239,19 @@ func (r *ViolationRecorder) RecordDNS(domain, qtype, action string, ips []string
 
 	entry, ok := r.dnsActivity[key]
 	if !ok {
-		if len(r.dnsActivity) >= maxDNSEntriesPerContainer {
-			return // cap reached, stop tracking new (domain, qtype) pairs
+		enforcement := isEnforcementDNSAction(action)
+
+		if len(r.dnsActivity) >= maxDNSEntriesPerContainer ||
+			(!enforcement && r.dnsAllowedEntries >= maxDNSEntriesPerContainer-dnsEnforcementHeadroom) {
+			// Cap reached: stop tracking new (domain, qtype) pairs, but
+			// count them so the loss is visible in the report.
+			r.dnsOverflow++
+
+			return
+		}
+
+		if !enforcement {
+			r.dnsAllowedEntries++
 		}
 
 		entry = &DNSActivityEntry{
@@ -236,18 +271,26 @@ func (r *ViolationRecorder) RecordDNS(domain, qtype, action string, ips []string
 	entry.QueryCount++
 	entry.LastSeen = now
 
-	// Merge new IPs into the entry's resolved set.
-	seen := make(map[string]bool, len(entry.ResolvedIPs))
-
-	for _, ip := range entry.ResolvedIPs {
-		seen[ip] = true
+	// Merge new IPs into the entry's resolved set (O(1) dedup, capped).
+	seen := r.dnsIPSets[key]
+	if seen == nil {
+		seen = make(map[string]struct{}, len(ips))
+		r.dnsIPSets[key] = seen
 	}
 
 	for _, ip := range ips {
-		if !seen[ip] {
-			entry.ResolvedIPs = append(entry.ResolvedIPs, ip)
-			seen[ip] = true
+		if _, dup := seen[ip]; dup {
+			continue
 		}
+
+		if len(entry.ResolvedIPs) >= maxResolvedIPsPerEntry {
+			entry.ResolvedIPsDropped++
+
+			continue
+		}
+
+		entry.ResolvedIPs = append(entry.ResolvedIPs, ip)
+		seen[ip] = struct{}{}
 	}
 
 	// Populate the netns-wide DNS cache so packet violations flushed
@@ -336,7 +379,9 @@ func (r *ViolationRecorder) SnapshotAndReset() ([]Violation, []DNSActivityEntry,
 
 	reconcileBareViolations(violations, r.dnsCache)
 
-	overflow := r.capCount
+	overflow := r.capCount + r.dnsOverflow
+	r.dnsOverflow = 0
+	r.dnsAllowedEntries = 0
 	r.capped = false
 	r.capCount = 0
 
@@ -351,6 +396,7 @@ func (r *ViolationRecorder) SnapshotAndReset() ([]Violation, []DNSActivityEntry,
 
 	// Reset DNS map and per-bucket env cache for the next window.
 	r.dnsActivity = make(map[dnsKey]*DNSActivityEntry)
+	r.dnsIPSets = make(map[dnsKey]map[string]struct{})
 	r.envCache = nil
 
 	return violations, activity, overflow

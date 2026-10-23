@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
-	"strings"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -40,17 +40,34 @@ func TestDNSPIDProcessInfoReexecAndExit(t *testing.T) {
 
 	defer tr.Close()
 
-	cmd := exec.Command("sh", "-c", "sleep 0.5; exec sleep 30")
+	// Exec through a symlink: the LSM hook records the canonical
+	// (resolved) path and the exec tracepoint must not replace it with
+	// the raw symlink path.
+	realSleep, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("no sleep")
+	}
+
+	realSleep, _ = filepath.EvalSymlinks(realSleep)
+	link := filepath.Join(t.TempDir(), "lnk")
+
+	if err = os.Symlink(realSleep, link); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("sh", "-c", "sleep 0.5; exec "+link+" 30")
 	if err = cmd.Start(); err != nil {
 		t.Fatalf("start: %v", err)
 	}
 
 	pid := uint32(cmd.Process.Pid) //nolint:gosec // pid fits uint32
 
-	if got, ok := waitBinaryPath(tr, pid, func(p string) bool { return strings.HasSuffix(p, "/sleep") }); !ok {
+	if got, ok := waitBinaryPath(tr, pid, func(p string) bool { return p == realSleep || p == link }); !ok {
 		_ = cmd.Process.Kill()
 
-		t.Fatalf("after re-exec want path ending /sleep, got %q", got)
+		t.Fatalf("after re-exec want %q, got %q", realSleep, got)
+	} else if got != realSleep {
+		t.Errorf("canonical LSM path was replaced by the raw exec path: got %q want %q", got, realSleep)
 	}
 
 	_ = cmd.Process.Kill()

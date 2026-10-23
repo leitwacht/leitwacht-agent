@@ -8,9 +8,6 @@
 
 #define BINARY_PATH_LEN 256
 
-/* Max gap between the LSM exec hook and the exec tracepoint of one exec. */
-#define EXEC_SAME_WINDOW_NS 20000000ULL
-
 /* DNS attribution record: populated by kprobes on udp_sendmsg and
    tcp_connect, read synchronously from userspace by the DNS proxy when
    handling each query. Keyed by (netns_cookie, src_port).
@@ -65,6 +62,7 @@ struct process_info {
     char  binary_path[BINARY_PATH_LEN];
     __u64 exec_ts;
     __u64 cgroup_id;
+    __u64 exec_id;             /* task->self_exec_id at exec: identifies one exec */
 } __attribute__((packed));
 
 struct {
@@ -224,6 +222,7 @@ int BPF_PROG(dns_pid_bprm, struct linux_binprm *bprm)
     struct process_info pi = {};
     pi.exec_ts   = bpf_ktime_get_ns();
     pi.cgroup_id = bpf_get_current_cgroup_id();
+    pi.exec_id   = BPF_CORE_READ((struct task_struct *)bpf_get_current_task(), self_exec_id);
 
     /* Cast drops the const qualifier that clang adds through the
        BPF_PROG-expanded `const struct linux_binprm *` param. bpf_d_path
@@ -247,9 +246,9 @@ int BPF_PROG(dns_pid_bprm, struct linux_binprm *bprm)
    fallback is what we ship with when the LSM program can't load.
    The LSM hook (bprm_committed_creds) fires a few microseconds
    before this tracepoint for the same exec and stores the canonical
-   path. This fallback therefore overwrites an existing entry (BPF_ANY,
-   so a re-exec or recycled pid never keeps a stale path) EXCEPT when
-   the entry is fresher than EXEC_SAME_WINDOW_NS, which means the LSM
+   path. This fallback overwrites an existing entry (BPF_ANY, so a
+   re-exec or recycled pid never keeps a stale path) EXCEPT when the
+   entry carries the same task->self_exec_id, which means the LSM
    already recorded this very exec. */
 SEC("tracepoint/sched/sched_process_exec")
 int dns_pid_exec(struct trace_event_raw_sched_process_exec *ctx)
@@ -259,30 +258,36 @@ int dns_pid_exec(struct trace_event_raw_sched_process_exec *ctx)
     struct process_info pi = {};
     pi.exec_ts   = bpf_ktime_get_ns();
     pi.cgroup_id = bpf_get_current_cgroup_id();
+    pi.exec_id   = BPF_CORE_READ((struct task_struct *)bpf_get_current_task(), self_exec_id);
 
     unsigned short file_off = ctx->__data_loc_filename & 0xFFFF;
     (void)bpf_probe_read_kernel_str(&pi.binary_path, sizeof(pi.binary_path),
                                     (char *)ctx + file_off);
 
     struct process_info *cur = bpf_map_lookup_elem(&process_info, &pid);
-    if (cur && pi.exec_ts - cur->exec_ts < EXEC_SAME_WINDOW_NS)
+    if (cur && cur->exec_id == pi.exec_id)
         return 0; /* LSM already stored the canonical path for this exec */
 
     (void)bpf_map_update_elem(&process_info, &pid, &pi, BPF_ANY);
     return 0;
 }
 
-/* Drop the process_info entry when the process exits so PID reuse
-   cannot inherit it. sched_process_exit fires per thread; only the
-   thread-group leader (pid == tid) is the process's key. */
+/* Drop the process_info entry when the process dies, so PID reuse
+   cannot inherit it. sched_process_exit fires per thread; the entry is
+   keyed by tgid and belongs to the whole thread group, so delete only
+   when the last thread is gone (signal->live reaches zero). Keying on
+   "the leader thread exited" would be wrong in both directions: a
+   leader can exit while other threads run, and exec from a non-leader
+   thread makes it the leader. */
 SEC("tracepoint/sched/sched_process_exit")
 int dns_pid_exit(void *ctx)
 {
-    __u64 id = bpf_get_current_pid_tgid();
-    __u32 pid = id >> 32;
+    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
 
-    if ((__u32)id != pid)
+    if (BPF_CORE_READ(task, signal, live.counter) != 0)
         return 0;
+
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
 
     (void)bpf_map_delete_elem(&process_info, &pid);
     return 0;

@@ -33,9 +33,9 @@ const (
 // u64 netns_cookie (8) + u16 src_port (2) + 6B padding = 16B.
 const dnsAttrKeySize = 16
 
-// processInfoSize = binary_path(256) + exec_ts(8) + cgroup_id(8) = 272.
+// processInfoSize = binary_path(256) + exec_ts(8) + cgroup_id(8) + exec_id(8) = 280.
 // Must match struct process_info in dns_pid.c and processInfoEntry below.
-const processInfoSize = binaryPathLen + 8 + 8
+const processInfoSize = binaryPathLen + 8 + 8 + 8
 
 // verifyDnspidBytecode asserts that the three structs this file decodes
 // via byte offsets still have the sizes the userspace code assumes. See
@@ -80,12 +80,13 @@ func encodeDNSAttrKey(netnsCookie uint64, srcPort uint16) [dnsAttrKeySize]byte {
 	return key
 }
 
-// processInfoEntry matches struct process_info in dns_pid.c (packed 272 B):
-// binary_path(256) + exec_ts(8) + cgroup_id(8).
+// processInfoEntry matches struct process_info in dns_pid.c (packed 280 B):
+// binary_path(256) + exec_ts(8) + cgroup_id(8) + exec_id(8).
 type processInfoEntry struct {
 	BinaryPath [binaryPathLen]byte
 	ExecTs     uint64
 	CgroupID   uint64
+	ExecID     uint64
 }
 
 // DNSPIDTracker populates src_port → (pid, comm, parent_comm, cgroup_id)

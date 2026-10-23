@@ -114,11 +114,12 @@ int BPF_PROG(sock_attr_connect, struct socket *sock, struct sockaddr *address, i
     return capture_sock_owner(sock->sk);
 }
 
-/* Unconnected UDP (sendto without prior connect). Once a socket has an
- * owner, return before capture_sock_owner so the (expensive)
- * bpf_d_path is not re-run on every send; the lookup without
- * F_CREATE is just a map read. The owner is written at the first
- * connect/send and kept for the socket's lifetime. */
+/* Unconnected UDP (sendto without prior connect). Skip the (expensive)
+ * bpf_d_path re-capture when the socket already has an owner recorded
+ * for the CURRENT process; a socket shared across fork/exec (inherited
+ * fd) is re-captured when a different process sends on it, so the
+ * owner tracks the sender. The lookup without F_CREATE is just a map
+ * read. */
 SEC("lsm/socket_sendmsg")
 int BPF_PROG(sock_attr_sendmsg, struct socket *sock, struct msghdr *msg, int size) {
     if (!sock)
@@ -129,8 +130,11 @@ int BPF_PROG(sock_attr_sendmsg, struct socket *sock, struct msghdr *msg, int siz
     struct sock *sk = sock->sk;
     if (!sk)
         return 0;
-    if (bpf_sk_storage_get(&sock_owners, sk, NULL, 0))
+
+    struct sock_owner *o = bpf_sk_storage_get(&sock_owners, sk, NULL, 0);
+    if (o && o->pid == (bpf_get_current_pid_tgid() >> 32))
         return 0;
+
     return capture_sock_owner(sk);
 }
 

@@ -35,6 +35,7 @@ type dnspidProcessInfo struct {
 	BinaryPath [256]int8
 	ExecTs     uint64
 	CgroupId   uint64
+	ExecId     uint64
 }
 
 // loadDnspid returns the embedded CollectionSpec for dnspid.

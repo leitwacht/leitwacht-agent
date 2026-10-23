@@ -11,7 +11,7 @@ import (
 )
 
 // TestProcessInfoEntrySize guards that the Go processInfoEntry struct
-// round-trips the packed C struct process_info (256 + 8 + 8 = 272
+// round-trips the packed C struct process_info (256 + 8 + 8 + 8 = 280
 // bytes) with no Go-compiler-injected padding. Any drift between the
 // BPF C side and this Go struct silently corrupts binary_path decoding.
 // binary.Size returns -1 if the struct contains a field with
@@ -19,7 +19,7 @@ import (
 func TestProcessInfoEntrySize(t *testing.T) {
 	t.Parallel()
 
-	const want = binaryPathLen + 8 + 8 // 256 + exec_ts + cgroup_id = 272
+	const want = binaryPathLen + 8 + 8 + 8 // 256 + exec_ts + cgroup_id + exec_id = 280
 
 	if got := binary.Size(processInfoEntry{}); got != want {
 		t.Errorf("processInfoEntry layout drift: binary.Size = %d, want %d "+

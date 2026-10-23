@@ -2,8 +2,10 @@ package enforcer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -270,4 +272,116 @@ func TestDetachPodSandbox_TriggersTeardown(t *testing.T) {
 	if exists {
 		t.Error("NetnsContext should be removed from the map after teardown")
 	}
+}
+
+// TestAttachPodSandbox_SandboxChangedDoesNotLeakRefcount: kubelet can
+// replace a pod's sandbox; the replaced sandbox's reference must be
+// released before re-attaching, otherwise every replacement leaks one
+// and the netns context never reaches refcount 0 (never torn down).
+func TestAttachPodSandbox_SandboxChangedDoesNotLeakRefcount(t *testing.T) {
+	sandboxCgroup, _, _ := makePodCgroupTree(t)
+
+	fp := &fakePlatform{
+		netnsByPID: map[int]uint64{testSandboxPID: testSharedNetnsIno},
+	}
+
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr.NetnsGrace = 0
+	defer mgr.DetachAll()
+
+	attach := func(sandboxID string) {
+		t.Helper()
+
+		err := mgr.AttachPodSandbox(PodSandboxInfo{
+			PodUID: testPodUID, SandboxID: sandboxID,
+			PID: testSandboxPID, CgroupPath: sandboxCgroup,
+		})
+		if err != nil {
+			t.Fatalf("AttachPodSandbox(%s): %v", sandboxID, err)
+		}
+	}
+
+	attach(testSandboxID)
+	attach("replacement-sandbox-0001")
+	attach("replacement-sandbox-0002")
+
+	mgr.mu.Lock()
+	nctx := mgr.netnsContexts[testSharedNetnsIno]
+	refs, sandbox := nctx.refcount, nctx.sandboxID
+	mgr.mu.Unlock()
+
+	if refs != 1 {
+		t.Fatalf("refcount after two SandboxChanged = %d, want 1", refs)
+	}
+
+	if sandbox != "replacement-sandbox-0002" {
+		t.Fatalf("sandboxID = %q, want the latest replacement", sandbox)
+	}
+
+	// The replaced sandboxes' late die events are no-ops; only the live one tears down.
+	mgr.DetachPodSandbox(testPodUID, testSandboxID)
+
+	mgr.mu.Lock()
+	_, stillThere := mgr.netnsContexts[testSharedNetnsIno]
+	mgr.mu.Unlock()
+
+	if !stillThere {
+		t.Fatal("die event for a replaced sandbox tore down the live context")
+	}
+
+	mgr.DetachPodSandbox(testPodUID, "replacement-sandbox-0002")
+
+	mgr.mu.Lock()
+	_, stillThere = mgr.netnsContexts[testSharedNetnsIno]
+	mgr.mu.Unlock()
+
+	if stillThere {
+		t.Fatal("context leaked after the live sandbox died (refcount leak)")
+	}
+}
+
+// TestPodSandbox_ConcurrentEventsRace drives sandbox replacement,
+// sandbox die, and real-container attach concurrently. Meaningful under
+// -race: sandboxID / podAttached used to be written under nctx.mu but
+// read under Manager.mu.
+func TestPodSandbox_ConcurrentEventsRace(t *testing.T) {
+	sandboxCgroup, _, _ := makePodCgroupTree(t)
+
+	fp := &fakePlatform{
+		cgroupPath: "/sys/fs/cgroup/test",
+		netnsByPID: map[int]uint64{testSandboxPID: testSharedNetnsIno, testBuildPID: testSharedNetnsIno},
+	}
+
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr.NetnsGrace = 0
+	defer mgr.DetachAll()
+
+	if err := mgr.AttachPodSandbox(PodSandboxInfo{
+		PodUID: testPodUID, SandboxID: testSandboxID, PID: testSandboxPID, CgroupPath: sandboxCgroup,
+	}); err != nil {
+		t.Fatalf("AttachPodSandbox: %v", err)
+	}
+
+	var wg sync.WaitGroup
+
+	// Sandbox replacement loop (writes sandboxID / podAttached / refcount).
+	wg.Go(func() {
+		for i := range 40 {
+			_ = mgr.AttachPodSandbox(PodSandboxInfo{
+				PodUID: testPodUID, SandboxID: fmt.Sprintf("sandbox-%02d-abcdef", i),
+				PID: testSandboxPID, CgroupPath: sandboxCgroup,
+			})
+		}
+	})
+
+	// Real-container attach/detach loop (reads podAttached in attachEnforcer).
+	wg.Go(func() {
+		for i := range 40 {
+			cid := fmt.Sprintf("build-%02d-abcdefgh", i)
+			_, _ = mgr.Attach(context.Background(), ContainerInfo{ContainerID: cid}, testBuildPID, testPolicy("audit"))
+			mgr.Detach(cid)
+		}
+	})
+
+	wg.Wait()
 }

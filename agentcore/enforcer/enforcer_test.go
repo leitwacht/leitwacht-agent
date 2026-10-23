@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -113,6 +114,7 @@ func (f *fakePlatform) DialUpstreamInNetns(_ int, _ string, _ int) (*net.UDPConn
 
 // fakeEBPFHandle tracks calls for verification.
 type fakeEBPFHandle struct {
+	mu          sync.Mutex // guards attachCount (AttachCgroup runs from concurrent events)
 	platform    *fakePlatform
 	attachCount int
 	auditMode   bool // last mode set via SetMode
@@ -185,7 +187,9 @@ func (h *fakeEBPFHandle) AttachCgroup(_ string) (CgroupLink, error) {
 	if h.platform.attachCgroupErr != nil {
 		return nil, h.platform.attachCgroupErr
 	}
+	h.mu.Lock()
 	h.attachCount++
+	h.mu.Unlock()
 	return &fakeCgroupLink{}, nil
 }
 

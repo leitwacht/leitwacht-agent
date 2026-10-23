@@ -167,6 +167,15 @@ func (m *Manager) handleExistingPodSandbox(netnsIno uint64, podCgroup string, in
 
 	oldLink := nctx.podCgroupLink
 	oldCgID := nctx.podCgroupID
+
+	// Reset the pod-attach state under m.mu (the lock every reader of
+	// these fields holds). The replaced sandbox's reference is released
+	// only after the new one is taken, so the count never dips to zero
+	// mid-replacement while a real container is detaching.
+	nctx.podCgroupLink = nil
+	nctx.podCgroupID = 0
+	nctx.podAttached = false
+	nctx.sandboxID = ""
 	m.mu.Unlock()
 
 	if oldLink != nil {
@@ -175,16 +184,44 @@ func (m *Manager) handleExistingPodSandbox(netnsIno uint64, podCgroup string, in
 
 	nctx.mu.Lock()
 	delete(nctx.cgroupRecorders, oldCgID)
-	nctx.podCgroupLink = nil
-	nctx.podCgroupID = 0
-	nctx.podAttached = false
 	nctx.mu.Unlock()
 
-	return true, m.attachPodLink(nctx, podCgroup, info)
+	attachErr := m.attachPodLink(nctx, podCgroup, info)
+
+	// attachPodLink took a reference for the new sandbox on success. The
+	// replaced sandbox's reference is released here either way; without
+	// this release each SandboxChanged leaked one, so the netns context
+	// could never reach refcount 0 and was never torn down.
+	m.mu.Lock()
+	nctx.refcount--
+	m.mu.Unlock()
+
+	if attachErr != nil {
+		// No new reference was taken. If that leaves the context
+		// unreferenced, tear it down like a failed first attach would.
+		m.mu.Lock()
+		shouldTeardown := nctx.refcount <= 0 && !nctx.tornDown
+
+		if shouldTeardown {
+			nctx.tornDown = true
+
+			if nctx.inode != 0 {
+				delete(m.netnsContexts, nctx.inode)
+			}
+		}
+		m.mu.Unlock()
+
+		if shouldTeardown {
+			m.teardownNetnsContext(nctx)
+		}
+	}
+
+	return true, attachErr
 }
 
 // attachPodLink performs the AttachCgroup call and stores pod-attach state
-// on nctx. Refcount is incremented under m.mu for symmetry with Detach.
+// on nctx under m.mu. Refcount is incremented with it, for symmetry with
+// Detach.
 func (m *Manager) attachPodLink(nctx *NetnsContext, podCgroup string, info PodSandboxInfo) error {
 	start := time.Now()
 
@@ -200,12 +237,27 @@ func (m *Manager) attachPodLink(nctx *NetnsContext, podCgroup string, info PodSa
 		return fmt.Errorf("get pod cgroup id: %w", idErr)
 	}
 
-	nctx.mu.Lock()
+	// Route softirq-context fallbacks (when bpf_get_current_cgroup_id()
+	// returns the pod cgroup id rather than a leaf container's id) to the
+	// pod-shared DNS recorder, instead of letting them fall back to the
+	// arbitrary first-registered recorder in lookupPacketRecorder.
+	if nctx.sharedDNSRecorder != nil {
+		nctx.mu.Lock()
+		nctx.cgroupRecorders[cgID] = nctx.sharedDNSRecorder
+		nctx.mu.Unlock()
+	}
+
+	// Pod-attach state is read under m.mu (attachEnforcer, sandbox
+	// bookkeeping) and by other goroutines handling sibling events, so
+	// it is written under m.mu as well. Refcount moves with it.
+	m.mu.Lock()
 	nctx.podCgroupLink = link
 	nctx.podCgroupID = cgID
 	nctx.podUID = info.PodUID
 	nctx.sandboxID = info.SandboxID
 	nctx.podAttached = true
+	nctx.refcount++
+	m.mu.Unlock()
 
 	// Egress is live at the pod cgroup before any user container runs, so
 	// arm the DNS attach-liveness signal here — the reserved `attached`
@@ -213,19 +265,6 @@ func (m *Manager) attachPodLink(nctx *NetnsContext, podCgroup string, info PodSa
 	// gating existed (no change to K8s timing). The per-container
 	// attachEnforcer path sets the same flag for non-pod runtimes.
 	nctx.egressAttached.Store(true)
-
-	// Route softirq-context fallbacks (when bpf_get_current_cgroup_id()
-	// returns the pod cgroup id rather than a leaf container's id) to the
-	// pod-shared DNS recorder, instead of letting them fall back to the
-	// arbitrary first-registered recorder in lookupPacketRecorder.
-	if nctx.sharedDNSRecorder != nil {
-		nctx.cgroupRecorders[cgID] = nctx.sharedDNSRecorder
-	}
-	nctx.mu.Unlock()
-
-	m.mu.Lock()
-	nctx.refcount++
-	m.mu.Unlock()
 
 	m.logger.Debug("pod cgroup link bound",
 		"pod_uid", info.PodUID,
@@ -263,7 +302,8 @@ func (m *Manager) DetachPodSandbox(podUID, sandboxID string) {
 	}
 
 	target.refcount--
-	teardown := target.refcount == 0
+	remaining := target.refcount
+	teardown := remaining == 0
 
 	lastContainer := teardown
 	if teardown && target.inode != 0 && m.NetnsGrace > 0 {
@@ -291,7 +331,7 @@ func (m *Manager) DetachPodSandbox(podUID, sandboxID string) {
 	m.logger.Info("pod sandbox detached",
 		"pod_uid", podUID,
 		"sandbox_id", truncID(sandboxID),
-		"refcount", target.refcount,
+		"refcount", remaining,
 		"teardown", teardown,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)

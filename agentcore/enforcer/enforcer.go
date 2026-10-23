@@ -1403,7 +1403,11 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 	// per-container because attribution must remain at the leaf cgroup.
 	var cgroupLink CgroupLink
 
-	if !nctx.podAttached {
+	m.mu.Lock()
+	podAttached := nctx.podAttached
+	m.mu.Unlock()
+
+	if !podAttached {
 		var attachErr error
 
 		cgroupLink, attachErr = nctx.ebpf.AttachCgroup(cgroupPath)
@@ -1514,7 +1518,7 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 	attachPath := "per_container_non_k8s"
 
 	switch {
-	case nctx.podAttached:
+	case podAttached:
 		attachPath = "pod_attached"
 	default:
 		_, podErr := PodCgroupFromContainer(cgroupPath)

@@ -129,61 +129,26 @@ func TestStartBuildKitEgressAttach_AttachFailsCleansUp(t *testing.T) {
 	}
 }
 
-// TestStartBuildKitEgressAttach_RecorderDropsUnknownCgroups exercises
-// the recorder-selection closure: events from cgroups without a known
-// BuildKitBinding are dropped (recorder=nil), not stamped into the
-// shared recorder. Critical for noise control on a /sys/fs/cgroup/buildkit
-// subtree shared with unrelated daemon traffic.
-func TestStartBuildKitEgressAttach_RecorderDropsUnknownCgroups(t *testing.T) {
+// TestMarkUnattributed verifies the flush-time marker: violations with
+// no BuildKit binding are flagged build_unattributed instead of being
+// dropped; bound and ambiguous ones are left alone.
+func TestMarkUnattributed(t *testing.T) {
 	t.Parallel()
 
-	registry := NewSessionRegistry(time.Minute)
-	registry.LinkCgroup(12345, CgroupBinding{
-		SessionRef:   "sess-1",
-		VertexDigest: "sha256:abc",
-		VertexName:   "[stage] apk add curl",
-	})
-
-	// Install + restore the package-global hook so the closure under
-	// test sees a real lookup result for known cgroup_ids.
-	prev := buildKitLookup.Load()
-
-	t.Cleanup(func() { buildKitLookup.Store(prev) })
-
-	SetBuildKitLookup(registry.LookupByCgroupID)
-
-	plat := &fakePlatform{}
-	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-	attach, err := StartBuildKitEgressAttach(
-		t.Context(), plat, []string{"/sys/fs/cgroup/buildkit"}, log, nil, 0,
-	)
-	if err != nil {
-		t.Fatalf("StartBuildKitEgressAttach: %v", err)
+	vs := []Violation{
+		{IP: "192.0.2.1"},
+		{IP: "192.0.2.2", BuildSessionRef: "sess-1"},
+		{IP: "192.0.2.3", BuildAmbiguous: true},
 	}
 
-	t.Cleanup(func() { _ = attach.Close() })
+	markUnattributed(vs)
 
-	// The fake ringbuf reader saved the lookupRecorder closure on the
-	// handle. We don't have a direct accessor — instead, replicate the
-	// production closure shape and assert its behavior on the registry
-	// we just primed. (The wired closure inside the helper is exercised
-	// at runtime via the ringbuf reader; this assertion verifies the
-	// dispatch logic.)
-	lookup := func(cgroupID uint64) *ViolationRecorder {
-		if _, ok := LookupBuildKitBinding(cgroupID); !ok {
-			return nil
-		}
-
-		return attach.recorder
+	if !vs[0].BuildUnattributed {
+		t.Error("unbound violation not marked unattributed")
 	}
 
-	if got := lookup(99999); got != nil {
-		t.Error("lookup(unknown_cgroup_id) returned non-nil recorder; want nil")
-	}
-
-	if got := lookup(12345); got == nil {
-		t.Error("lookup(known_cgroup_id) returned nil recorder; want shared recorder")
+	if vs[1].BuildUnattributed || vs[2].BuildUnattributed {
+		t.Error("bound/ambiguous violation wrongly marked unattributed")
 	}
 }
 

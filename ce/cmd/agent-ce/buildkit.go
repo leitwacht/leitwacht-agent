@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -58,6 +59,7 @@ func startBuildKitAttribution(
 	}
 
 	registry := enforcer.NewSessionRegistry(buildKitSessionTTL)
+	registry.SetMaxSessionAge(cfg.BuildkitMaxSessionAge)
 
 	if cfg.BuildkitRequireCIMetadata {
 		required := resolveRequiredAttrs(cfg.BuildkitRequiredAttrs)
@@ -99,12 +101,7 @@ func startBuildKitAttribution(
 		source := enforcer.NewInotifyCgroupSource(cgroupPaths)
 		joiner := enforcer.NewCgroupJoiner(registry, source, log)
 
-		go func() {
-			err := joiner.Run(ctx)
-			if err != nil && ctx.Err() == nil {
-				log.Error("buildkit cgroup joiner exited", "error", err)
-			}
-		}()
+		go superviseJoiner(ctx, joiner, log)
 
 		log.Info("buildkit attribution active",
 			"grpc_addr", cfg.BuildkitGRPCAddr,
@@ -167,6 +164,61 @@ func startBuildKitAttribution(
 	)
 
 	return attach, nil
+}
+
+// joinerRestartMin and joinerRestartMax bound the backoff between
+// cgroup-joiner restarts.
+const (
+	joinerRestartMin = time.Second
+	joinerRestartMax = time.Minute
+)
+
+// joinerRunner is the part of the cgroup joiner the supervisor needs;
+// an interface so tests can drive restarts.
+type joinerRunner interface {
+	Run(ctx context.Context) error
+}
+
+// superviseJoiner runs the cgroup joiner and restarts it with
+// exponential backoff whenever it exits before ctx is done. A dead
+// joiner would otherwise leave every new RUN cgroup unbound (and, with
+// a kill policy configured, unchecked) until the agent restarts.
+func superviseJoiner(ctx context.Context, joiner joinerRunner, log *slog.Logger) {
+	superviseJoinerWith(ctx, joiner, log, joinerRestartMin, joinerRestartMax)
+}
+
+func superviseJoinerWith(ctx context.Context, joiner joinerRunner, log *slog.Logger, minB, maxB time.Duration) {
+	backoff := minB
+
+	for ctx.Err() == nil {
+		started := time.Now()
+		err := joiner.Run(ctx)
+
+		if ctx.Err() != nil {
+			return
+		}
+
+		// A run that stayed up a while was healthy; restart quickly.
+		if time.Since(started) > maxB {
+			backoff = minB
+		}
+
+		if errors.Is(err, enforcer.ErrCgroupJoinUnsupported) {
+			log.Error("buildkit cgroup joiner unsupported; not restarting", "error", err)
+
+			return
+		}
+
+		log.Error("buildkit cgroup joiner exited; restarting", "error", err, "backoff", backoff)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(backoff):
+		}
+
+		backoff = min(backoff*2, maxB)
+	}
 }
 
 // compileDenyVertexPatterns parses the comma-separated regex list from

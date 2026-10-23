@@ -46,6 +46,13 @@ type Violation struct {
 	BuildAmbiguous           bool                 `json:"build_ambiguous,omitempty"`
 	BuildAmbiguousCandidates []AmbiguousCandidate `json:"build_ambiguous_candidates,omitempty"`
 
+	// BuildUnattributed marks egress seen in a watched BuildKit cgroup
+	// subtree that the cgroup-join layer has not bound to any session
+	// or vertex (no match yet, or no match at all). Such events carry
+	// no build_* identity and must not be trusted as belonging to any
+	// particular build.
+	BuildUnattributed bool `json:"build_unattributed,omitempty"`
+
 	// Per-row CI override fields, derived from the BuildKit session's
 	// FrontendAttrs (build-args prefixed LEITWACHT_CI_*). Populated
 	// at egress time when the binding's FrontendAttrs carry these

@@ -112,6 +112,11 @@ type Config struct {
 	//   LEITWACHT_CE_BUILDKIT_DENY_VERTEX_PATTERNS="apt-get,curl https?://"
 	BuildkitDenyVertexPatterns string
 
+	// BuildkitMaxSessionAge bounds how long a BuildKit session that
+	// never reported completion stays tracked (LEITWACHT_CE_BUILDKIT_MAX_SESSION_AGE,
+	// default 6h). Zero or negative keeps the default.
+	BuildkitMaxSessionAge time.Duration
+
 	// Logging.
 	LogLevel string
 }
@@ -178,6 +183,10 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	c.BuildkitDisableCgroupAttach, err = envBool("LEITWACHT_CE_BUILDKIT_DISABLE_CGROUP_ATTACH", false)
+	if err != nil {
+		return nil, err
+	}
+	c.BuildkitMaxSessionAge, err = envDuration("LEITWACHT_CE_BUILDKIT_MAX_SESSION_AGE", 6*time.Hour)
 	if err != nil {
 		return nil, err
 	}

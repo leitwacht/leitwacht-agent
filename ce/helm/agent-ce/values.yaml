@@ -178,6 +178,11 @@ buildkit:
   # block agent startup.
   disableCgroupAttach: false
 
+  # How long a BuildKit session that never reported completion (missed
+  # event, crashed client) stays tracked after its last activity. Go
+  # duration; empty keeps the agent default (6h).
+  maxSessionAge: ""
+
   # Per-vertex kill-switch. Each list item is a Go regexp (RE2) that
   # the agent evaluates against each BuildKit vertex's Name (e.g.
   # "[stage 2/5] RUN apk add curl"). A match SIGKILLs the RUN

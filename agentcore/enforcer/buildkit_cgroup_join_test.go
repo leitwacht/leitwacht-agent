@@ -35,7 +35,7 @@ func TestExtractRunCommand(t *testing.T) {
 	}
 }
 
-func TestMatchPendingByCmdline(t *testing.T) {
+func TestMatchPendingByArgv(t *testing.T) {
 	pending := []PendingVertex{
 		{SessionRef: "rA", VertexDigest: "dA", VertexName: "[build 1/3] RUN apt-get update"},
 		{SessionRef: "rA", VertexDigest: "dB", VertexName: "[build 2/3] RUN npm ci"},
@@ -43,24 +43,24 @@ func TestMatchPendingByCmdline(t *testing.T) {
 	}
 
 	// /bin/sh -c "<cmd>" — common runc invocation shape.
-	got := matchPendingByCmdline(pending, "/bin/sh -c apt-get update")
+	got := matchPendingByArgv(pending, []string{"/bin/sh", "-c", "apt-get update"})
 	if len(got) != 1 || got[0].VertexDigest != "dA" {
 		t.Fatalf("apt-get match: got %+v", got)
 	}
 
-	got = matchPendingByCmdline(pending, "/bin/sh -c npm ci")
+	got = matchPendingByArgv(pending, []string{"/bin/sh", "-c", "npm ci"})
 	if len(got) != 1 || got[0].VertexDigest != "dB" {
 		t.Fatalf("npm ci match: got %+v", got)
 	}
 
 	// COPY doesn't match — it never enters the cmdline space.
-	got = matchPendingByCmdline(pending, "/bin/sh -c apt-get install -y curl")
+	got = matchPendingByArgv(pending, []string{"/bin/sh", "-c", "apt-get install -y curl"})
 	if len(got) != 0 {
 		t.Fatalf("unrelated cmdline matched: %+v", got)
 	}
 }
 
-func TestMatchPendingByCmdline_CrossBuildDuplicate(t *testing.T) {
+func TestMatchPendingByArgv_CrossBuildDuplicate(t *testing.T) {
 	// Two sessions, both running the same exact RUN — the join layer
 	// should report both as candidates and let the tiebreaker decide.
 	pending := []PendingVertex{
@@ -68,7 +68,7 @@ func TestMatchPendingByCmdline_CrossBuildDuplicate(t *testing.T) {
 		{SessionRef: "rB", VertexDigest: "dB", VertexName: "[build 1/2] RUN apt-get update", FrontendAttrs: map[string]string{"build-arg:VERSION": "2"}},
 	}
 
-	got := matchPendingByCmdline(pending, "/bin/sh -c apt-get update")
+	got := matchPendingByArgv(pending, []string{"/bin/sh", "-c", "apt-get update"})
 	if len(got) != 2 {
 		t.Fatalf("expected 2 matches, got %d: %+v", len(got), got)
 	}
@@ -749,7 +749,7 @@ func TestCgroupJoiner_KillsOnDenyVertexPatternAmbiguous(t *testing.T) {
 		StartedAt: time.Unix(1010, 0),
 	})
 
-	// cmdline "npm install" hits both vertices — matchPendingByCmdline
+	// cmdline "npm install" hits both vertices — matchPendingByArgv
 	// returns 2, forcing the default (ambiguous-candidates) branch.
 	cgroupPath := stageCgroup(t, root, "ctr-amb", 8888, "/bin/sh\x00-c\x00npm install\x00")
 	killFile := filepath.Join(cgroupPath, "cgroup.kill")

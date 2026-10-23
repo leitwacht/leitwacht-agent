@@ -2,11 +2,16 @@ package enforcer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -164,6 +169,13 @@ func NewCgroupJoiner(registry *SessionRegistry, source CgroupEventSource, logger
 		opt(j)
 	}
 
+	// Let the registry verify bindings against the cgroup's current
+	// inode on lookup (guards against cgroup id reuse after a missed
+	// remove event).
+	if j.statFn != nil && registry != nil {
+		registry.SetStatFn(j.statFn)
+	}
+
 	return j
 }
 
@@ -217,16 +229,22 @@ func (j *CgroupJoiner) handleCreate(ctx context.Context, evt CgroupCreateEvent) 
 		return
 	}
 
+	// A rescan (queue overflow, re-watch) re-reports cgroups that are
+	// already bound; do not re-judge a linked RUN.
+	if j.registry.hasBindingForPath(cgroupID, evt.CgroupPath) {
+		return
+	}
+
 	// First attempt runs synchronously so the happy fast-path
 	// (cgroup already populated, vertex already announced) takes
 	// no goroutine. The deferred loop only spawns when this misses.
-	if j.tryMatch(ctx, cgroupID, evt) {
+	if j.tryMatch(ctx, cgroupID, evt, j.deferredMatchTimeout <= 0) {
 		return
 	}
 
 	if j.deferredMatchTimeout <= 0 {
-		// Legacy behaviour: drop on first miss. Egress events for
-		// this cgroup will be emitted unattributed.
+		// No retry window: the single attempt above was final. Egress
+		// events for this cgroup will be emitted unattributed.
 		return
 	}
 
@@ -257,25 +275,31 @@ func (j *CgroupJoiner) handleCreate(ctx context.Context, evt CgroupCreateEvent) 
 	}()
 }
 
-// tryMatch performs one read-procs + read-cmdline + match-pending
-// attempt. Returns true if a binding was linked (success) OR if ctx
-// has been cancelled by a remove fired during the retry window — in
-// either case the caller's retry loop should stop. Returns false on a
-// real miss (procs empty, cmdline unreadable, no pending vertex), so
-// the retry loop keeps trying.
-func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt CgroupCreateEvent) bool {
+// tryMatch performs one read-procs + read-argv + match-pending
+// attempt. Returns true if the cgroup was handled (linked or killed)
+// OR if ctx has been cancelled by a remove fired during the retry
+// window — in either case the caller's retry loop should stop.
+// Returns false on a real miss (procs empty, argv unreadable, no
+// pending vertex), so the retry loop keeps trying.
+//
+// final marks the last attempt for this cgroup. When the operator has
+// opted into enforcement (require-CI-metadata or deny patterns) a
+// final attempt that finds no single authorized match kills the
+// cgroup: an unattributable RUN container must not run unchecked.
+// Without enforcement a miss only leaves the cgroup unbound.
+func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt CgroupCreateEvent, final bool) bool {
 	pid, err := readFirstPID(evt.CgroupPath)
 	if err != nil {
-		return false
+		return j.noMatch(ctx, cgroupID, evt, final)
 	}
 
-	cmdline, err := readCmdline(j.procRoot, pid)
+	argv, err := readArgv(j.procRoot, pid)
 	if err != nil {
-		return false
+		return j.noMatch(ctx, cgroupID, evt, final)
 	}
 
 	pending := j.registry.PendingVertices()
-	matches := matchPendingByCmdline(pending, cmdline)
+	matches := matchPendingByArgv(pending, argv)
 
 	// Final check just before committing: if a remove event for this
 	// container fired during the retry window, ctx is now cancelled and
@@ -285,9 +309,16 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 		return true
 	}
 
+	// A candidate whose history record has not arrived yet has no real
+	// authorization decision. Keep retrying until the deadline instead
+	// of killing (or trusting) on the placeholder's defaults.
+	if !final && anyPlaceholder(matches) {
+		return false
+	}
+
 	switch len(matches) {
 	case 0:
-		return false
+		return j.noMatch(ctx, cgroupID, evt, final)
 	case 1:
 		m := matches[0]
 
@@ -295,23 +326,9 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 		// at register time (require-CI-metadata policy enabled and the
 		// session's FrontendAttrs lacked a required key), SIGKILL every
 		// process in this cgroup via cgroup.kill BEFORE writing a
-		// binding. The binding would be unused anyway since the runc
-		// child is about to die — and skipping LinkCgroup keeps the
-		// hot-path egress lookup miss-rate accurate to the kill
-		// (LookupBuildKitBinding stays empty for this cgroup, so any
-		// in-flight packet attributes as unattributed; the eBPF
-		// recorder's fallback handles it).
+		// binding.
 		if !m.Authorized {
-			j.killCgroup(evt.CgroupPath)
-
-			j.logger.Warn("buildkit cgroup killed: session missing required CI attribution",
-				"cgroup_id", cgroupID,
-				"container_id", evt.ContainerID,
-				"cgroup_path", evt.CgroupPath,
-				"session_ref", m.SessionRef,
-				"vertex_digest", m.VertexDigest,
-				"vertex_name", m.VertexName,
-			)
+			j.killMatched(cgroupID, evt, m, "buildkit cgroup killed: session missing required CI attribution", 0)
 
 			return true
 		}
@@ -323,61 +340,51 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 		// installed — back-compat for installations that haven't
 		// opted into per-vertex policy.
 		if j.registry.MatchesDenyVertexPattern(m.VertexName) {
-			j.killCgroup(evt.CgroupPath)
-
-			j.logger.Warn("buildkit cgroup killed: vertex matched a deny policy pattern",
-				"cgroup_id", cgroupID,
-				"container_id", evt.ContainerID,
-				"cgroup_path", evt.CgroupPath,
-				"session_ref", m.SessionRef,
-				"vertex_digest", m.VertexDigest,
-				"vertex_name", m.VertexName,
-			)
+			j.killMatched(cgroupID, evt, m, "buildkit cgroup killed: vertex matched a deny policy pattern", 0)
 
 			return true
 		}
 
-		j.registry.LinkCgroup(cgroupID, CgroupBinding{
-			SessionRef:    m.SessionRef,
-			VertexDigest:  m.VertexDigest,
-			VertexName:    m.VertexName,
-			ContainerID:   evt.ContainerID,
-			FrontendAttrs: m.FrontendAttrs,
-		})
+		if j.distrustArgvMatch(cgroupID, evt, 1) {
+			return true
+		}
+
+		j.link(cgroupID, evt, m)
 
 		j.logger.Info("buildkit cgroup linked",
 			"cgroup_id", cgroupID,
 			"container_id", evt.ContainerID,
 			"session_ref", m.SessionRef,
 			"vertex_digest", m.VertexDigest,
-			"vertex_name", m.VertexName,
+			"vertex_name_hash", VertexNameHash(m.VertexName),
 		)
 
 		return true
 	default:
-		// Fail-closed deny-vertex check: when the join can't pick one
-		// candidate, any candidate whose vertex_name matches a deny
-		// pattern kills the cgroup. An attacker who engineers a
-		// duplicate vertex name on a benign session would otherwise
-		// slip past the case-1 check by landing in ambiguous-link
-		// territory. Run this BEFORE the tiebreaker so the kill
-		// also catches the refined-to-one outcome below.
+		// Fail-closed policy check: when the join can't pick one
+		// candidate, ANY candidate that is unauthorized or whose
+		// vertex_name matches a deny pattern kills the cgroup. An
+		// attacker who engineers a duplicate vertex name on a benign
+		// session would otherwise slip past the single-match checks by
+		// landing in ambiguous-link territory. Run this BEFORE the
+		// tiebreaker so it also covers the refined-to-one outcome
+		// below (the refined candidate is one of these).
 		for i := range matches {
-			if j.registry.MatchesDenyVertexPattern(matches[i].VertexName) {
-				j.killCgroup(evt.CgroupPath)
-
-				j.logger.Warn("buildkit cgroup killed: ambiguous candidate matched a deny policy pattern",
-					"cgroup_id", cgroupID,
-					"container_id", evt.ContainerID,
-					"cgroup_path", evt.CgroupPath,
-					"session_ref", matches[i].SessionRef,
-					"vertex_digest", matches[i].VertexDigest,
-					"vertex_name", matches[i].VertexName,
-					"candidates", len(matches),
-				)
+			if !matches[i].Authorized {
+				j.killMatched(cgroupID, evt, matches[i], "buildkit cgroup killed: ambiguous candidate missing required CI attribution", len(matches))
 
 				return true
 			}
+
+			if j.registry.MatchesDenyVertexPattern(matches[i].VertexName) {
+				j.killMatched(cgroupID, evt, matches[i], "buildkit cgroup killed: ambiguous candidate matched a deny policy pattern", len(matches))
+
+				return true
+			}
+		}
+
+		if j.distrustArgvMatch(cgroupID, evt, len(matches)) {
+			return true
 		}
 
 		// Tiebreaker: environ. Read /proc/<pid>/environ and pick
@@ -386,22 +393,17 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 		// tiebreaker also yields >1 (or 0 — the more likely case
 		// when neither side's attrs surface in env).
 		environ, _ := readEnviron(j.procRoot, pid)
+
 		refined := tiebreakByEnviron(matches, environ)
 		if len(refined) == 1 {
-			m := refined[0]
-			j.registry.LinkCgroup(cgroupID, CgroupBinding{
-				SessionRef:    m.SessionRef,
-				VertexDigest:  m.VertexDigest,
-				VertexName:    m.VertexName,
-				ContainerID:   evt.ContainerID,
-				FrontendAttrs: m.FrontendAttrs,
-			})
+			j.link(cgroupID, evt, refined[0])
 
 			return true
 		}
 
 		j.registry.LinkCgroup(cgroupID, CgroupBinding{
 			ContainerID:         evt.ContainerID,
+			CgroupPath:          evt.CgroupPath,
 			Ambiguous:           true,
 			AmbiguousCandidates: candidatesFromMatches(matches),
 		})
@@ -415,12 +417,141 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 	}
 }
 
+// distrustArgvMatch implements the fail-closed rule for argv-derived
+// matches: argv is controlled by the process (exec -a, setproctitle), so
+// a match proves nothing about which session owns the cgroup. Under a
+// policy, while any unauthorized, placeholder or deny-matching session
+// is open, no match is trusted and the cgroup is killed instead of
+// bound. Returns true when it killed (the caller must stop).
+func (j *CgroupJoiner) distrustArgvMatch(cgroupID uint64, evt CgroupCreateEvent, candidates int) bool {
+	if !j.registry.EnforcementEnabled() || !j.registry.PolicyCandidates().Risky {
+		return false
+	}
+
+	if j.killCgroup(evt.CgroupPath) {
+		j.logger.Warn("buildkit cgroup killed: argv match not trusted while an unauthorized or denied session is open",
+			"cgroup_id", cgroupID,
+			"container_id", evt.ContainerID,
+			"cgroup_path", evt.CgroupPath,
+			"candidates", candidates,
+		)
+	}
+
+	return true
+}
+
+// noMatch handles a miss. Non-final misses just ask for a retry. A
+// final miss under an enforcing policy fails closed but not blindly:
+// the cgroup may be a legitimate container the vertex text cannot be
+// matched to (a "# syntax=" frontend container, or a RUN whose command
+// BuildKit renders differently from what runs). So the candidate set is
+// every pending RUN vertex of every open session, and the cgroup is
+// killed only if any open session is unauthorized or still a
+// placeholder, or any pending vertex matches a deny pattern, or the
+// history watcher is down (the registry is blind). Otherwise it is
+// bound as ambiguous over all candidates (or left unbound when there
+// are none). Without a policy a miss just leaves the cgroup unbound.
+func (j *CgroupJoiner) noMatch(ctx context.Context, cgroupID uint64, evt CgroupCreateEvent, final bool) bool {
+	if !final || ctx.Err() != nil || !j.registry.EnforcementEnabled() {
+		return false
+	}
+
+	pc := j.registry.PolicyCandidates()
+
+	if j.registry.HistoryDisconnected() || pc.Risky {
+		reason := "buildkit cgroup killed: unmatched under policy with unauthorized or denied candidate sessions"
+		if j.registry.HistoryDisconnected() {
+			reason = "buildkit cgroup killed: unmatched while the history watcher is disconnected"
+		}
+
+		if j.killCgroup(evt.CgroupPath) {
+			j.logger.Warn(reason,
+				"cgroup_id", cgroupID,
+				"container_id", evt.ContainerID,
+				"cgroup_path", evt.CgroupPath,
+				"candidates", len(pc.Vertices),
+			)
+		}
+
+		return true
+	}
+
+	if len(pc.Vertices) > 0 {
+		j.registry.LinkCgroup(cgroupID, CgroupBinding{
+			ContainerID:         evt.ContainerID,
+			CgroupPath:          evt.CgroupPath,
+			Ambiguous:           true,
+			AmbiguousCandidates: candidatesFromMatches(pc.Vertices),
+		})
+
+		j.logger.Info("cgroup unmatched under policy; bound ambiguous over all open sessions",
+			"container_id", evt.ContainerID,
+			"candidates", len(pc.Vertices),
+		)
+	}
+
+	return true
+}
+
+func (j *CgroupJoiner) link(cgroupID uint64, evt CgroupCreateEvent, m PendingVertex) {
+	j.registry.LinkCgroup(cgroupID, CgroupBinding{
+		SessionRef:    m.SessionRef,
+		VertexDigest:  m.VertexDigest,
+		VertexName:    m.VertexName,
+		ContainerID:   evt.ContainerID,
+		CgroupPath:    evt.CgroupPath,
+		FrontendAttrs: m.FrontendAttrs,
+	})
+}
+
+// killMatched kills the cgroup and logs why. The vertex name is
+// Dockerfile text and may carry secrets, so only the digest and a
+// short hash of the name are logged.
+func (j *CgroupJoiner) killMatched(cgroupID uint64, evt CgroupCreateEvent, m PendingVertex, msg string, candidates int) {
+	if !j.killCgroup(evt.CgroupPath) {
+		return
+	}
+
+	attrs := []any{
+		"cgroup_id", cgroupID,
+		"container_id", evt.ContainerID,
+		"cgroup_path", evt.CgroupPath,
+		"session_ref", m.SessionRef,
+		"vertex_digest", m.VertexDigest,
+		"vertex_name_hash", VertexNameHash(m.VertexName),
+	}
+	if candidates > 0 {
+		attrs = append(attrs, "candidates", candidates)
+	}
+
+	j.logger.Warn(msg, attrs...)
+}
+
+// VertexNameHash returns a short stable hash of a vertex name, enough
+// to correlate log lines without recording Dockerfile text.
+func VertexNameHash(name string) string {
+	sum := sha256.Sum256([]byte(name))
+
+	return hex.EncodeToString(sum[:6])
+}
+
+func anyPlaceholder(ms []PendingVertex) bool {
+	for i := range ms {
+		if ms[i].Placeholder {
+			return true
+		}
+	}
+
+	return false
+}
+
 // deferredMatch retries tryMatch on a ticker until it succeeds, the
 // deadline expires, or ctx is cancelled. Covers the BuildKit + runc
 // timing window where the cgroup directory is created before the
 // child PID is in procs AND before the Status stream announces the
 // vertex. One goroutine per cgroup create; bounded by buildkit's
-// max-parallelism (typically low tens).
+// max-parallelism (typically low tens). The attempt at or after the
+// deadline is the final one (see tryMatch).
 func (j *CgroupJoiner) deferredMatch(ctx context.Context, cgroupID uint64, evt CgroupCreateEvent) {
 	deadline := time.Now().Add(j.deferredMatchTimeout)
 
@@ -434,11 +565,13 @@ func (j *CgroupJoiner) deferredMatch(ctx context.Context, cgroupID uint64, evt C
 		case <-tick.C:
 		}
 
-		if j.tryMatch(ctx, cgroupID, evt) {
+		final := !time.Now().Before(deadline)
+
+		if j.tryMatch(ctx, cgroupID, evt, final) {
 			return
 		}
 
-		if time.Now().After(deadline) {
+		if final {
 			j.logger.Debug("cgroup-to-vertex join deadline; dropped",
 				"container_id", evt.ContainerID,
 				"cgroup_id", cgroupID,
@@ -506,19 +639,19 @@ func readFirstPID(cgroupPath string) (int, error) {
 	return 0, errors.New("cgroup.procs is empty")
 }
 
-// readCmdline returns the contents of /proc/<pid>/cmdline with the
-// usual NUL byte separators replaced by spaces. Returned string is
-// trimmed of any trailing NUL.
-func readCmdline(procRoot string, pid int) (string, error) {
+// readArgv returns /proc/<pid>/cmdline split into its argv elements.
+func readArgv(procRoot string, pid int) ([]string, error) {
 	data, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cmdline"))
 	if err != nil {
-		return "", fmt.Errorf("read cmdline: %w", err)
+		return nil, fmt.Errorf("read cmdline: %w", err)
 	}
 
-	// cmdline is NUL-separated; collapse to spaces and trim.
-	s := strings.ReplaceAll(strings.TrimRight(string(data), "\x00"), "\x00", " ")
+	trimmed := strings.TrimRight(string(data), "\x00")
+	if trimmed == "" {
+		return nil, errors.New("empty cmdline")
+	}
 
-	return s, nil
+	return strings.Split(trimmed, "\x00"), nil
 }
 
 // readEnviron returns /proc/<pid>/environ as a map[KEY]VALUE.
@@ -549,21 +682,22 @@ func readEnviron(procRoot string, pid int) (map[string]string, error) {
 	return out, nil
 }
 
-// matchPendingByCmdline returns the pending vertices whose Name
-// contains a RUN command matching cmdline. BuildKit names look like:
+// matchPendingByArgv returns the pending vertices whose RUN command
+// is exactly the command the process was started with. BuildKit names
+// look like:
 //
 //	"[build 5/12] RUN npm ci"
 //	"[stage-final 2/4] COPY --from=build /out /"
 //
 // Only "RUN" vertices match — COPY/FROM/ARG don't spawn runc
-// containers and therefore don't surface as cgroup creates. The
-// match strips the bracket prefix and the leading "RUN " and then
-// checks whether cmdline contains the remainder.
+// containers and therefore don't surface as cgroup creates.
 //
-// BuildKit invokes RUN via `/bin/sh -c "<cmd>"`, so cmdline is
-// typically "sh -c <cmd>" or "/bin/sh -c <cmd>". The substring check
-// against the RUN command tolerates either shape.
-func matchPendingByCmdline(pending []PendingVertex, cmdline string) []PendingVertex {
+// BuildKit runs shell-form RUN as `<shell> [opts] -c "<cmd>"`; the
+// command string is argv's last element. Equality is on the whole
+// (whitespace-normalised) command — a substring test would let any
+// process whose command line merely contains another session's RUN
+// text inherit that session's authorization.
+func matchPendingByArgv(pending []PendingVertex, argv []string) []PendingVertex {
 	var out []PendingVertex
 
 	for _, v := range pending {
@@ -572,7 +706,7 @@ func matchPendingByCmdline(pending []PendingVertex, cmdline string) []PendingVer
 			continue
 		}
 
-		if cmdlineContains(cmdline, cmd) {
+		if argvMatchesRun(argv, cmd) || argvMatchesRunLoose(argv, cmd) {
 			out = append(out, v)
 		}
 	}
@@ -580,8 +714,204 @@ func matchPendingByCmdline(pending []PendingVertex, cmdline string) []PendingVer
 	return out
 }
 
+// argvMatchesRun reports whether argv is the invocation of runCmd:
+// either `... -c <runCmd>` (shell form) or argv joined == runCmd
+// (exec form).
+func argvMatchesRun(argv []string, runCmd string) bool {
+	want := normalizeWS(runCmd)
+	if want == "" || len(argv) == 0 {
+		return false
+	}
+
+	if n := len(argv); n >= 3 && argv[n-2] == "-c" {
+		return normalizeWS(argv[n-1]) == want
+	}
+
+	return normalizeWS(strings.Join(argv, " ")) == want
+}
+
+// argvMatchesRunLoose widens argvMatchesRun for the legitimate forms
+// where the vertex text and the process argv differ. Every widening can
+// only over-match; over-matching yields an ambiguous candidate set,
+// which the policy checks treat fail-closed.
+func argvMatchesRunLoose(argv []string, runCmd string) bool {
+	if len(argv) == 0 {
+		return false
+	}
+
+	// Exec form: the vertex name carries a JSON array, compare
+	// element-wise.
+	if strings.HasPrefix(runCmd, "[") {
+		var elems []string
+		if json.Unmarshal([]byte(runCmd), &elems) == nil && len(elems) > 0 {
+			return execFormMatches(argv, elems)
+		}
+	}
+
+	// Heredoc: "<<EOF ..." summary versus the first line of the script.
+	if strings.HasPrefix(runCmd, "<<") {
+		return heredocMatches(argv[len(argv)-1], runCmd)
+	}
+
+	script := argv[len(argv)-1]
+	hasShellC := len(argv) >= 3 && argv[len(argv)-2] == "-c"
+
+	// $VAR / ${VAR} in the script are expanded in the vertex name.
+	if hasShellC && strings.Contains(script, "$") && varPatternMatches(script, runCmd) {
+		return true
+	}
+
+	// The shell exec-replaced itself with the last simple command, so
+	// argv is the resolved command, possibly behind an interpreter
+	// (pip install x -> python3 /usr/local/bin/pip install x).
+	return tailMatchesCommand(argv, runCmd)
+}
+
+func execFormMatches(argv, elems []string) bool {
+	if len(argv) == len(elems) {
+		eq := true
+
+		for i := range elems {
+			if argv[i] != elems[i] {
+				eq = false
+
+				break
+			}
+		}
+
+		if eq {
+			return true
+		}
+	}
+
+	// Resolved binary path / interpreter prefix.
+	n := len(elems)
+	if len(argv) < n {
+		return false
+	}
+
+	off := len(argv) - n
+	if path.Base(argv[off]) != path.Base(elems[0]) {
+		return false
+	}
+
+	for i := 1; i < n; i++ {
+		if argv[off+i] != elems[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+var heredocTagRE = regexp.MustCompile(`^<<-?\s*["']?[A-Za-z_][A-Za-z0-9_]*["']?\s*`)
+
+// heredocMatches compares the heredoc summary in the vertex name (the
+// script's first line, wrapped in parentheses) with the script's first line. Equality is required;
+// a prefix is accepted only when the summary was truncated with "...".
+// A bare "<<EOF" with no summary matches nothing.
+func heredocMatches(script, runCmd string) bool {
+	head := firstNonEmptyLine(heredocTagRE.ReplaceAllString(runCmd, ""))
+	// BuildKit renders the summary as "<<EOF (<first line>...)".
+	if strings.HasPrefix(head, "(") && strings.HasSuffix(head, ")") {
+		head = strings.TrimSpace(head[1 : len(head)-1])
+	}
+
+	truncated := strings.HasSuffix(head, "...")
+	head = strings.TrimSpace(strings.TrimSuffix(head, "..."))
+
+	first := firstNonEmptyLine(script)
+
+	if head == "" || first == "" {
+		return false
+	}
+
+	return head == first || (truncated && strings.HasPrefix(first, head))
+}
+
+func firstNonEmptyLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if l := normalizeWS(line); l != "" {
+			return l
+		}
+	}
+
+	return ""
+}
+
+var shellVarRE = regexp.MustCompile(`\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*`)
+
+const maxVarPatternLen = 4096
+
+// varPatternMatches reports whether runCmd (the vertex text, variables
+// already expanded) fits script with each $X/${X} as a non-greedy
+// wildcard, anchored at both ends on whitespace-normalised text.
+func varPatternMatches(script, runCmd string) bool {
+	script = normalizeWS(script)
+	if len(script) > maxVarPatternLen || !shellVarRE.MatchString(script) {
+		return false
+	}
+
+	var sb strings.Builder
+
+	sb.WriteString("^")
+
+	last := 0
+	for _, loc := range shellVarRE.FindAllStringIndex(script, -1) {
+		sb.WriteString(regexp.QuoteMeta(script[last:loc[0]]))
+		sb.WriteString(".*?")
+
+		last = loc[1]
+	}
+
+	sb.WriteString(regexp.QuoteMeta(script[last:]))
+	sb.WriteString("$")
+
+	re, err := regexp.Compile(sb.String())
+	if err != nil {
+		return false
+	}
+
+	return re.MatchString(normalizeWS(runCmd))
+}
+
+// tailMatchesCommand matches a simple command (no shell operators)
+// against the last len(tokens) argv elements, comparing the program by
+// base name.
+func tailMatchesCommand(argv []string, runCmd string) bool {
+	if strings.ContainsAny(runCmd, ";&|<>()$`\n") {
+		return false
+	}
+
+	tokens := strings.Fields(runCmd)
+
+	n := len(tokens)
+	if n == 0 || len(argv) < n {
+		return false
+	}
+
+	off := len(argv) - n
+	if path.Base(argv[off]) != path.Base(tokens[0]) {
+		return false
+	}
+
+	for i := 1; i < n; i++ {
+		if argv[off+i] != tokens[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func normalizeWS(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
 // extractRunCommand returns the command portion of a BuildKit RUN
-// vertex name. Returns "" for non-RUN vertices.
+// vertex name with the bracketed stage prefix and any leading RUN
+// flags (--mount=..., --network=..., --security=...) removed.
+// Returns "" for non-RUN vertices.
 func extractRunCommand(vertexName string) string {
 	// Drop the bracketed prefix if present: "[stage 1/2] RUN ..."
 	rest := vertexName
@@ -594,15 +924,18 @@ func extractRunCommand(vertexName string) string {
 		return ""
 	}
 
-	return strings.TrimSpace(rest[len(runPrefix):])
-}
+	rest = strings.TrimSpace(rest[len(runPrefix):])
 
-func cmdlineContains(cmdline, runCmd string) bool {
-	if runCmd == "" {
-		return false
+	for strings.HasPrefix(rest, "--") {
+		_, after, found := strings.Cut(rest, " ")
+		if !found {
+			return ""
+		}
+
+		rest = strings.TrimLeft(after, " ")
 	}
 
-	return strings.Contains(cmdline, runCmd)
+	return rest
 }
 
 // tiebreakByEnviron narrows a multi-match set to candidates whose
@@ -674,21 +1007,32 @@ func candidatesFromMatches(matches []PendingVertex) []AmbiguousCandidate {
 // session. Errors are logged at warn level but not propagated — a
 // missing cgroup.kill (cgroup v1, or a transient cgroup that was
 // removed between detection and kill) is a no-op; nothing we'd want
-// to retry.
+// to retry. Returns true only when the kill was written.
 //
 // The cgroup.kill primitive is a single-write atomic operation: the
 // kernel signals every process in the cgroup AND every descendant
 // cgroup. No race with runc tearing down children; no leftover
 // processes. Requires write permission on the cgroup file (agent
 // runs as root → fine).
-func (j *CgroupJoiner) killCgroup(cgroupPath string) {
+func (j *CgroupJoiner) killCgroup(cgroupPath string) bool {
 	const killFile = "cgroup.kill"
 
 	err := os.WriteFile(filepath.Join(cgroupPath, killFile), []byte("1"), 0)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// Cgroup already gone: nothing was killed, nothing to report.
+			j.logger.Debug("cgroup.kill skipped: cgroup gone", "path", cgroupPath)
+
+			return false
+		}
+
 		j.logger.Warn("cgroup.kill write failed",
 			"path", cgroupPath,
 			"error", err,
 		)
+
+		return false
 	}
+
+	return true
 }

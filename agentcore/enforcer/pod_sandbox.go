@@ -111,7 +111,7 @@ func (m *Manager) AttachPodSandbox(info PodSandboxInfo) error {
 
 	m.logger.Info("pod sandbox attached at pod cgroup",
 		"pod_uid", info.PodUID,
-		"sandbox_id", info.SandboxID[:min(len(info.SandboxID), shortContainerIDLen)],
+		"sandbox_id", truncID(info.SandboxID),
 		"pod_cgroup", podCgroup,
 		"netns_inode", netnsIno,
 		"duration_ms", time.Since(start).Milliseconds(),
@@ -149,7 +149,7 @@ func (m *Manager) handleExistingPodSandbox(netnsIno uint64, podCgroup string, in
 
 	if nctx.sandboxID == info.SandboxID {
 		m.mu.Unlock()
-		m.logger.Debug("duplicate pod_sandbox_start ignored", "sandbox_id", info.SandboxID[:12])
+		m.logger.Debug("duplicate pod_sandbox_start ignored", "sandbox_id", truncID(info.SandboxID))
 
 		return true, nil
 	}
@@ -169,22 +169,42 @@ func (m *Manager) handleExistingPodSandbox(netnsIno uint64, podCgroup string, in
 	oldCgID := nctx.podCgroupID
 	m.mu.Unlock()
 
+	// Attach the new link BEFORE closing the old one (requires cgroup
+	// bpf_link multi-attach, Linux >= 5.7; the agent already needs links): closing first leaves
+	// a window with no egress filter on the pod cgroup while containers
+	// are running. Links are independently attachable to one cgroup, so the
+	// program briefly runs twice, which is harmless. On failure the old
+	// link and state stay in place, so the pod keeps its filter.
+	attachErr := m.attachPodLink(nctx, podCgroup, info)
+	if attachErr != nil {
+		return true, attachErr
+	}
+
+	// attachPodLink took a reference for the new sandbox. Release the
+	// replaced sandbox's here; without this release each SandboxChanged
+	// leaked one, so the netns context could never reach refcount 0 and
+	// was never torn down. The count never dips mid-replacement.
+	m.mu.Lock()
+	nctx.refcount--
+	newCgID := nctx.podCgroupID
+	m.mu.Unlock()
+
 	if oldLink != nil {
 		_ = oldLink.Close() // swallow ENOENT
 	}
 
-	nctx.mu.Lock()
-	delete(nctx.cgroupRecorders, oldCgID)
-	nctx.podCgroupLink = nil
-	nctx.podCgroupID = 0
-	nctx.podAttached = false
-	nctx.mu.Unlock()
+	if oldCgID != newCgID {
+		nctx.mu.Lock()
+		delete(nctx.cgroupRecorders, oldCgID)
+		nctx.mu.Unlock()
+	}
 
-	return true, m.attachPodLink(nctx, podCgroup, info)
+	return true, nil
 }
 
 // attachPodLink performs the AttachCgroup call and stores pod-attach state
-// on nctx. Refcount is incremented under m.mu for symmetry with Detach.
+// on nctx under m.mu. Refcount is incremented with it, for symmetry with
+// Detach.
 func (m *Manager) attachPodLink(nctx *NetnsContext, podCgroup string, info PodSandboxInfo) error {
 	start := time.Now()
 
@@ -200,36 +220,40 @@ func (m *Manager) attachPodLink(nctx *NetnsContext, podCgroup string, info PodSa
 		return fmt.Errorf("get pod cgroup id: %w", idErr)
 	}
 
-	nctx.mu.Lock()
-	nctx.podCgroupLink = link
-	nctx.podCgroupID = cgID
-	nctx.podUID = info.PodUID
-	nctx.sandboxID = info.SandboxID
-	nctx.podAttached = true
-
-	// Egress is live at the pod cgroup before any user container runs, so
-	// arm the DNS attach-liveness signal here — the reserved `attached`
-	// reply is answerable from pod-sandbox time, exactly as before this
-	// gating existed (no change to K8s timing). The per-container
-	// attachEnforcer path sets the same flag for non-pod runtimes.
-	nctx.egressAttached.Store(true)
-
 	// Route softirq-context fallbacks (when bpf_get_current_cgroup_id()
 	// returns the pod cgroup id rather than a leaf container's id) to the
 	// pod-shared DNS recorder, instead of letting them fall back to the
 	// arbitrary first-registered recorder in lookupPacketRecorder.
 	if nctx.sharedDNSRecorder != nil {
+		nctx.mu.Lock()
 		nctx.cgroupRecorders[cgID] = nctx.sharedDNSRecorder
+		nctx.mu.Unlock()
 	}
-	nctx.mu.Unlock()
 
+	// Pod-attach state is read under m.mu (attachEnforcer, sandbox
+	// bookkeeping) and by other goroutines handling sibling events, so
+	// it is written under m.mu as well. Refcount moves with it.
 	m.mu.Lock()
+	nctx.podCgroupLink = link
+	nctx.podCgroupID = cgID
+	nctx.podUID = info.PodUID
+	nctx.sandboxID = info.SandboxID
+	nctx.podAttached = true
 	nctx.refcount++
 	m.mu.Unlock()
 
+	// Egress is live at the pod cgroup before any user container runs, so
+	// arm the DNS attach-liveness signal here: leitwacht-initc (an init
+	// container that carries no job env, so it never reaches Attach itself)
+	// must be released as soon as the pod-level program is linked, or every
+	// job pod would wait out its deadline. Known window: until the build
+	// container's own Attach reconciles the netns to its policy, egress
+	// runs under this audit-all placeholder (allowed and logged).
+	nctx.egressAttached.Store(true)
+
 	m.logger.Debug("pod cgroup link bound",
 		"pod_uid", info.PodUID,
-		"sandbox_id", info.SandboxID[:min(len(info.SandboxID), shortContainerIDLen)],
+		"sandbox_id", truncID(info.SandboxID),
 		"pod_cgroup", podCgroup,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
@@ -263,7 +287,8 @@ func (m *Manager) DetachPodSandbox(podUID, sandboxID string) {
 	}
 
 	target.refcount--
-	teardown := target.refcount == 0
+	remaining := target.refcount
+	teardown := remaining == 0
 
 	lastContainer := teardown
 	if teardown && target.inode != 0 && m.NetnsGrace > 0 {
@@ -290,11 +315,9 @@ func (m *Manager) DetachPodSandbox(podUID, sandboxID string) {
 
 	m.logger.Info("pod sandbox detached",
 		"pod_uid", podUID,
-		"sandbox_id", sandboxID[:min(len(sandboxID), shortContainerIDLen)],
-		"refcount", target.refcount,
+		"sandbox_id", truncID(sandboxID),
+		"refcount", remaining,
 		"teardown", teardown,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
 }
-
-const shortContainerIDLen = 12

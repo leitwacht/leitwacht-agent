@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -113,6 +114,7 @@ func (f *fakePlatform) NewUpstreamDialer(_ int) (UpstreamDialer, error) {
 
 // fakeEBPFHandle tracks calls for verification.
 type fakeEBPFHandle struct {
+	mu          sync.Mutex // guards attachCount (AttachCgroup runs from concurrent events)
 	platform    *fakePlatform
 	attachCount int
 	auditMode   bool // last mode set via SetMode
@@ -130,7 +132,8 @@ func (h *fakeEBPFHandle) AddAllowedIP(ip net.IP, ports []int, _ uint32) error {
 
 func (h *fakeEBPFHandle) AddAllowedHost(ip net.IP, port int, prio uint32) error {
 	entry := fmt.Sprintf("%s:%d", ip, port)
-	h.platform.allowedHosts = append(h.platform.allowedHosts, entry)
+	// Map semantics: Put overwrites the key's value, it does not add a row.
+	h.platform.allowedHosts = append(removeEntry(h.platform.allowedHosts, entry), entry)
 	h.platform.recordPrio(entry, prio)
 	return nil
 }
@@ -147,7 +150,7 @@ func (h *fakeEBPFHandle) RemoveAllowedHost(ip net.IP, port int) error {
 
 func (h *fakeEBPFHandle) AddDeniedIP(ip net.IP, port int, prio uint32) error {
 	entry := fmt.Sprintf("%s:%d", ip, port)
-	h.platform.deniedIPs = append(h.platform.deniedIPs, entry)
+	h.platform.deniedIPs = append(removeEntry(h.platform.deniedIPs, entry), entry)
 	h.platform.recordPrio(entry, prio)
 	return nil
 }
@@ -184,7 +187,9 @@ func (h *fakeEBPFHandle) AttachCgroup(_ string) (CgroupLink, error) {
 	if h.platform.attachCgroupErr != nil {
 		return nil, h.platform.attachCgroupErr
 	}
+	h.mu.Lock()
 	h.attachCount++
+	h.mu.Unlock()
 	return &fakeCgroupLink{}, nil
 }
 
@@ -358,13 +363,14 @@ func TestAttachMaxConcurrency(t *testing.T) {
 		t.Fatalf("first attach: %v", err)
 	}
 
-	// Second attach skipped (max concurrency = 1).
+	// Second attach is refused (max concurrency = 1) with an error, so a
+	// block-mode caller can fail closed instead of running unenforced.
 	e, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "container-two2"}, 2, pol)
-	if err != nil {
-		t.Fatalf("second attach should not error: %v", err)
+	if !errors.Is(err, ErrMaxConcurrent) {
+		t.Fatalf("second attach error = %v, want ErrMaxConcurrent", err)
 	}
 	if e != nil {
-		t.Error("second attach should return nil (max concurrency)")
+		t.Error("second attach should return a nil enforcer (max concurrency)")
 	}
 }
 
@@ -383,13 +389,16 @@ func TestAttachDuplicateContainerSkipped(t *testing.T) {
 		t.Fatalf("first attach: %v", err)
 	}
 
-	// Second attach with same containerID is skipped (no leak).
+	first := mgr.enforcers[info.ContainerID]
+
+	// Second attach with same containerID returns the existing handle
+	// explicitly (no leak, no second enforcer).
 	e, err := mgr.Attach(ctx, info, 1, pol)
 	if err != nil {
 		t.Fatalf("duplicate should not error: %v", err)
 	}
-	if e != nil {
-		t.Error("duplicate should return nil")
+	if e == nil || e != first {
+		t.Errorf("duplicate should return the existing enforcer, got %p want %p", e, first)
 	}
 	if mgr.Count() != 1 {
 		t.Errorf("count = %d, want 1 (not 2)", mgr.Count())
@@ -1442,4 +1451,39 @@ func contains(haystack []string, needle string) bool {
 		}
 	}
 	return false
+}
+
+// TestAttachEnforcerRecordsScopeAndLeafCgroups: Docker's systemd driver
+// puts the main PID in .scope/init. The LSM programs key on the task's
+// leaf cgroup id, so the enforcer must remember both paths for LSM
+// registration (not just the scope-stripped attach point).
+func TestAttachEnforcerRecordsScopeAndLeafCgroups(t *testing.T) {
+	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/system.slice/docker-abc.scope/init"}
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr.NetnsGrace = 0
+	defer mgr.DetachAll()
+
+	e, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "abcdef123456"}, 1234, testPolicy("audit"))
+	if err != nil || e == nil {
+		t.Fatalf("attach = (%v, %v)", e, err)
+	}
+
+	want := []string{
+		"/sys/fs/cgroup/system.slice/docker-abc.scope",
+		"/sys/fs/cgroup/system.slice/docker-abc.scope/init",
+	}
+
+	got := e.lsmCgroupPaths()
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("lsmCgroupPaths = %v, want %v", got, want)
+	}
+
+	st := &credwatchContainerState{CgroupID: 1, CgroupIDs: []uint64{1, 2}}
+	if ids := st.allCgroupIDs(); len(ids) != 2 {
+		t.Fatalf("allCgroupIDs = %v, want both ids", ids)
+	}
+
+	if ids := (&procMemContainerState{CgroupID: 7}).allCgroupIDs(); len(ids) != 1 || ids[0] != 7 {
+		t.Fatalf("legacy single-id state: allCgroupIDs = %v", ids)
+	}
 }

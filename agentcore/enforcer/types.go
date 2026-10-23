@@ -1,6 +1,10 @@
 package enforcer
 
-import "time"
+import (
+	"time"
+
+	"gitlab.com/leitwacht/leitwacht-agent/agentcore/internal/idutil"
+)
 
 // ContainerInfo holds identity fields from the start event, preserved for reporting at detach time.
 type ContainerInfo struct {
@@ -33,3 +37,7 @@ type DetachResult struct {
 	Info  ContainerInfo
 	Stats EgressStats
 }
+
+// truncID shortens a container ID for log fields. Unlike a raw [:12]
+// slice it never panics on a short or empty ID (fixtures, runtime quirks).
+var truncID = idutil.Trunc

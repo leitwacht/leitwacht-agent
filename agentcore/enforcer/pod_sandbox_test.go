@@ -2,8 +2,10 @@ package enforcer
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -269,5 +271,210 @@ func TestDetachPodSandbox_TriggersTeardown(t *testing.T) {
 
 	if exists {
 		t.Error("NetnsContext should be removed from the map after teardown")
+	}
+}
+
+// TestAttachPodSandbox_SandboxChangedDoesNotLeakRefcount: kubelet can
+// replace a pod's sandbox; the replaced sandbox's reference must be
+// released before re-attaching, otherwise every replacement leaks one
+// and the netns context never reaches refcount 0 (never torn down).
+func TestAttachPodSandbox_SandboxChangedDoesNotLeakRefcount(t *testing.T) {
+	sandboxCgroup, _, _ := makePodCgroupTree(t)
+
+	fp := &fakePlatform{
+		netnsByPID: map[int]uint64{testSandboxPID: testSharedNetnsIno},
+	}
+
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr.NetnsGrace = 0
+	defer mgr.DetachAll()
+
+	attach := func(sandboxID string) {
+		t.Helper()
+
+		err := mgr.AttachPodSandbox(PodSandboxInfo{
+			PodUID: testPodUID, SandboxID: sandboxID,
+			PID: testSandboxPID, CgroupPath: sandboxCgroup,
+		})
+		if err != nil {
+			t.Fatalf("AttachPodSandbox(%s): %v", sandboxID, err)
+		}
+	}
+
+	attach(testSandboxID)
+	attach("replacement-sandbox-0001")
+	attach("replacement-sandbox-0002")
+
+	mgr.mu.Lock()
+	nctx := mgr.netnsContexts[testSharedNetnsIno]
+	refs, sandbox := nctx.refcount, nctx.sandboxID
+	mgr.mu.Unlock()
+
+	if refs != 1 {
+		t.Fatalf("refcount after two SandboxChanged = %d, want 1", refs)
+	}
+
+	if sandbox != "replacement-sandbox-0002" {
+		t.Fatalf("sandboxID = %q, want the latest replacement", sandbox)
+	}
+
+	// The replaced sandboxes' late die events are no-ops; only the live one tears down.
+	mgr.DetachPodSandbox(testPodUID, testSandboxID)
+
+	mgr.mu.Lock()
+	_, stillThere := mgr.netnsContexts[testSharedNetnsIno]
+	mgr.mu.Unlock()
+
+	if !stillThere {
+		t.Fatal("die event for a replaced sandbox tore down the live context")
+	}
+
+	mgr.DetachPodSandbox(testPodUID, "replacement-sandbox-0002")
+
+	mgr.mu.Lock()
+	_, stillThere = mgr.netnsContexts[testSharedNetnsIno]
+	mgr.mu.Unlock()
+
+	if stillThere {
+		t.Fatal("context leaked after the live sandbox died (refcount leak)")
+	}
+}
+
+// TestPodSandbox_ConcurrentEventsRace drives sandbox replacement,
+// sandbox die, and real-container attach concurrently. Meaningful under
+// -race: sandboxID / podAttached used to be written under nctx.mu but
+// read under Manager.mu.
+func TestPodSandbox_ConcurrentEventsRace(t *testing.T) {
+	sandboxCgroup, _, _ := makePodCgroupTree(t)
+
+	fp := &fakePlatform{
+		cgroupPath: "/sys/fs/cgroup/test",
+		netnsByPID: map[int]uint64{testSandboxPID: testSharedNetnsIno, testBuildPID: testSharedNetnsIno},
+	}
+
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr.NetnsGrace = 0
+	defer mgr.DetachAll()
+
+	if err := mgr.AttachPodSandbox(PodSandboxInfo{
+		PodUID: testPodUID, SandboxID: testSandboxID, PID: testSandboxPID, CgroupPath: sandboxCgroup,
+	}); err != nil {
+		t.Fatalf("AttachPodSandbox: %v", err)
+	}
+
+	var wg sync.WaitGroup
+
+	// Sandbox replacement loop (writes sandboxID / podAttached / refcount).
+	wg.Go(func() {
+		for i := range 40 {
+			_ = mgr.AttachPodSandbox(PodSandboxInfo{
+				PodUID: testPodUID, SandboxID: fmt.Sprintf("sandbox-%02d-abcdef", i),
+				PID: testSandboxPID, CgroupPath: sandboxCgroup,
+			})
+		}
+	})
+
+	// Real-container attach/detach loop (reads podAttached in attachEnforcer).
+	wg.Go(func() {
+		for i := range 40 {
+			cid := fmt.Sprintf("build-%02d-abcdefgh", i)
+			_, _ = mgr.Attach(context.Background(), ContainerInfo{ContainerID: cid}, testBuildPID, testPolicy("audit"))
+			mgr.Detach(cid)
+		}
+	})
+
+	wg.Wait()
+}
+
+func podGateManager(t *testing.T) (*Manager, string) {
+	t.Helper()
+
+	sandboxCgroup, _, _ := makePodCgroupTree(t)
+
+	fp := &fakePlatform{
+		cgroupPath: "/sys/fs/cgroup/test",
+		netnsByPID: map[int]uint64{
+			testSandboxPID: testSharedNetnsIno, testBuildPID: testSharedNetnsIno, 300: testSharedNetnsIno,
+		},
+	}
+
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	t.Cleanup(func() { mgr.DetachAll() })
+
+	return mgr, sandboxCgroup
+}
+
+func gateOpen(t *testing.T, mgr *Manager) bool {
+	t.Helper()
+
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+
+	return mgr.netnsContexts[testSharedNetnsIno].egressAttached.Load()
+}
+
+// TestAttachedSignalRealPodOrdering models the real runner pod order:
+// sandbox start, then the init container (no job env, so only a sibling
+// PrepareNetns), and only after initc exits the build container's Attach.
+// The gate must open before any container Attach (otherwise initc, which
+// blocks the build container from starting, would time out), and the later
+// build Attach must reconcile the netns to block.
+func TestAttachedSignalRealPodOrdering(t *testing.T) {
+	mgr, sandboxCgroup := podGateManager(t)
+
+	if err := mgr.AttachPodSandbox(PodSandboxInfo{
+		PodUID: testPodUID, SandboxID: testSandboxID, PID: testSandboxPID, CgroupPath: sandboxCgroup,
+	}); err != nil {
+		t.Fatalf("AttachPodSandbox: %v", err)
+	}
+
+	if !gateOpen(t, mgr) {
+		t.Fatal("pod-level attach did not arm the attached signal; initc would deadlock the pod")
+	}
+
+	if err := mgr.PrepareNetns("initc0000000000", 300, "/sys/fs/cgroup/initc"); err != nil {
+		t.Fatalf("PrepareNetns: %v", err)
+	}
+
+	if !gateOpen(t, mgr) {
+		t.Fatal("gate closed after the initc sibling started")
+	}
+
+	mgr.mu.Lock()
+	audit := mgr.netnsContexts[testSharedNetnsIno].auditMode.Load()
+	mgr.mu.Unlock()
+
+	if !audit {
+		t.Fatal("netns should still be the audit-all placeholder before the build container attaches")
+	}
+
+	if _, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "build0000000", ProjectPath: "team/app"},
+		testBuildPID, testPolicy("block")); err != nil {
+		t.Fatalf("Attach: %v", err)
+	}
+
+	mgr.mu.Lock()
+	audit = mgr.netnsContexts[testSharedNetnsIno].auditMode.Load()
+	mgr.mu.Unlock()
+
+	if audit {
+		t.Fatal("build container's Attach did not reconcile the netns to block mode")
+	}
+}
+
+// Without a pod link (Docker-style / fallback) a sibling's attach arms the
+// signal.
+func TestAttachedSignalSiblingWithoutPodLink(t *testing.T) {
+	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test", netnsByPID: map[int]uint64{300: testSharedNetnsIno}}
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+
+	defer mgr.DetachAll()
+
+	if err := mgr.PrepareNetns("helper0000000000", 300, "/sys/fs/cgroup/helper"); err != nil {
+		t.Fatalf("PrepareNetns: %v", err)
+	}
+
+	if !gateOpen(t, mgr) {
+		t.Fatal("sibling on a non-pod netns did not arm the attached signal")
 	}
 }

@@ -217,9 +217,18 @@ func (m *Manager) ProcMemLSMLoaded() bool {
 	return m.procMemLSMLoaded
 }
 
-// AttachProcMem populates proc_mem BPF maps for a container.
-// Non-fatal: logs warnings on failure (egress enforcement continues).
+// AttachProcMem populates proc_mem BPF maps for a container's single
+// cgroup. Prefer AttachProcMemPaths when the container has more than one
+// relevant cgroup (scope + leaf).
 func (m *Manager) AttachProcMem(containerID, cgroupPath string, allowProcRead, observeOnly bool) {
+	m.AttachProcMemPaths(containerID, []string{cgroupPath}, allowProcRead, observeOnly)
+}
+
+// AttachProcMemPaths populates proc_mem BPF maps for every cgroup of a
+// container (scope and the Docker /init leaf; see AttachCredwatchPaths
+// for why both are needed).
+// Non-fatal: logs warnings on failure (egress enforcement continues).
+func (m *Manager) AttachProcMemPaths(containerID string, cgroupPaths []string, allowProcRead, observeOnly bool) {
 	if !m.procMemLSMLoaded {
 		return
 	}
@@ -229,27 +238,40 @@ func (m *Manager) AttachProcMem(containerID, cgroupPath string, allowProcRead, o
 		return
 	}
 
-	cgID, err := cgroupID(cgroupPath)
-	if err != nil {
-		m.logger.Warn("proc_mem: failed to get cgroup id", "container", containerID[:12], "error", err)
+	var cgIDs []uint64
 
-		return
+	for _, p := range cgroupPaths {
+		cgID, err := cgroupID(p)
+		if err != nil {
+			m.logger.Warn("proc_mem: failed to get cgroup id", "container", truncID(containerID), "path", p, "error", err)
+
+			continue
+		}
+
+		if err := populateProcMemMaps(lsm.objs, cgID, allowProcRead, observeOnly); err != nil {
+			m.logger.Warn("proc_mem: failed to populate maps", "container", truncID(containerID), "cgroup_id", cgID, "error", err)
+
+			continue
+		}
+
+		cgIDs = append(cgIDs, cgID)
 	}
 
-	if err := populateProcMemMaps(lsm.objs, cgID, allowProcRead, observeOnly); err != nil {
-		m.logger.Warn("proc_mem: failed to populate maps", "container", containerID[:12], "error", err)
-
+	if len(cgIDs) == 0 {
 		return
 	}
 
 	m.mu.Lock()
-	m.procMemContainers[containerID] = &procMemContainerState{CgroupID: cgID, ObserveOnly: observeOnly}
-	m.procMemCgroupMap[cgID] = containerID
+	m.procMemContainers[containerID] = &procMemContainerState{CgroupID: cgIDs[0], CgroupIDs: cgIDs, ObserveOnly: observeOnly}
+
+	for _, id := range cgIDs {
+		m.procMemCgroupMap[id] = containerID
+	}
 	m.mu.Unlock()
 
 	m.logger.Info("proc_mem maps populated",
-		"container", containerID[:12],
-		"cgroup_id", cgID,
+		"container", truncID(containerID),
+		"cgroup_ids", cgIDs,
 		"allow_proc_read", allowProcRead,
 		"observe_only", observeOnly,
 	)
@@ -270,7 +292,10 @@ func (m *Manager) DetachProcMem(containerID string) {
 	state, exists := m.procMemContainers[containerID]
 	if exists {
 		delete(m.procMemContainers, containerID)
-		delete(m.procMemCgroupMap, state.CgroupID)
+
+		for _, id := range state.allCgroupIDs() {
+			delete(m.procMemCgroupMap, id)
+		}
 	}
 	m.mu.Unlock()
 
@@ -278,8 +303,11 @@ func (m *Manager) DetachProcMem(containerID string) {
 		return
 	}
 
-	removeProcMemMaps(lsm.objs, state.CgroupID)
-	m.logger.Debug("proc_mem maps cleaned", "container", containerID[:12])
+	for _, id := range state.allCgroupIDs() {
+		removeProcMemMaps(lsm.objs, id)
+	}
+
+	m.logger.Debug("proc_mem maps cleaned", "container", truncID(containerID))
 }
 
 // handleProcMemBPFEvent is called by the ring buffer reader for each event.

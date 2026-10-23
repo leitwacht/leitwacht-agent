@@ -117,6 +117,12 @@ spec:
               value: {{ .Values.eventBuffer | quote }}
             - name: LEITWACHT_CE_NETNS_GRACE
               value: {{ .Values.netnsGrace | quote }}
+            - name: LEITWACHT_CE_FREEZE_TIMEOUT
+              value: {{ .Values.freezeTimeout | quote }}
+            # Freeze markers must survive an agent container restart: keep
+            # them on the host-backed var-run volume.
+            - name: LEITWACHT_CE_FREEZE_STATE_DIR
+              value: /var/run/leitwacht/frozen
             - name: LEITWACHT_CE_BUCKET_INTERVAL
               value: {{ .Values.bucketInterval | quote }}
             - name: LEITWACHT_CE_LOG_LEVEL
@@ -196,9 +202,10 @@ spec:
             - name: bpf
               mountPath: /sys/fs/bpf
               mountPropagation: Bidirectional
+            # Writable: the pre-attach freeze writes cgroup.freeze (and the
+            # kill fallback writes cgroup.kill) on container cgroups.
             - name: cgroup
               mountPath: /sys/fs/cgroup
-              readOnly: true
       volumes:
         - name: rules
           configMap:

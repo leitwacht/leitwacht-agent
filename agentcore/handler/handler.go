@@ -1,6 +1,7 @@
 // Package handler processes container lifecycle events from the watcher,
-// pauses each container, fetches its policy, runs security checks, attaches
-// enforcement, and reports back. Edition-neutral: EE wires it with gRPC
+// freezes each container until enforcement is attached (see Freezer),
+// fetches its policy, runs security checks, attaches enforcement, and
+// reports back. Edition-neutral: EE wires it with gRPC
 // sinks, CE wires it with stdout/Prometheus/webhook sinks. The handler
 // itself never imports either edition's wire format.
 package handler
@@ -11,7 +12,13 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
+
+	cerrdefs "github.com/containerd/errdefs"
 
 	"gitlab.com/leitwacht/leitwacht-agent/agentcore/advisory"
 	"gitlab.com/leitwacht/leitwacht-agent/agentcore/enforcer"
@@ -22,10 +29,11 @@ import (
 )
 
 const (
-	// handleStartTimeout bounds the pause-to-unpause window. If enforcement
-	// cannot be set up within this time (e.g., backend unreachable), the
-	// container is unpaused to avoid indefinite freezes that would trigger
-	// kubelet liveness probe failures or pod deadline expiry.
+	// handleStartTimeout bounds one HandleStart (policy lookup + attach).
+	// The freeze hold is bounded separately and independently of it (see
+	// Freezer): a container is never left frozen past
+	// max(FreezeTimeout, handleStartTimeout) + freezeHoldSlack, so a stuck
+	// handler cannot cause kubelet liveness failures or pod deadline expiry.
 	handleStartTimeout = 10 * time.Second
 )
 
@@ -105,15 +113,217 @@ type Handler struct {
 	Logger             *slog.Logger
 	DefaultAction      string
 	UnknownProjectMode UnknownProjectMode
+
+	// FreezeTimeout bounds how long HandleStart waits for the container's
+	// cgroup to report frozen. The freeze applies ONLY to the Docker API
+	// runtime (Docker, and Podman through its Docker-compatible socket);
+	// containerd/CRI (Kubernetes) events are never frozen, since K8s relies
+	// on the leitwacht-initc pre-job gate. BEHAVIOUR CHANGE: the zero value means
+	// DefaultFreezeTimeout (5s) with the freeze ENABLED, so a Handler
+	// constructed without this field now freezes every container it
+	// attaches. To turn the freeze off set DisableFreeze (or a negative
+	// FreezeTimeout); not recommended, the job then runs with unfiltered
+	// egress until attach completes.
+	FreezeTimeout time.Duration
+
+	// DisableFreeze turns the pre-attach freeze off explicitly. Equivalent
+	// to a negative FreezeTimeout.
+	DisableFreeze bool
+
+	// FreezeStateDir is where freeze markers are persisted so RecoverFrozen
+	// can release containers a crashed agent left frozen. Empty means
+	// DefaultFreezeStateDir. Ignored when Freezer is set.
+	FreezeStateDir string
+
+	// Freezer overrides the container freezer. Nil builds one lazily that
+	// uses the cgroup v2 freezer, falling back to the Watcher's pause API
+	// when the Watcher implements ContainerPauser.
+	Freezer *Freezer
+
+	freezerOnce      sync.Once
+	freezeWarnedOnce sync.Once
+	freezerResolved  *Freezer
+	killWireOnce     sync.Once
 }
 
-// HandleStart processes a container start event: pauses the container to
-// prevent egress before enforcement is ready, fetches policy, runs security
-// checks, attaches enforcement, then unpauses.
+// freezer returns the configured or lazily built Freezer.
+func (h *Handler) freezer() *Freezer {
+	h.freezerOnce.Do(func() {
+		if h.Freezer != nil {
+			h.freezerResolved = h.Freezer
+
+			return
+		}
+
+		f := &Freezer{Logger: h.Logger, StateDir: h.FreezeStateDir}
+		if p, ok := h.Watcher.(ContainerPauser); ok {
+			f.Pauser = p
+		}
+
+		h.freezerResolved = f
+	})
+
+	// The hard-limit callback is wired whether the Freezer is ours or
+	// supplied: a block-mode freeze that expires kills, it does not release.
+	h.killWireOnce.Do(func() {
+		if h.freezerResolved.Kill == nil {
+			h.freezerResolved.Kill = func(id, scope string) { h.killContainer(id, scope) }
+		}
+	})
+
+	return h.freezerResolved
+}
+
+// Shutdown releases every container still frozen. Call it before the
+// agent exits so no workload is left stopped.
+func (h *Handler) Shutdown() {
+	h.freezer().ThawAll()
+}
+
+// RecoverFrozen releases containers a previous agent process left frozen
+// (crash, SIGKILL, OOM). Call it once at startup, BEFORE enumerating
+// running containers: a frozen or paused workload never reports as
+// running and would otherwise stay stopped forever.
+func (h *Handler) RecoverFrozen(ctx context.Context) int {
+	return h.freezer().RecoverFrozen(ctx)
+}
+
+const killTimeout = 5 * time.Second
+
+// killContainer kills a container on a fresh context (the handler's own
+// may be spent) and checks the result. If the runtime kill fails it falls
+// back to the cgroup v2 kill switch on the container scope. Returns nil
+// when the container was killed.
+func (h *Handler) killContainer(containerID, scope string) error {
+	kctx, cancel := context.WithTimeout(context.Background(), killTimeout)
+	defer cancel()
+
+	err := h.Watcher.KillContainer(kctx, containerID)
+	if err == nil {
+		return nil
+	}
+
+	// Already exited / no longer known to the runtime: the goal (it is not
+	// running) is met.
+	if errors.Is(err, os.ErrNotExist) || cerrdefs.IsNotFound(err) {
+		return nil
+	}
+
+	h.Logger.Error("runtime kill failed", "container_id", truncID(containerID), "error", err)
+
+	if scope != "" {
+		if werr := writeCgroupFile(filepath.Join(scope, "cgroup.kill"), "1"); werr == nil {
+			return nil
+		} else {
+			h.Logger.Error("cgroup.kill fallback failed", "container_id", truncID(containerID), "error", werr)
+		}
+	}
+
+	return err
+}
+
+// kill returns the advisory action to report: "killed", or "kill_failed"
+// when neither the runtime nor cgroup.kill could stop the container.
+func (h *Handler) kill(ev watcher.ContainerEvent, scope string) string {
+	if err := h.killContainer(ev.ContainerID, scope); err != nil {
+		return "kill_failed"
+	}
+
+	return "killed"
+}
+
+// containerScope returns the container's cgroup scope directory: the
+// kernel's view from /proc first, then the runtime-supplied path if it is
+// under the cgroup mount. Empty when neither is usable.
+func (h *Handler) containerScope(ev watcher.ContainerEvent) string {
+	if h.Enforcer != nil && ev.PID > 0 {
+		if p, err := h.Enforcer.CgroupPathForPID(ev.PID); err == nil && p != "" {
+			return enforcer.ScopeCgroup(p)
+		}
+	}
+
+	// containerd may report a systemd-style "slice:prefix:name" here, and
+	// anything outside the cgroup mount is not a path we may write to.
+	if strings.HasPrefix(ev.CgroupPath, cgroupMount+"/") {
+		return enforcer.ScopeCgroup(ev.CgroupPath)
+	}
+
+	return ""
+}
+
+const cgroupMount = "/sys/fs/cgroup"
+
+// freezeRuntime reports whether the Watcher's runtime is one the pre-attach
+// freeze applies to: the Docker API (including Podman's compatible API).
+func (h *Handler) freezeRuntime() bool {
+	rn, ok := h.Watcher.(watcher.RuntimeNamer)
+
+	return ok && rn.Runtime() == watcher.RuntimeDocker
+}
+
+// freezeBeforeAttach stops the container until enforcement is attached.
+// It returns a nil *Freeze (whose Thaw is a no-op) when no freeze is
+// needed or possible, and an error only when a freeze was attempted and
+// failed in a way the caller must act on. ErrFreezeUnavailable and
+// os.ErrNotExist (container already gone) are returned for the caller to
+// treat as "proceed unfrozen".
+func (h *Handler) freezeBeforeAttach(ctx context.Context, ev watcher.ContainerEvent) (*Freeze, error) {
+	if h.DisableFreeze || h.FreezeTimeout < 0 || ev.HasGVisor {
+		return nil, nil //nolint:nilnil // nil Freeze is a valid no-op handle
+	}
+
+	// Freeze applies to the Docker API runtime only (Docker, and Podman via
+	// its Docker-compatible socket). It is never applied to containerd/CRI
+	// (Kubernetes) events, whatever the pod-attach state: K8s pods are
+	// gated by the leitwacht-initc init container, which holds entrypoints
+	// until the DNS proxy reports the netns enforcing. A watcher that does
+	// not identify its runtime is treated as non-freezable.
+	if !h.freezeRuntime() {
+		return nil, nil //nolint:nilnil // nil Freeze is a valid no-op handle
+	}
+
+	scope := h.containerScope(ev)
+
+	z, err := h.freezer().Freeze(ctx, ev.ContainerID, scope, h.FreezeTimeout)
+	if err != nil && errors.Is(err, os.ErrNotExist) && ev.PID > 0 && procExists(ev.PID) {
+		// The process is alive but we could not find its cgroup directory
+		// (path mismatch, namespaced mount). That is "cannot freeze by
+		// cgroup", not "container gone": use the runtime pause API.
+		z, err = h.freezer().FreezePause(ctx, ev.ContainerID)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	// Until the policy is known assume the configured default; HandleStart
+	// refines this once it has resolved the job's action.
+	z.SetKillOnExpire(h.DefaultAction == policy.ActionBlock)
+
+	return z, nil
+}
+
+func procExists(pid int) bool {
+	_, err := os.Stat("/proc/" + strconv.Itoa(pid))
+
+	return err == nil
+}
+
+// HandleStart processes a container start event: freezes the container so it
+// cannot egress before enforcement is ready, fetches policy, runs security
+// checks, attaches enforcement, then thaws it.
+//
+// Failure handling is fail-closed in block mode: if the freeze cannot be
+// confirmed or attach fails (other than the container having already
+// exited), the container is killed and an advisory with action "killed" is
+// sent. In audit mode the container is thawed and a "warned" advisory is
+// sent. The container is always thawed on return.
 //
 //nolint:funlen // orchestration handler with sequential security steps
 func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
-	// Bound the entire pause-to-unpause window to prevent indefinite container freezes.
+	// Bound policy lookup + attach. The freeze itself has its own hard
+	// limit (Freezer) so a wedged handler can never leave a container
+	// frozen.
 	ctx, cancel := context.WithTimeout(ctx, handleStartTimeout)
 	defer cancel()
 
@@ -123,6 +333,16 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 		"job_id", ev.JobID,
 	)
 
+	// Close the pre-attach window first. Docker and Podman only (see
+	// freezeBeforeAttach; never containerd/K8s): there is no pod sandbox, so without a freeze the job runs
+	// with unfiltered egress and no DNS redirect until policy lookup, eBPF
+	// load, nftables setup and cgroup attach finish. The deferred Thaw is
+	// the safety net for every early return below.
+	freeze, freezeErr := h.freezeBeforeAttach(ctx, ev)
+	defer freeze.Thaw()
+
+	scope := h.containerScope(ev)
+
 	// On K8s the build container's eBPF cgroup attach race is closed by
 	// the pod-sandbox attach path (HandlePodSandboxStart →
 	// Manager.AttachPodSandbox): when the pause container's /tasks/start
@@ -130,7 +350,11 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 	// agent derives the parent pod cgroup and attaches the cgroup_skb
 	// program once at that level. Every container that subsequently joins
 	// the pod (init, helper, build) is filtered automatically; the build
-	// container's first packet hits an already-attached program. The
+	// container's first packet hits an already-attached program, which
+	// runs the audit-all placeholder until this container's own Attach
+	// reconciles the netns to its policy: a known window of tens of ms in
+	// which egress is allowed and logged. leitwacht-initc releases on the
+	// pod-level attach, not on that reconcile. The
 	// per-container AttachCgroup call below is skipped when the
 	// NetnsContext is podAttached, and stays as the fallback path for
 	// Docker/Podman/plain-containerd shapes that have no pod cgroup.
@@ -184,6 +408,8 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 		pol = pol.ForJob(ev.JobName)
 	}
 
+	freeze.SetKillOnExpire(pol.Action == policy.ActionBlock)
+
 	report := func(kind advisory.Kind, msg, action string) {
 		_ = h.AdvisorySink.ReportAdvisory(ctx, &advisory.Advisory{
 			ContainerID:  ev.ContainerID,
@@ -216,8 +442,10 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 	}
 
 	// Non-enrolled projects get DNS interception only — no security
-	// advisories, no container kills. Skip straight to attach.
+	// advisories, no container kills. Skip straight to attach. Nothing is
+	// enforced for them, so release the freeze first.
 	if passiveOnly {
+		freeze.Thaw()
 		h.attachSentinelOnly(ctx, ev, pol)
 
 		return
@@ -227,13 +455,13 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 	if ev.HasDinD {
 		if pol.Action == policy.ActionBlock {
 			h.Logger.Error("DinD detected in block mode, killing container", "container_id", truncID(ev.ContainerID))
-			_ = h.Watcher.KillContainer(ctx, ev.ContainerID)
+			act := h.kill(ev, scope)
 
 			report(advisory.KindDinDDetected,
 				"Docker-in-Docker detected — container killed (block mode).\n\n"+
 					"Fix: Replace DinD with kaniko, buildah, or Docker socket binding for image builds. "+
 					"DinD spawns nested containers whose network traffic cannot be enforced.",
-				"killed")
+				act)
 
 			return
 		}
@@ -251,14 +479,14 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 	if ev.HasSocketMount {
 		if pol.Action == policy.ActionBlock {
 			h.Logger.Error("Docker socket mount in block mode, killing container", "container_id", truncID(ev.ContainerID))
-			_ = h.Watcher.KillContainer(ctx, ev.ContainerID)
+			act := h.kill(ev, scope)
 
 			report(advisory.KindSocketMount,
 				"Docker socket bind mount detected — container killed (block mode).\n\n"+
 					"Fix: Remove the /var/run/docker.sock volume mount from the runner's volume configuration "+
 					"(config.toml [runners.docker] volumes, or Helm values runners.config volumes). "+
 					"Socket access allows spawning sibling containers that bypass network enforcement.",
-				"killed")
+				act)
 
 			return
 		}
@@ -277,14 +505,14 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 	if ev.MissingNetworkPerBld {
 		if pol.Action == policy.ActionBlock {
 			h.Logger.Error("FF_NETWORK_PER_BUILD missing in block mode, killing container", "container_id", truncID(ev.ContainerID))
-			_ = h.Watcher.KillContainer(ctx, ev.ContainerID)
+			act := h.kill(ev, scope)
 
 			report(advisory.KindFFNetworkPerBuildMissing,
 				"FF_NETWORK_PER_BUILD not enabled — container killed (block mode).\n\n"+
 					"Fix: Set FF_NETWORK_PER_BUILD = \"true\" in the runner's environment variables "+
 					"(config.toml [[runners.environment]], Helm values runners.config environment, or as a CI/CD variable in GitLab). "+
 					"This isolates each job's network stack.",
-				"killed")
+				act)
 
 			return
 		}
@@ -299,22 +527,101 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 			"warned")
 	}
 
-	_, attachErr := h.Enforcer.Attach(ctx, infoFromEvent(ev, pol), ev.PID, pol)
-	if attachErr != nil {
-		// Short-lived helper containers (e.g. GitLab Runner init containers) may exit
-		// before we can attach. Don't fire an advisory for these — the build container
-		// will start momentarily and attach successfully.
-		if errors.Is(attachErr, os.ErrNotExist) {
-			h.Logger.Debug("container exited before attach, skipping advisory", "container_id", truncID(ev.ContainerID))
-		} else {
-			h.Logger.Error("attach enforcement failed", "container_id", truncID(ev.ContainerID), "error", attachErr)
-			report(advisory.KindAttachFailure,
-				fmt.Sprintf("eBPF enforcement failed to attach: %s\n\n"+
-					"Fix: Ensure the host kernel supports eBPF (a maintained kernel current on its distro's security stream), the agent has CAP_SYS_ADMIN/CAP_BPF, "+
-					"and the container PID namespace is accessible. Check agent logs for details.", attachErr),
-				"warned")
-		}
+	// A freeze that was attempted and failed (timeout, write error) leaves
+	// the container in an unknown state with no confirmed window closure.
+	// "Unavailable" and "already gone" are not failures: there is nothing
+	// to hold, and attach below reports a vanished container itself.
+	if freezeErr != nil && !h.handleFreezeFailure(ctx, ev, pol, freezeErr, scope, report) {
+		return
 	}
+
+	_, attachErr := h.Enforcer.Attach(ctx, infoFromEvent(ev, pol), ev.PID, pol)
+	if attachErr == nil {
+		freeze.Thaw()
+
+		return
+	}
+
+	// Short-lived helper containers (e.g. GitLab Runner init containers) may exit
+	// before we can attach. Don't fire an advisory for these — the build container
+	// will start momentarily and attach successfully.
+	if errors.Is(attachErr, os.ErrNotExist) {
+		h.Logger.Debug("container exited before attach, skipping advisory", "container_id", truncID(ev.ContainerID))
+
+		return
+	}
+
+	// A duplicate start event while the first attach is in flight: the
+	// first call owns the outcome (and the freeze).
+	if errors.Is(attachErr, enforcer.ErrAttachInProgress) {
+		h.Logger.Debug("attach already in progress, ignoring duplicate start", "container_id", truncID(ev.ContainerID))
+
+		return
+	}
+
+	h.Logger.Error("attach enforcement failed", "container_id", truncID(ev.ContainerID), "error", attachErr)
+
+	fix := "Fix: Ensure the host kernel supports eBPF (a maintained kernel current on its distro's security stream), the agent has CAP_SYS_ADMIN/CAP_BPF, " +
+		"and the container PID namespace is accessible. Check agent logs for details."
+
+	if errors.Is(attachErr, enforcer.ErrMaxConcurrent) {
+		fix = "Fix: Raise the agent's maximum concurrent enforcement setting or reduce parallel jobs per node."
+	}
+
+	// Fail closed in block mode: a container that could not be put under
+	// enforcement must not run as if it were.
+	if pol.Action == policy.ActionBlock {
+		h.Logger.Error("enforcement not attached in block mode, killing container", "container_id", truncID(ev.ContainerID))
+		act := h.kill(ev, scope)
+
+		report(advisory.KindAttachFailure,
+			fmt.Sprintf("eBPF enforcement failed to attach — container killed (block mode): %s\n\n%s", attachErr, fix),
+			act)
+
+		return
+	}
+
+	report(advisory.KindAttachFailure,
+		fmt.Sprintf("eBPF enforcement failed to attach: %s\n\n%s", attachErr, fix),
+		"warned")
+}
+
+// handleFreezeFailure acts on a freeze error. It returns true when
+// HandleStart should continue to attach, false when the container was
+// dealt with (killed in block mode).
+func (h *Handler) handleFreezeFailure(
+	ctx context.Context, ev watcher.ContainerEvent, pol *policy.ResolvedPolicy,
+	freezeErr error, scope string, report func(advisory.Kind, string, string),
+) bool {
+	switch {
+	case errors.Is(freezeErr, os.ErrNotExist):
+		return true
+	case errors.Is(freezeErr, ErrFreezeUnavailable):
+		h.freezeWarnedOnce.Do(func() {
+			h.Logger.Warn("pre-attach freeze unavailable on this host; containers run unfiltered until attach completes",
+				"error", freezeErr)
+		})
+
+		return true
+	}
+
+	h.Logger.Error("pre-attach freeze failed", "container_id", truncID(ev.ContainerID), "error", freezeErr)
+
+	if pol.Action == policy.ActionBlock {
+		act := h.kill(ev, scope)
+
+		report(advisory.KindAttachFailure,
+			fmt.Sprintf("could not hold the container until enforcement attached — container killed (block mode): %s", freezeErr),
+			act)
+
+		return false
+	}
+
+	report(advisory.KindAttachFailure,
+		fmt.Sprintf("could not hold the container until enforcement attached; it may have run unfiltered briefly: %s", freezeErr),
+		"warned")
+
+	return true
 }
 
 // attachSentinelOnly attaches DNS interception with a no-rule audit-pass
@@ -377,7 +684,7 @@ func (h *Handler) HandlePodSandboxDie(_ context.Context, ev watcher.ContainerEve
 // HandleSiblingStart processes a sibling container start event (e.g., K8s
 // helper container). Sets up netns-level DNS infrastructure (proxy, nftables,
 // eBPF) so DNS queries are captured before the build container starts.
-// No pause, no policy fetch — runs in audit-all mode until the build container
+// No freeze, no policy fetch — runs in audit-all mode until the build container
 // joins and provides the real policy.
 func (h *Handler) HandleSiblingStart(_ context.Context, ev watcher.ContainerEvent) {
 	h.Logger.Info("sibling container start",

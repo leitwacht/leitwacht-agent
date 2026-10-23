@@ -267,6 +267,14 @@ func TestIntegrationDNSAllowUnaffectedByPriority(t *testing.T) {
 
 	const allowedDomain = "example.com"
 
+	// Needs real internet egress from the host: skip, don't fail, where the
+	// network (or this port) is filtered.
+	if c, err := net.DialTimeout("tcp", allowedDomain+":80", 3*time.Second); err != nil {
+		t.Skipf("no egress to %s:80 from this host: %v", allowedDomain, err)
+	} else {
+		_ = c.Close()
+	}
+
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	script := "while true; do nc -z -w 3 " + allowedDomain + " 80 >/dev/null 2>&1 || true; sleep 2; done"

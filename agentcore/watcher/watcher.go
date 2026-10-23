@@ -156,12 +156,12 @@ func (w *Watcher) handleEvent(ctx context.Context, ev events.Message, ch chan<- 
 	info, err := w.client.ContainerInspect(ctx, containerID)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
-			w.logger.Debug("container gone before inspect", "container_id", containerID[:12])
+			w.logger.Debug("container gone before inspect", "container_id", truncID(containerID))
 
 			return
 		}
 
-		w.logger.Error("inspect container", "container_id", containerID[:12], "error", err)
+		w.logger.Error("inspect container", "container_id", truncID(containerID), "error", err)
 
 		return
 	}
@@ -180,13 +180,13 @@ func (w *Watcher) handleEvent(ctx context.Context, ev events.Message, ch chan<- 
 		w.scope,
 	)
 	if event == nil {
-		w.logger.Debug("skipping non-build container", "container_id", containerID[:12])
+		w.logger.Debug("skipping non-build container", "container_id", truncID(containerID))
 
 		return
 	}
 
 	w.logger.Info("build container detected",
-		"container_id", containerID[:12],
+		"container_id", truncID(containerID),
 		"project", event.ProjectPath,
 		"job_id", event.JobID,
 	)
@@ -222,7 +222,7 @@ func (w *Watcher) RecoverRunning(ctx context.Context) ([]ContainerEvent, error) 
 	for _, c := range containers {
 		info, err := w.client.ContainerInspect(ctx, c.ID)
 		if err != nil {
-			w.logger.Warn("inspect running container", "container_id", c.ID[:12], "error", err)
+			w.logger.Warn("inspect running container", "container_id", truncID(c.ID), "error", err)
 
 			continue
 		}
@@ -253,6 +253,33 @@ func (w *Watcher) KillContainer(ctx context.Context, containerID string) error {
 	err := w.client.ContainerKill(ctx, containerID, "KILL")
 	if err != nil {
 		return fmt.Errorf("kill container %s: %w", containerID, err)
+	}
+
+	return nil
+}
+
+// Runtime identifies this watcher as the Docker-API one. Podman served
+// through its Docker-compatible socket is configured as the "docker"
+// runtime and takes this path too; it is the only runtime whose containers
+// the handler freezes before attach.
+func (w *Watcher) Runtime() string { return RuntimeDocker }
+
+// PauseContainer freezes every process in the container via the runtime's
+// pause API. Fallback for hosts where the cgroup v2 freezer is not usable.
+func (w *Watcher) PauseContainer(ctx context.Context, containerID string) error {
+	err := w.client.ContainerPause(ctx, containerID)
+	if err != nil {
+		return fmt.Errorf("pause container %s: %w", truncID(containerID), err)
+	}
+
+	return nil
+}
+
+// UnpauseContainer reverses PauseContainer.
+func (w *Watcher) UnpauseContainer(ctx context.Context, containerID string) error {
+	err := w.client.ContainerUnpause(ctx, containerID)
+	if err != nil {
+		return fmt.Errorf("unpause container %s: %w", truncID(containerID), err)
 	}
 
 	return nil

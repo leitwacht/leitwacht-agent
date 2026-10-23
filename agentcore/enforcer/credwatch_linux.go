@@ -435,9 +435,21 @@ func (m *Manager) CredwatchLSMLoaded() bool {
 	return m.credwatchLSMLoaded
 }
 
-// AttachCredwatch populates credwatch BPF maps for a container.
-// Non-fatal: logs warnings on failure (egress enforcement continues).
+// AttachCredwatch populates credwatch BPF maps for a container's single
+// cgroup. Prefer AttachCredwatchPaths when the container has more than
+// one relevant cgroup (scope + leaf).
 func (m *Manager) AttachCredwatch(containerID, cgroupPath string, allowCredWatch, observeOnly bool) {
+	m.AttachCredwatchPaths(containerID, []string{cgroupPath}, allowCredWatch, observeOnly)
+}
+
+// AttachCredwatchPaths populates credwatch BPF maps for every cgroup of
+// a container. The BPF program keys on bpf_get_current_cgroup_id(),
+// which is the task's leaf cgroup: a Docker container whose PID lives in
+// .../docker-<id>.scope/init reports the /init leaf, not the scope the
+// egress program is attached at, so both ids must be registered or the
+// main process's own credential reads go unseen.
+// Non-fatal: logs warnings on failure (egress enforcement continues).
+func (m *Manager) AttachCredwatchPaths(containerID string, cgroupPaths []string, allowCredWatch, observeOnly bool) {
 	if !m.credwatchLSMLoaded {
 		return
 	}
@@ -447,30 +459,44 @@ func (m *Manager) AttachCredwatch(containerID, cgroupPath string, allowCredWatch
 		return
 	}
 
-	cgID, err := cgroupID(cgroupPath)
-	if err != nil {
-		m.logger.Warn("credwatch: failed to get cgroup id", "container", containerID[:12], "error", err)
+	var cgIDs []uint64
 
-		return
+	for _, p := range cgroupPaths {
+		cgID, err := cgroupID(p)
+		if err != nil {
+			m.logger.Warn("credwatch: failed to get cgroup id", "container", truncID(containerID), "path", p, "error", err)
+
+			continue
+		}
+
+		if err := populateCredwatchMaps(lsm.objs, cgID, allowCredWatch, observeOnly); err != nil {
+			m.logger.Warn("credwatch: failed to populate maps", "container", truncID(containerID), "cgroup_id", cgID, "error", err)
+
+			continue
+		}
+
+		cgIDs = append(cgIDs, cgID)
 	}
 
-	if err := populateCredwatchMaps(lsm.objs, cgID, allowCredWatch, observeOnly); err != nil {
-		m.logger.Warn("credwatch: failed to populate maps", "container", containerID[:12], "error", err)
-
+	if len(cgIDs) == 0 {
 		return
 	}
 
 	m.mu.Lock()
 	m.credwatchContainers[containerID] = &credwatchContainerState{
-		CgroupID:    cgID,
+		CgroupID:    cgIDs[0],
+		CgroupIDs:   cgIDs,
 		ObserveOnly: observeOnly,
 	}
-	m.credwatchCgroupToContainer[cgID] = containerID
+
+	for _, id := range cgIDs {
+		m.credwatchCgroupToContainer[id] = containerID
+	}
 	m.mu.Unlock()
 
 	m.logger.Info("credwatch maps populated",
-		"container", containerID[:12],
-		"cgroup_id", cgID,
+		"container", truncID(containerID),
+		"cgroup_ids", cgIDs,
 		"allow_credwatch", allowCredWatch,
 		"observe_only", observeOnly,
 	)
@@ -491,7 +517,10 @@ func (m *Manager) DetachCredwatch(containerID string) {
 	state, exists := m.credwatchContainers[containerID]
 	if exists {
 		delete(m.credwatchContainers, containerID)
-		delete(m.credwatchCgroupToContainer, state.CgroupID)
+
+		for _, id := range state.allCgroupIDs() {
+			delete(m.credwatchCgroupToContainer, id)
+		}
 	}
 	m.mu.Unlock()
 
@@ -499,8 +528,11 @@ func (m *Manager) DetachCredwatch(containerID string) {
 		return
 	}
 
-	removeCredwatchMaps(lsm.objs, state.CgroupID)
-	m.logger.Debug("credwatch maps cleaned", "container", containerID[:12])
+	for _, id := range state.allCgroupIDs() {
+		removeCredwatchMaps(lsm.objs, id)
+	}
+
+	m.logger.Debug("credwatch maps cleaned", "container", truncID(containerID))
 }
 
 // handleCredwatchBPFEvent is called by the ring buffer reader for each event.

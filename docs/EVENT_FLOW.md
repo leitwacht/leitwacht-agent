@@ -201,9 +201,11 @@ mid-flush and the final bucket is lost. Either lower
 | `LEITWACHT_CE_EVENT_BUFFER`   | 64      | `event_channel_depth` pegged              | Memory pressure on tiny nodes |
 | `LEITWACHT_CE_MAX_CONCURRENT` | 64      | `ErrMaxConcurrent` in logs                | OOMKilled at scale (rare)    |
 | `LEITWACHT_CE_NETNS_GRACE`    | 30s     | "torn down after grace period" warnings   | nctx leaks; many `deferredTeardown` sleepers under churn |
+| `LEITWACHT_CE_FREEZE_TIMEOUT` | 5s      | "pre-attach freeze failed" in logs         | `0` disables the freeze (job runs unfiltered until attach completes) |
+| `LEITWACHT_CE_FREEZE_STATE_DIR` | /run/leitwacht/frozen | n/a | Must survive an agent restart; used to thaw containers a crashed agent left frozen |
 | `LEITWACHT_CE_BUCKET_INTERVAL`| 5m      | Want fresher data in reports              | `DetachAll` shutdown wait too long for kubelet grace period |
 | `LEITWACHT_CE_DNS_UPSTREAM`   | (required) | n/a — no default, must be set explicitly | n/a |
-| `handleStartTimeout`          | 10s (constant) | Slow upstreams routinely time out  | n/a — bound exists to bound pause |
+| `handleStartTimeout`          | 10s (constant) | Slow upstreams routinely time out  | n/a — bounds policy lookup + attach; the freeze has its own hard limit |
 
 ## Why dispatch isn't fan-out
 
@@ -213,10 +215,13 @@ synchronous:
 1. **Ordering** — sandbox-then-container-then-die is invariant the
    eBPF cgroup-derivation logic depends on. A worker pool would
    require explicit per-pod serialisation.
-2. **Pause-window honesty** — `handleStartTimeout` bounds *the* pause
-   window. If 100 container starts arrive at once, processing them
+2. **Freeze-window honesty** — a container is frozen from the moment
+   its start event is *handled* until attach completes, bounded by a
+   hard limit. If 100 container starts arrive at once, processing them
    serially gives the operator a sharp signal (queue depth) instead of
-   100 simultaneously-paused containers.
+   100 simultaneously-frozen containers. Note the flip side: an event
+   waiting in the channel is not frozen yet, so a deep queue is also a
+   wider unfiltered window — alert on `event_channel_depth`.
 3. **Resource-exhaustion is observable** — the channel depth gauge
    *is* the load signal. Replace dispatch with a worker pool and the
    load signal becomes "average attach latency under contention",
@@ -386,3 +391,53 @@ Residual gaps:
   the opening process.
 - Rename/link hooks need `CONFIG_SECURITY_PATH`; without it credwatch
   runs with the `file_open` check only.
+
+## Pre-attach freeze: operational notes
+
+- **Scope: Docker and Podman only.** The freeze is applied only to
+  events from the Docker-API watcher (Podman is run through its
+  Docker-compatible socket with `LEITWACHT_CE_CONTAINER_RUNTIME=docker`).
+  It is never applied to containerd/CRI (Kubernetes) events. K8s jobs
+  are gated by the `leitwacht-initc` init container instead; see below.
+  Plain containerd outside Kubernetes (`nerdctl`, `ctr`) is the same
+  watcher and therefore has no freeze: the pre-attach window of finding
+  #3 remains for that shape.
+
+- While a container is frozen (from its start event until attach
+  completes, typically tens to hundreds of ms) `exec` into it and
+  container health checks fail or time out. Do not alert on a single
+  failure at container start.
+- Freezes are not reference-counted per cgroup: a second freeze of the
+  same cgroup would share one marker and the first thaw would release
+  both. This is safe only because `HandleStart` events are dispatched
+  serially (see above); a future fan-out must refcount per cgroup.
+- A crashed agent cannot thaw what it froze. Markers under
+  `LEITWACHT_CE_FREEZE_STATE_DIR` are swept (and the containers thawed)
+  at the next start, before running containers are enumerated.
+
+## Kubernetes: the leitwacht-initc gate and the audit window
+
+The pod-sandbox event attaches egress at the pod cgroup with an
+**audit-all placeholder** policy and arms the reserved
+`_leitwacht.attached.local` TXT "attached" answer that
+`leitwacht-initc` polls. initc is an init container whose pod-spec patch
+carries no job environment, so its start is only a sibling
+(`PrepareNetns`); it never reaches `Attach` and must be released as soon
+as the pod-level program is linked. The build, helper and service
+containers (the ones that carry `CI_PROJECT_PATH` and reach `Attach`)
+cannot start until initc exits.
+
+**Known window:** from the build container's start until its own `Attach`
+reconciles the netns to the job's policy, egress runs under the
+audit-all placeholder (allowed and logged, not blocked). That is
+typically tens of milliseconds. The Docker/Podman freeze does not apply
+to Kubernetes (containerd/CRI) events.
+
+`leitwacht-initc` exits 1 if the signal is not seen within its deadline
+(`LEITWACHT_INIT_DEADLINE`, default 20s), so a job whose agent never
+attached fails closed.
+
+Possible future hardening (operator decision, not implemented): carry
+the job's block/audit intent to the pod at sandbox time (pod annotations
+exposed to the init container through the downward API) and withhold the
+attached signal until the netns is enforcing for a block-mode job.

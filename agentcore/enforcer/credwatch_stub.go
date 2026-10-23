@@ -16,3 +16,6 @@ func (m *Manager) AttachCredwatch(_, _ string, _, _ bool) {}
 
 // DetachCredwatch is a no-op on non-linux.
 func (m *Manager) DetachCredwatch(_ string) {}
+
+// AttachCredwatchPaths is a no-op on non-linux.
+func (m *Manager) AttachCredwatchPaths(_ string, _ []string, _, _ bool) {}

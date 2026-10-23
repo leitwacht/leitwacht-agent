@@ -379,7 +379,7 @@ func (w *ContainerdWatcher) RecoverRunning(ctx context.Context) ([]ContainerEven
 		}
 
 		status, err := task.Status(ctx)
-		if err != nil || status.Status != containerd.Running {
+		if err != nil || !taskLive(status.Status) {
 			noTask++
 
 			continue
@@ -467,7 +467,7 @@ func (w *ContainerdWatcher) RunningContainerIDs(ctx context.Context) (map[string
 		}
 
 		status, err := task.Status(ctx)
-		if err != nil || status.Status != containerd.Running {
+		if err != nil || !taskLive(status.Status) {
 			continue
 		}
 
@@ -486,6 +486,11 @@ func (w *ContainerdWatcher) KillContainer(ctx context.Context, containerID strin
 
 	return task.Kill(ctx, syscall.SIGKILL) //nolint:wrapcheck // pass through containerd errors
 }
+
+// Runtime identifies this watcher as the containerd/CRI (Kubernetes) one.
+// The handler never freezes containers from it: K8s uses the
+// leitwacht-initc pre-job gate.
+func (w *ContainerdWatcher) Runtime() string { return RuntimeContainerd }
 
 func (w *ContainerdWatcher) getTask(ctx context.Context, containerID string) (containerd.Task, error) {
 	container, err := w.client.LoadContainer(ctx, containerID)
@@ -570,7 +575,7 @@ func (w *ContainerdWatcher) recoverSandbox(
 	}
 
 	status, err := task.Status(ctx)
-	if err != nil || status.Status != containerd.Running {
+	if err != nil || !taskLive(status.Status) {
 		return ContainerEvent{}, false
 	}
 
@@ -644,3 +649,11 @@ func (w *ContainerdWatcher) Close() error {
 
 // truncID is the package-local alias for idutil.Trunc.
 var truncID = idutil.Trunc
+
+// taskLive reports whether a task counts as running for recovery and
+// reconcile. A task the agent paused (pre-attach freeze, runtime-pause
+// fallback) is still a live workload: skipping it would drop the container
+// from enforcement and, after a crash, from recovery.
+func taskLive(s containerd.ProcessStatus) bool {
+	return s == containerd.Running || s == containerd.Paused || s == containerd.Pausing
+}

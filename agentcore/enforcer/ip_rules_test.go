@@ -640,3 +640,28 @@ func TestSamePolicyMemberChurnKeepsDNSAllows(t *testing.T) {
 		t.Fatal("dns allows flushed by an identical-policy member joining/leaving")
 	}
 }
+
+// TestPolicyFingerprintCoversResolutionAndAttribution: members differing only
+// in a rule's Resolution or RequireBuildAttribution are different policies.
+func TestPolicyFingerprintCoversResolutionAndAttribution(t *testing.T) {
+	mk := func(mod func(*policy.Rule)) *policy.ResolvedPolicy {
+		r := policy.Rule{Pattern: "example.com", PatternType: policy.PatternFQDN, Action: policy.ActionDeny}
+		mod(&r)
+
+		return ipRulePolicy("block", r)
+	}
+
+	base := policyFingerprint(mk(func(*policy.Rule) {}))
+
+	if policyFingerprint(mk(func(*policy.Rule) {})) != base {
+		t.Fatal("identical policies must share a fingerprint")
+	}
+
+	if policyFingerprint(mk(func(r *policy.Rule) { r.Resolution = policy.DenyResolutionNXDomain })) == base {
+		t.Fatal("Resolution is not part of the fingerprint")
+	}
+
+	if policyFingerprint(mk(func(r *policy.Rule) { r.RequireBuildAttribution = true })) == base {
+		t.Fatal("RequireBuildAttribution is not part of the fingerprint")
+	}
+}

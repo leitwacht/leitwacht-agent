@@ -730,7 +730,7 @@ func policyFingerprint(pol *policy.ResolvedPolicy) string {
 	fmt.Fprintf(h, "%s|%s|%d\n", pol.ProjectPath, pol.Action, pol.Version)
 
 	for _, r := range pol.RulesForJob("") {
-		fmt.Fprintf(h, "r|%s|%s|%s|%v\n", r.Pattern, r.PatternType, r.Action, r.Ports)
+		fmt.Fprintf(h, "r|%s|%s|%s|%v|%s|%t\n", r.Pattern, r.PatternType, r.Action, r.Ports, r.Resolution, r.RequireBuildAttribution)
 	}
 
 	for _, d := range pol.DenyIPs {

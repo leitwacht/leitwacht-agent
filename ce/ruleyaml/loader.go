@@ -181,8 +181,9 @@ func (l *Loader) runWithReady(stop <-chan struct{}, ready chan<- struct{}) error
 	}
 }
 
-// Version returns the monotonic counter advanced on every successful
-// reload. Surfaced for diagnostic logging — callers should not rely on
+// Version returns a monotonic counter advanced on every reload attempt
+// (a failed reload consumes a number without replacing the snapshot).
+// Surfaced for diagnostic logging — callers should not rely on
 // the exact integer for caching decisions.
 func (l *Loader) Version() int64 { return l.version.Load() }
 
@@ -314,11 +315,6 @@ func buildSnapshot(f *File, version int) (*snapshot, error) {
 func convertRules(in []Rule) ([]policy.Rule, error) {
 	out := make([]policy.Rule, 0, len(in))
 	for i, r := range in {
-		pt, pattern, err := normalisePattern(r.PatternType, r.Pattern)
-		if err != nil {
-			return nil, fmt.Errorf("rule[%d] %q: %w", i, r.Pattern, err)
-		}
-
 		action, err := normaliseAction(r.Action, "")
 		if err != nil {
 			return nil, fmt.Errorf("rule[%d] %q: action: %w", i, r.Pattern, err)
@@ -337,7 +333,17 @@ func convertRules(in []Rule) ([]policy.Rule, error) {
 			action = policy.ActionDeny
 		}
 
-		if err := validatePorts(r.Ports, pt); err != nil {
+		pt, pattern, err := normalisePattern(r.PatternType, r.Pattern, action)
+		if err != nil {
+			return nil, fmt.Errorf("rule[%d] %q: %w", i, r.Pattern, err)
+		}
+
+		// Ports on a domain/wildcard deny rule are not used by the
+		// datapath (the whole name is blocked), so they are ignored.
+		ports := r.Ports
+		if action == policy.ActionDeny && pt == policy.PatternFQDN {
+			ports = nil
+		} else if err := validatePorts(ports, pt); err != nil {
 			return nil, fmt.Errorf("rule[%d] %q: %w", i, r.Pattern, err)
 		}
 
@@ -362,7 +368,7 @@ func convertRules(in []Rule) ([]policy.Rule, error) {
 			PatternType: pt,
 			Action:      action,
 			Resolution:  resolution,
-			Ports:       r.Ports,
+			Ports:       ports,
 			Reason:      r.Reason,
 			Source:      "ce-yaml",
 		})
@@ -458,10 +464,12 @@ const maxPort = 65535
 
 // normaliseFQDN lower-cases a domain/wildcard pattern, strips a single
 // trailing dot (the DNS root label) and rejects anything that is not a
-// bare hostname: schemes, ports, paths, userinfo, whitespace and empty
-// labels would never match a DNS query name, so the rule would silently
-// never apply.
-func normaliseFQDN(pattern string) (string, error) {
+// valid hostname pattern: IP literals, schemes, ports, paths, empty or
+// over-long labels, non-ASCII, and wildcards the matcher does not honour.
+// Such rules would never match a DNS query name, so they would silently
+// never apply. Allow rules may use `*` as a whole label anywhere; deny
+// rules only as the first label (`*.example.com`).
+func normaliseFQDN(pattern, action string) (string, error) {
 	p := strings.ToLower(strings.TrimSuffix(pattern, "."))
 	if p == "" {
 		return "", errors.New("pattern is required")
@@ -471,17 +479,46 @@ func normaliseFQDN(pattern string) (string, error) {
 		return "", fmt.Errorf("pattern %q must be a bare hostname, not a URL (drop the scheme)", pattern)
 	}
 
+	if net.ParseIP(p) != nil {
+		return "", fmt.Errorf("pattern %q is an IP address; use pattern_type ip", pattern)
+	}
+
 	if strings.Contains(p, ":") {
 		return "", fmt.Errorf("pattern %q must not include a port or IPv6 address; "+
 			"use the ports field (and pattern_type ip/cidr for addresses)", pattern)
 	}
 
-	if strings.ContainsAny(p, "/@? \t\r\n#") {
-		return "", fmt.Errorf("pattern %q must be a bare hostname", pattern)
+	for _, r := range p {
+		if r > 127 {
+			return "", fmt.Errorf("pattern %q contains non-ASCII characters; "+
+				"use the punycode (xn--) form of internationalised names", pattern)
+		}
+
+		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '*' || r == '.') {
+			return "", fmt.Errorf("pattern %q must be a bare hostname (invalid character %q)", pattern, r)
+		}
 	}
 
-	if strings.HasPrefix(p, ".") || strings.HasSuffix(p, ".") || strings.Contains(p, "..") {
-		return "", fmt.Errorf("pattern %q has an empty label", pattern)
+	if len(p) > 253 {
+		return "", fmt.Errorf("pattern %q is longer than 253 characters", pattern)
+	}
+
+	if p == "*" {
+		return "", fmt.Errorf("pattern %q would match every name; use a domain like *.example.com", pattern)
+	}
+
+	labels := strings.Split(p, ".")
+	for i, l := range labels {
+		switch {
+		case l == "":
+			return "", fmt.Errorf("pattern %q has an empty label", pattern)
+		case len(l) > 63:
+			return "", fmt.Errorf("pattern %q has a label longer than 63 characters", pattern)
+		case strings.Contains(l, "*") && l != "*":
+			return "", fmt.Errorf("pattern %q: '*' must be a whole label (e.g. *.example.com)", pattern)
+		case l == "*" && i > 0 && action == policy.ActionDeny:
+			return "", fmt.Errorf("pattern %q: deny rules support '*' only as the first label", pattern)
+		}
 	}
 
 	return p, nil
@@ -516,7 +553,7 @@ func singleHostIPv4(pattern string, allowPrefix bool) (string, error) {
 	return ip.To4().String() + "/32", nil
 }
 
-func normalisePattern(ptype, pattern string) (string, string, error) {
+func normalisePattern(ptype, pattern, action string) (string, string, error) {
 	pattern = strings.TrimSpace(pattern)
 	if pattern == "" {
 		return "", "", errors.New("pattern is required")
@@ -524,7 +561,7 @@ func normalisePattern(ptype, pattern string) (string, string, error) {
 
 	switch strings.ToLower(strings.TrimSpace(ptype)) {
 	case "", PatternDomain, PatternWildcard:
-		p, err := normaliseFQDN(pattern)
+		p, err := normaliseFQDN(pattern, action)
 		if err != nil {
 			return "", "", err
 		}

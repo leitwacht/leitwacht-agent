@@ -262,7 +262,9 @@ Two things sit outside the ordering by design:
 rejected when the CE YAML rules are loaded or hot-reloaded (a failed
 reload keeps the previous rule set active), rather than silently
 installing nothing. The same load-time check rejects IPv6 addresses,
-ports outside the datapath range, and malformed domain patterns. The
+ports outside 0..65535 (1..65535 for allow-listed domains), IP literals
+or URLs/ports in domain patterns, invalid hostname characters or labels,
+and wildcards other than a whole `*` label (block rules: first label only). The
 enforcer re-checks these defensively and skips (with a warning) any
 such rule that reaches it from another policy source.
 

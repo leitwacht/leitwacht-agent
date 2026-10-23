@@ -126,9 +126,14 @@ active) any `ip`/`cidr`/`deny_ips` entry that is IPv6 or a multi-host
 prefix such as `/8` or `/24`. Previously these were accepted and then
 skipped at attach time with only a log warning, i.e. they never
 enforced. Likewise rejected: domain/wildcard patterns that carry a
-scheme (`https://host`), a port (`host:443`), a path or an empty label
-(a single trailing dot, `example.com.`, is stripped), and ports outside
-the datapath range.
+scheme (`https://host`), a port (`host:443`), a path, an IP literal
+(use `pattern_type: ip`), an empty label, a label over 63 or a name over
+253 characters, non-ASCII (write internationalised names in `xn--`
+punycode form), any character outside `a-z 0-9 - _ * .`, and ports
+outside the datapath range. A single trailing dot (`example.com.`) is
+stripped. In `*` patterns the `*` must be a whole label (no `api*`, no
+`**`), a bare `*` is rejected, and block rules accept `*` only as the
+first label (`*.example.com`); allow rules may use it in any label.
 
 `domain` and `wildcard` are both stored as FQDN rules at runtime —
 agentcore's matcher walks domain labels and applies wildcard semantics
@@ -152,8 +157,9 @@ List of TCP ports, each `1..65535` for domain/wildcard rules and
 `0..65535`. Out-of-range values are rejected; they would otherwise wrap
 in the 16-bit map key (65979 becomes 443, 65536 becomes 0 = any port).
 **Required** when `action: allow` and
-`pattern_type` is `domain` or `wildcard`. Optional (and ignored) for
-all other rules.
+`pattern_type` is `domain` or `wildcard`. Optional for
+ip/cidr rules (empty means any port). Ignored for domain/wildcard
+`block` rules, which block the whole name.
 
 When an FQDN allow rule lists no ports, the DNS proxy falls back to a
 built-in default of `443` and `80`, which is rarely what the operator

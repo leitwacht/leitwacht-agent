@@ -86,6 +86,16 @@ struct {
     __uint(max_entries, 64 * 1024);  /* 64KB */
 } credwatch_events SEC(".maps");
 
+/* Count of ringbuf reserve failures (ring full). The deny verdict does
+ * not depend on the reserve, but a full ring silently loses the
+ * evidence, so userspace reads this to surface the loss. */
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u64);
+} reserve_failures SEC(".maps");
+
 /* Force clang to emit BTF for credwatch_event. Without a live reference, the
  * ringbuf-reserve path uses void* and BTF drops the struct — which blocks
  * the userspace struct-size self-check at load time. Concrete instance
@@ -94,33 +104,22 @@ struct {
 volatile const struct credwatch_event __credwatch_event_btf_hint;
 
 /* match_suffix checks whether the resolved path ends with any watched
- * suffix. It scans backwards from the end of the path string, trying
- * each position as a potential suffix start. For each position, it
- * constructs a candidate suffix string and looks it up in the
- * watched_suffixes hash map.
- *
- * The scan range covers suffixes up to 63 chars. Path positions 0-4
- * are skipped because credential suffixes always start with "/" and
- * need at least a few prefix chars (e.g., "/.ssh/id_rsa" at pos N-14).
+ * suffix. It tries every '/' position in the path as a potential suffix
+ * start, builds the candidate string from there and looks it up in the
+ * watched_suffixes hash map. Position 0 is included: a path such as
+ * "/.ssh/id_rsa" (a process whose root is the home directory's parent,
+ * or an absolute watched suffix) matches at pos 0.
  *
  * Uses constant-offset reads within each suffix to satisfy the BPF
  * verifier's variable-offset restrictions. */
 static __always_inline int match_suffix(const char *path, long path_len)
 {
-    /* Suffixes start with '/', so the earliest possible match position
-     * is 1 (a path like "/.ssh/id_rsa" would have the suffix at pos 0,
-     * but most real paths have a longer prefix). Start scanning from
-     * position 1 to allow short home dirs. */
-    int start = path_len < 63 ? 1 : path_len - 63;
-    if (start < 1)
-        start = 1;
-
     /* Upper bound is path_len (the string length from bpf_d_path),
      * capped at 127 to stay within the 128-byte path_buf. The verifier
      * needs a constant upper bound; path_len ≤ 128 is guaranteed by
      * the bpf_d_path(buf, 128) call, so pos < 128 is safe for reads. */
 #pragma unroll
-    for (int pos = 1; pos < 127; pos++) {
+    for (int pos = 0; pos < 127; pos++) {
         /* Stop past the resolved path length */
         if (pos >= path_len)
             break;
@@ -152,19 +151,16 @@ static __always_inline int match_suffix(const char *path, long path_len)
     return 0;
 }
 
-/* read_dentry_name reads the dentry filename (last path component) into
- * a fixed-size buffer for the watched_filenames pre-filter lookup.
+/* read_dentry_name_of reads a dentry's filename (last path component)
+ * into a fixed-size buffer for the watched_filenames pre-filter lookup.
  * Returns the length of the filename, or 0 on error. */
-static __always_inline int read_dentry_name(struct file *file, char *name_out)
+static __always_inline int read_dentry_name_of(struct dentry *dentry, char *name_out)
 {
     struct qstr dname;
-    /* Read the dentry name qstr from file->f_path.dentry->d_name.
-     * BPF_CORE_READ_INTO reads the struct in one go. */
-    if (bpf_core_read(&dname, sizeof(dname), &file->f_path.dentry->d_name))
+    if (bpf_core_read(&dname, sizeof(dname), &dentry->d_name))
         return 0;
 
-    /* Read the name string. dname.name is a const char* pointing to
-     * the name data. We read up to 63 bytes into name_out. */
+    /* dname.name points at the name data; read up to 63 bytes + NUL. */
     long len = bpf_probe_read_kernel_str(name_out, 64, dname.name);
     if (len < 0)
         return 0;
@@ -172,17 +168,50 @@ static __always_inline int read_dentry_name(struct file *file, char *name_out)
     return len;
 }
 
+/* emit_credwatch publishes one event. src is copied into the 128-byte
+ * path field; callers pass either the resolved path (128 bytes) or a
+ * bare filename (64 bytes) — n must be a compile-time constant. */
+#define EMIT_CREDWATCH(cgroup_id_, src_, n_)                                    \
+    do {                                                                       \
+        struct credwatch_event *_evt;                                          \
+        _evt = bpf_ringbuf_reserve(&credwatch_events, sizeof(*_evt), 0);       \
+        if (_evt) {                                                            \
+            __builtin_memset(_evt, 0, sizeof(*_evt));                          \
+            _evt->cgroup_id = (cgroup_id_);                                    \
+            _evt->pid = bpf_get_current_pid_tgid() >> 32;                      \
+            _evt->timestamp_ns = bpf_ktime_get_ns();                           \
+            bpf_get_current_comm(&_evt->comm, sizeof(_evt->comm));             \
+            __builtin_memcpy(&_evt->path, (src_), (n_));                       \
+            bpf_ringbuf_submit(_evt, 0);                                       \
+        } else {                                                               \
+            __u32 _z = 0;                                                      \
+            __u64 *_c = bpf_map_lookup_elem(&reserve_failures, &_z);           \
+            if (_c)                                                            \
+                *_c += 1;                                                      \
+        }                                                                      \
+    } while (0)
+
+/* watched_container applies the cgroup pre-filter and the
+ * allow_credwatch exemption. Returns the config for a container that
+ * must be enforced, or NULL. */
+static __always_inline struct cgroup_proc_config *watched_container(__u64 *cgroup_id)
+{
+    *cgroup_id = bpf_get_current_cgroup_id();
+    struct cgroup_proc_config *cfg = bpf_map_lookup_elem(&known_containers, cgroup_id);
+    if (!cfg)
+        return 0;
+    if (cfg->flags & FLAG_ALLOW_CREDWATCH)
+        return 0;
+    return cfg;
+}
+
 SEC("lsm/file_open")
 int BPF_PROG(credwatch_file_open, struct file *file)
 {
-    /* 1. Cgroup pre-filter — skip non-container processes */
-    __u64 cgroup_id = bpf_get_current_cgroup_id();
-    struct cgroup_proc_config *cfg = bpf_map_lookup_elem(&known_containers, &cgroup_id);
+    /* 1+2. Cgroup pre-filter and allow_credwatch exemption */
+    __u64 cgroup_id;
+    struct cgroup_proc_config *cfg = watched_container(&cgroup_id);
     if (!cfg)
-        return 0;
-
-    /* 2. Exempt containers with allow_credwatch label */
-    if (cfg->flags & FLAG_ALLOW_CREDWATCH)
         return 0;
 
     /* 3. Skip pseudo-filesystems — credential files are on real
@@ -199,7 +228,7 @@ int BPF_PROG(credwatch_file_open, struct file *file)
      * avoids bpf_d_path for 99%+ of opens where the filename is
      * not a credential file name (e.g., "main.go", "output.log"). */
     char filename[64] = {};
-    if (read_dentry_name(file, filename) == 0)
+    if (read_dentry_name_of(BPF_CORE_READ(file, f_path.dentry), filename) == 0)
         return 0;
 
     __u8 *fname_found = bpf_map_lookup_elem(&watched_filenames, &filename);
@@ -213,34 +242,78 @@ int BPF_PROG(credwatch_file_open, struct file *file)
     __u32 zero = 0;
     char *buf = bpf_map_lookup_elem(&path_buf, &zero);
     if (!buf)
-        return 0;
+        goto fail_closed;
 
     long path_len = bpf_d_path(&file->f_path, buf, 128);
     if (path_len < 0)
-        return 0;
+        goto fail_closed; /* e.g. ENAMETOOLONG: the path does not fit */
 
     /* 6. Check if path matches any watched suffix */
     if (!match_suffix(buf, path_len))
         return 0;
 
     /* 7. Emit event to ring buffer */
-    struct credwatch_event *evt;
-    evt = bpf_ringbuf_reserve(&credwatch_events, sizeof(*evt), 0);
-    if (evt) {
-        evt->cgroup_id = cgroup_id;
-        evt->pid = bpf_get_current_pid_tgid() >> 32;
-        evt->timestamp_ns = bpf_ktime_get_ns();
-        bpf_get_current_comm(&evt->comm, sizeof(evt->comm));
-        __builtin_memcpy(&evt->path, buf, sizeof(evt->path));
-        bpf_ringbuf_submit(evt, 0);
-    }
+    EMIT_CREDWATCH(cgroup_id, buf, 128);
+    goto verdict;
 
+fail_closed:
+    /* The watched-name prefilter matched but the full path could not be
+     * resolved (path too long for the buffer, or no scratch buffer).
+     * Allowing here would let a deep directory defeat the watch, so
+     * treat it as a hit: report the bare filename and apply the same
+     * verdict as a confirmed match. */
+    EMIT_CREDWATCH(cgroup_id, filename, 64);
+
+verdict:
     /* 8. Deny the open — unless this container is in observe-only
      * mode, in which case we've already emitted the event and let
      * the open proceed. */
     if (cfg->flags & FLAG_OBSERVE_ONLY)
         return 0;
     return -EPERM;
+}
+
+/* watched_name_verdict is shared by the path_rename and path_link hooks.
+ * A credential file can be renamed or hard-linked to a name the
+ * file_open prefilter does not watch (mv id_rsa x; ln id_rsa /tmp/x),
+ * then opened under that name. Treat touching the source name like an
+ * open of it: report and apply the same verdict. Only the source
+ * dentry's name is available here, so the event path is that bare name. */
+static __always_inline int watched_name_verdict(struct dentry *src)
+{
+    __u64 cgroup_id;
+    struct cgroup_proc_config *cfg = watched_container(&cgroup_id);
+    if (!cfg)
+        return 0;
+
+    char filename[64] = {};
+    if (read_dentry_name_of(src, filename) == 0)
+        return 0;
+
+    __u8 *found = bpf_map_lookup_elem(&watched_filenames, &filename);
+    if (!found)
+        return 0;
+
+    EMIT_CREDWATCH(cgroup_id, filename, 64);
+
+    if (cfg->flags & FLAG_OBSERVE_ONLY)
+        return 0;
+    return -EPERM;
+}
+
+SEC("lsm/path_rename")
+int BPF_PROG(credwatch_path_rename, const struct path *old_dir,
+             struct dentry *old_dentry, const struct path *new_dir,
+             struct dentry *new_dentry, unsigned int flags)
+{
+    return watched_name_verdict(old_dentry);
+}
+
+SEC("lsm/path_link")
+int BPF_PROG(credwatch_path_link, struct dentry *old_dentry,
+             const struct path *new_dir, struct dentry *new_dentry)
+{
+    return watched_name_verdict(old_dentry);
 }
 
 char __license[] SEC("license") = "GPL";

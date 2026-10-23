@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 )
@@ -20,9 +21,15 @@ import (
 type credwatchLSMImpl struct {
 	objs *credwatchObjects
 	link link.Link
+	// pathLinks are the optional path_rename / path_link hooks.
+	pathLinks []link.Link
 }
 
 func (c *credwatchLSMImpl) Close() {
+	for _, l := range c.pathLinks {
+		l.Close() //nolint:errcheck,gosec // cleanup
+	}
+
 	if c.link != nil {
 		c.link.Close() //nolint:errcheck,gosec // cleanup
 	}
@@ -49,7 +56,15 @@ func loadCredwatchLSM() (*credwatchObjects, link.Link, error) {
 
 	err = spec.LoadAndAssign(&objs, nil)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load credwatch bpf objects: %w", err)
+		// The path_rename / path_link programs need the kernel to expose
+		// those LSM hooks (CONFIG_SECURITY_PATH). Without them, retry
+		// with only the file_open program rather than losing credwatch.
+		fallbackObjs, fallbackErr := loadCredwatchFileOpenOnly()
+		if fallbackErr != nil {
+			return nil, nil, fmt.Errorf("load credwatch bpf objects: %w", err)
+		}
+
+		objs = *fallbackObjs
 	}
 
 	lsmLink, err := link.AttachLSM(link.LSMOptions{
@@ -62,6 +77,73 @@ func loadCredwatchLSM() (*credwatchObjects, link.Link, error) {
 	}
 
 	return &objs, lsmLink, nil
+}
+
+// loadCredwatchFileOpenOnly loads the credwatch collection without the
+// optional path_rename / path_link programs.
+func loadCredwatchFileOpenOnly() (*credwatchObjects, error) {
+	spec, err := loadCredwatch()
+	if err != nil {
+		return nil, err
+	}
+
+	delete(spec.Programs, "credwatch_path_rename")
+	delete(spec.Programs, "credwatch_path_link")
+
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		return nil, err
+	}
+
+	objs := &credwatchObjects{}
+	objs.CredwatchFileOpen = coll.Programs["credwatch_file_open"]
+	objs.CredwatchEvents = coll.Maps["credwatch_events"]
+	objs.KnownContainers = coll.Maps["known_containers"]
+	objs.PathBuf = coll.Maps["path_buf"]
+	objs.WatchedFilenames = coll.Maps["watched_filenames"]
+	objs.WatchedSuffixes = coll.Maps["watched_suffixes"]
+	objs.ReserveFailures = coll.Maps["reserve_failures"]
+
+	return objs, nil
+}
+
+// attachCredwatchPathHooks attaches the rename/hardlink hooks, which
+// stop a watched credential file being moved or linked to a name the
+// file_open prefilter does not watch. Non-fatal: a kernel without these
+// hooks keeps the file_open protection.
+func attachCredwatchPathHooks(objs *credwatchObjects, logger *slog.Logger) []link.Link {
+	var links []link.Link
+
+	for name, prog := range map[string]*ebpf.Program{
+		"path_rename": objs.CredwatchPathRename,
+		"path_link":   objs.CredwatchPathLink,
+	} {
+		if prog == nil {
+			continue
+		}
+
+		l, err := link.AttachLSM(link.LSMOptions{Program: prog})
+		if err != nil {
+			logger.Warn("credwatch: path hook unavailable", "hook", name, "error", err)
+
+			continue
+		}
+
+		links = append(links, l)
+	}
+
+	return links
+}
+
+// CredwatchReserveFailures returns the number of credwatch events lost
+// because the ring buffer was full (summed across CPUs).
+func (m *Manager) CredwatchReserveFailures() uint64 {
+	lsm, ok := m.credwatchState.(*credwatchLSMImpl)
+	if !ok || lsm.objs == nil {
+		return 0
+	}
+
+	return readReserveFailures(lsm.objs.ReserveFailures)
 }
 
 // startCredwatchReader starts the ring buffer reader goroutine.
@@ -215,6 +297,7 @@ func (m *Manager) StartCredwatch() error {
 	}
 
 	lsm := &credwatchLSMImpl{objs: objs, link: lsmLink}
+	lsm.pathLinks = attachCredwatchPathHooks(objs, m.logger)
 	m.credwatchState = lsm
 	m.credwatchLSMLoaded = true
 

@@ -69,7 +69,9 @@ type credwatchSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type credwatchProgramSpecs struct {
-	CredwatchFileOpen *ebpf.ProgramSpec `ebpf:"credwatch_file_open"`
+	CredwatchFileOpen   *ebpf.ProgramSpec `ebpf:"credwatch_file_open"`
+	CredwatchPathLink   *ebpf.ProgramSpec `ebpf:"credwatch_path_link"`
+	CredwatchPathRename *ebpf.ProgramSpec `ebpf:"credwatch_path_rename"`
 }
 
 // credwatchMapSpecs contains maps before they are loaded into the kernel.
@@ -79,6 +81,7 @@ type credwatchMapSpecs struct {
 	CredwatchEvents  *ebpf.MapSpec `ebpf:"credwatch_events"`
 	KnownContainers  *ebpf.MapSpec `ebpf:"known_containers"`
 	PathBuf          *ebpf.MapSpec `ebpf:"path_buf"`
+	ReserveFailures  *ebpf.MapSpec `ebpf:"reserve_failures"`
 	WatchedFilenames *ebpf.MapSpec `ebpf:"watched_filenames"`
 	WatchedSuffixes  *ebpf.MapSpec `ebpf:"watched_suffixes"`
 }
@@ -113,6 +116,7 @@ type credwatchMaps struct {
 	CredwatchEvents  *ebpf.Map `ebpf:"credwatch_events"`
 	KnownContainers  *ebpf.Map `ebpf:"known_containers"`
 	PathBuf          *ebpf.Map `ebpf:"path_buf"`
+	ReserveFailures  *ebpf.Map `ebpf:"reserve_failures"`
 	WatchedFilenames *ebpf.Map `ebpf:"watched_filenames"`
 	WatchedSuffixes  *ebpf.Map `ebpf:"watched_suffixes"`
 }
@@ -122,6 +126,7 @@ func (m *credwatchMaps) Close() error {
 		m.CredwatchEvents,
 		m.KnownContainers,
 		m.PathBuf,
+		m.ReserveFailures,
 		m.WatchedFilenames,
 		m.WatchedSuffixes,
 	)
@@ -138,12 +143,16 @@ type credwatchVariables struct {
 //
 // It can be passed to loadCredwatchObjects or ebpf.CollectionSpec.LoadAndAssign.
 type credwatchPrograms struct {
-	CredwatchFileOpen *ebpf.Program `ebpf:"credwatch_file_open"`
+	CredwatchFileOpen   *ebpf.Program `ebpf:"credwatch_file_open"`
+	CredwatchPathLink   *ebpf.Program `ebpf:"credwatch_path_link"`
+	CredwatchPathRename *ebpf.Program `ebpf:"credwatch_path_rename"`
 }
 
 func (p *credwatchPrograms) Close() error {
 	return _CredwatchClose(
 		p.CredwatchFileOpen,
+		p.CredwatchPathLink,
+		p.CredwatchPathRename,
 	)
 }
 

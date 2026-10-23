@@ -315,3 +315,14 @@ func (m *Manager) handleProcMemBPFEvent(evt procMemEventBPF) {
 		m.OnProcMemEvent(event)
 	}
 }
+
+// ProcMemReserveFailures returns the number of proc_mem events lost
+// because the ring buffer was full (summed across CPUs).
+func (m *Manager) ProcMemReserveFailures() uint64 {
+	lsm, ok := m.procMemState.(*procMemLSMImpl)
+	if !ok || lsm.objs == nil {
+		return 0
+	}
+
+	return readReserveFailures(lsm.objs.ReserveFailures)
+}

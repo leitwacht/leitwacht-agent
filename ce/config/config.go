@@ -227,6 +227,11 @@ func Load() (*Config, error) {
 	}
 	c.WebhookTimeout = wto
 
+	// Canonicalise enum values so every downstream comparison against the
+	// lowercase policy constants sees "block", never "Block"/" BLOCK ".
+	c.DefaultAction = strings.ToLower(strings.TrimSpace(c.DefaultAction))
+	c.UnknownProjectMode = strings.ToLower(strings.TrimSpace(c.UnknownProjectMode))
+
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}

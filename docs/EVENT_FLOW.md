@@ -257,10 +257,14 @@ Two things sit outside the ordering by design:
   only after every rule has missed. An explicit deny rule still
   overrides node-level trust.
 
-`cidr` allow rules must name a single host (a bare address, `/32` or
-`/128`) — the allow map is an exact-match hash. Wider prefixes are
-rejected at rule-creation time rather than silently installing
-nothing.
+`cidr` allow rules must name a single host (a bare IPv4 address or
+`/32`) — the allow map is an exact-match hash. Wider prefixes are
+rejected when the CE YAML rules are loaded or hot-reloaded (a failed
+reload keeps the previous rule set active), rather than silently
+installing nothing. The same load-time check rejects IPv6 addresses,
+ports outside the datapath range, and malformed domain patterns. The
+enforcer re-checks these defensively and skips (with a warning) any
+such rule that reaches it from another policy source.
 
 The two layers cooperate against the realistic attack shapes:
 

@@ -117,8 +117,18 @@ the scope default.
 | ---------- | ----------------------------------------------------------- |
 | `domain`   | Exact FQDN match (e.g., `github.com`).                      |
 | `wildcard` | FQDN with `*` labels (e.g., `*.amazonaws.com`).             |
-| `ip`       | Single IPv4 or IPv6 address.                                |
-| `cidr`     | IPv4 or IPv6 CIDR (e.g., `10.0.0.0/8`, `fd00::/8`).         |
+| `ip`       | Single IPv4 address.                                        |
+| `cidr`     | Single-host IPv4 CIDR (`/32` only, e.g., `192.0.2.1/32`; equivalent to `ip`). |
+
+The egress allow/deny maps are exact-match IPv4 hashes, so the loader
+**rejects** (the load fails, or on hot-reload the previous rule set stays
+active) any `ip`/`cidr`/`deny_ips` entry that is IPv6 or a multi-host
+prefix such as `/8` or `/24`. Previously these were accepted and then
+skipped at attach time with only a log warning, i.e. they never
+enforced. Likewise rejected: domain/wildcard patterns that carry a
+scheme (`https://host`), a port (`host:443`), a path or an empty label
+(a single trailing dot, `example.com.`, is stripped), and ports outside
+the datapath range.
 
 `domain` and `wildcard` are both stored as FQDN rules at runtime —
 agentcore's matcher walks domain labels and applies wildcard semantics
@@ -137,20 +147,21 @@ queries.
 
 ### `ports`
 
-List of TCP ports. **Required** when `action: allow` and
+List of TCP ports, each `1..65535` for domain/wildcard rules and
+`0..65535` for ip/cidr rules (`0` = any port). `deny_ips[].port` accepts
+`0..65535`. Out-of-range values are rejected; they would otherwise wrap
+in the 16-bit map key (65979 becomes 443, 65536 becomes 0 = any port).
+**Required** when `action: allow` and
 `pattern_type` is `domain` or `wildcard`. Optional (and ignored) for
 all other rules.
 
-The agent's underlying primitive treats an empty port list on an
-allow rule as "all ports allowed" — that's a footgun for an egress
-firewall, since `allow github.com` with no ports also opens 22, 3389,
-and any other service running on the host. Both CE and the EE
-counterpart force operators to spell out which ports they actually
-need so a single allow rule cannot accidentally widen the surface.
+When an FQDN allow rule lists no ports, the DNS proxy falls back to a
+built-in default of `443` and `80`, which is rarely what the operator
+meant. CE and the EE counterpart therefore force operators to spell out
+the ports they actually need, so the rule says what it enforces.
 
-If you genuinely want all ports for a host (rare), list the ones you
-mean explicitly. CIDR rules still accept empty ports because
-"allow this internal subnet on any port" is a normal firewall pattern.
+CIDR/ip rules still accept empty ports, which means "any port on this
+address".
 
 ## Stability
 

@@ -316,12 +316,12 @@ func convertRules(in []Rule) ([]policy.Rule, error) {
 	for i, r := range in {
 		pt, pattern, err := normalisePattern(r.PatternType, r.Pattern)
 		if err != nil {
-			return nil, fmt.Errorf("rule[%d]: %w", i, err)
+			return nil, fmt.Errorf("rule[%d] %q: %w", i, r.Pattern, err)
 		}
 
 		action, err := normaliseAction(r.Action, "")
 		if err != nil {
-			return nil, fmt.Errorf("rule[%d]: action: %w", i, err)
+			return nil, fmt.Errorf("rule[%d] %q: action: %w", i, r.Pattern, err)
 		}
 
 		// agentcore action vocabulary at rule scope is allow|deny only.
@@ -330,22 +330,26 @@ func convertRules(in []Rule) ([]policy.Rule, error) {
 		// as allow and surprise operators. Audit-mode is a project-
 		// level decision: set `default_action: audit` on the scope.
 		if action == ActionAudit {
-			return nil, fmt.Errorf("rule[%d]: action: audit is not supported per-rule; "+
-				"use default_action: audit on the scope to put the whole scope in audit mode", i)
+			return nil, fmt.Errorf("rule[%d] %q: action: audit is not supported per-rule; "+
+				"use default_action: audit on the scope to put the whole scope in audit mode", i, r.Pattern)
 		}
 		if action == ActionBlock {
 			action = policy.ActionDeny
 		}
 
+		if err := validatePorts(r.Ports, pt); err != nil {
+			return nil, fmt.Errorf("rule[%d] %q: %w", i, r.Pattern, err)
+		}
+
 		// Reject `allow + domain/wildcard` rules without explicit ports.
-		// agentcore's primitive treats empty ports as "all ports
-		// allowed" — that's a footgun for an egress-control rule
-		// (`allow github.com` with no ports also opens SSH, RDP, and
-		// any port someone runs an unrelated service on). Both CE and
-		// EE force operators to spell out the ports they actually need.
+		// When a rule lists no ports the DNS proxy seeds a built-in
+		// default of [443, 80], which is rarely what the operator meant
+		// (and for a CIDR rule "no ports" means any port, a different
+		// meaning). Both CE and EE force operators to spell out the
+		// ports they actually need so the rule says what it enforces.
 		if action == policy.ActionAllow && pt == policy.PatternFQDN && len(r.Ports) == 0 {
-			return nil, fmt.Errorf("rule[%d]: allow + domain/wildcard rule must specify ports "+
-				"(e.g., ports: [443]); empty ports would permit every port on the matched host", i)
+			return nil, fmt.Errorf("rule[%d] %q: allow + domain/wildcard rule must specify ports "+
+				"(e.g., ports: [443]); empty ports would fall back to the built-in default (443, 80)", i, r.Pattern)
 		}
 
 		resolution := r.Resolution
@@ -431,6 +435,87 @@ func buildJobModes(in map[string]JobOverride) (credwatch, procMem map[string]str
 	return credwatch, procMem, nil
 }
 
+// validatePorts checks rule ports against what the datapath can key on.
+// The eBPF allow/deny keys hold a uint16, so an out-of-range value would
+// silently wrap (65979 -> 443, 65536 -> 0 = any port). FQDN rules need a
+// real port (1..65535); CIDR rules also accept 0, the any-port wildcard.
+func validatePorts(ports []int, patternType string) error {
+	lo := 1
+	if patternType == policy.PatternCIDR {
+		lo = 0
+	}
+
+	for _, p := range ports {
+		if p < lo || p > maxPort {
+			return fmt.Errorf("port %d out of range (want %d..%d)", p, lo, maxPort)
+		}
+	}
+
+	return nil
+}
+
+const maxPort = 65535
+
+// normaliseFQDN lower-cases a domain/wildcard pattern, strips a single
+// trailing dot (the DNS root label) and rejects anything that is not a
+// bare hostname: schemes, ports, paths, userinfo, whitespace and empty
+// labels would never match a DNS query name, so the rule would silently
+// never apply.
+func normaliseFQDN(pattern string) (string, error) {
+	p := strings.ToLower(strings.TrimSuffix(pattern, "."))
+	if p == "" {
+		return "", errors.New("pattern is required")
+	}
+
+	if strings.Contains(p, "://") {
+		return "", fmt.Errorf("pattern %q must be a bare hostname, not a URL (drop the scheme)", pattern)
+	}
+
+	if strings.Contains(p, ":") {
+		return "", fmt.Errorf("pattern %q must not include a port or IPv6 address; "+
+			"use the ports field (and pattern_type ip/cidr for addresses)", pattern)
+	}
+
+	if strings.ContainsAny(p, "/@? \t\r\n#") {
+		return "", fmt.Errorf("pattern %q must be a bare hostname", pattern)
+	}
+
+	if strings.HasPrefix(p, ".") || strings.HasSuffix(p, ".") || strings.Contains(p, "..") {
+		return "", fmt.Errorf("pattern %q has an empty label", pattern)
+	}
+
+	return p, nil
+}
+
+// singleHostIPv4 parses an IPv4 address or /32 CIDR. IPv6 and multi-host
+// prefixes are rejected because the egress maps are exact-match IPv4
+// hashes; the enforcer would otherwise skip the rule with only a warning.
+func singleHostIPv4(pattern string, allowPrefix bool) (string, error) {
+	if strings.Contains(pattern, ":") {
+		return "", fmt.Errorf("%q: IPv6 is not supported (the egress filter handles IPv4 only)", pattern)
+	}
+
+	addr, prefix, hasPrefix := strings.Cut(pattern, "/")
+
+	ip := net.ParseIP(addr)
+	if ip == nil || ip.To4() == nil {
+		return "", fmt.Errorf("invalid IPv4 address %q", pattern)
+	}
+
+	if hasPrefix {
+		if !allowPrefix {
+			return "", fmt.Errorf("invalid ip %q (use pattern_type cidr for prefixes)", pattern)
+		}
+
+		if prefix != "32" {
+			return "", fmt.Errorf("cidr %q: only single-host /32 is supported "+
+				"(the allow/deny maps are exact-match); list each address or use a domain rule", pattern)
+		}
+	}
+
+	return ip.To4().String() + "/32", nil
+}
+
 func normalisePattern(ptype, pattern string) (string, string, error) {
 	pattern = strings.TrimSpace(pattern)
 	if pattern == "" {
@@ -439,22 +524,27 @@ func normalisePattern(ptype, pattern string) (string, string, error) {
 
 	switch strings.ToLower(strings.TrimSpace(ptype)) {
 	case "", PatternDomain, PatternWildcard:
-		return policy.PatternFQDN, strings.ToLower(pattern), nil
+		p, err := normaliseFQDN(pattern)
+		if err != nil {
+			return "", "", err
+		}
+
+		return policy.PatternFQDN, p, nil
 	case PatternIP:
-		ip := net.ParseIP(pattern)
-		if ip == nil {
-			return "", "", fmt.Errorf("invalid ip %q", pattern)
+		p, err := singleHostIPv4(pattern, false)
+		if err != nil {
+			return "", "", err
 		}
-		// Single-host CIDR for the eBPF map.
-		if ip.To4() != nil {
-			return policy.PatternCIDR, ip.String() + "/32", nil
-		}
-		return policy.PatternCIDR, ip.String() + "/128", nil
+
+		return policy.PatternCIDR, p, nil
 	case PatternCIDR:
-		if _, _, err := net.ParseCIDR(pattern); err != nil {
-			return "", "", fmt.Errorf("invalid cidr %q: %w", pattern, err)
+		// A /32 written as cidr is accepted and equivalent to pattern_type ip.
+		p, err := singleHostIPv4(pattern, true)
+		if err != nil {
+			return "", "", err
 		}
-		return policy.PatternCIDR, pattern, nil
+
+		return policy.PatternCIDR, p, nil
 	default:
 		return "", "", fmt.Errorf("unknown pattern_type %q", ptype)
 	}
@@ -464,11 +554,14 @@ func buildDenyIPs(in []DenyIP) ([]policy.DenyIP, map[policy.DenyIPKey]bool, erro
 	out := make([]policy.DenyIP, 0, len(in))
 	set := make(map[policy.DenyIPKey]bool, len(in))
 	for i, d := range in {
-		ip := net.ParseIP(d.IP)
-		if ip == nil {
-			return nil, nil, fmt.Errorf("deny_ips[%d]: invalid ip %q", i, d.IP)
+		addr, err := singleHostIPv4(strings.TrimSpace(d.IP), false)
+		if err != nil {
+			return nil, nil, fmt.Errorf("deny_ips[%d]: %w", i, err)
 		}
-		entry := policy.DenyIP{IP: ip.String(), Port: d.Port}
+		if d.Port < 0 || d.Port > maxPort {
+			return nil, nil, fmt.Errorf("deny_ips[%d]: port %d out of range (want 0..%d)", i, d.Port, maxPort)
+		}
+		entry := policy.DenyIP{IP: strings.TrimSuffix(addr, "/32"), Port: d.Port}
 		out = append(out, entry)
 		set[policy.DenyIPKey{IP: entry.IP, Port: entry.Port}] = true
 	}

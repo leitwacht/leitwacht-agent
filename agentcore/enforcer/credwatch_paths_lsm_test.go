@@ -3,6 +3,7 @@
 package enforcer
 
 import (
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -11,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // credwatchTestEnv loads credwatch with the given watched suffixes and
@@ -106,6 +109,21 @@ func mustWrite(t *testing.T, path string) {
 	}
 }
 
+// mustWriteWatched creates a file that has a watched name: the create is
+// done under a staging name and renamed into place (renaming TO a
+// watched name is allowed), because creating it directly would be
+// denied.
+func mustWriteWatched(t *testing.T, path string) {
+	t.Helper()
+
+	stage := filepath.Join(filepath.Dir(path), "stage-tmp")
+	mustWrite(t, stage)
+
+	if err := os.Rename(stage, path); err != nil {
+		t.Fatalf("rename into place: %v", err)
+	}
+}
+
 func TestCredwatchRenameAndLinkDenied(t *testing.T) {
 	_, events := credwatchTestEnv(t, []string{"/.testcred/secret"}, false, false)
 
@@ -121,7 +139,7 @@ func TestCredwatchRenameAndLinkDenied(t *testing.T) {
 
 	src := filepath.Join(dir, ".testcred", "secret")
 
-	if err := os.Rename(src, filepath.Join(dir, "moved")); !os.IsPermission(err) && !isEPERM(err) {
+	if err := os.Rename(src, filepath.Join(dir, "moved")); !isEPERM(err) {
 		t.Fatalf("rename of watched file: want EPERM, got %v", err)
 	}
 
@@ -166,33 +184,159 @@ func TestCredwatchRenameLinkObserveOnlyAllowed(t *testing.T) {
 	}
 }
 
-// A path too long for the 128-byte d_path buffer used to fail open.
-func TestCredwatchLongPathFailsClosed(t *testing.T) {
-	_, events := credwatchTestEnv(t, []string{"/.testcred/secret"}, false, false)
-
-	dir := t.TempDir()
-	long := filepath.Join(dir, strings.Repeat("d", 60), strings.Repeat("e", 60), ".testcred", "secret")
-	mustWrite(t, filepath.Join(filepath.Dir(long), "stage"))
-
-	if err := os.Rename(filepath.Join(filepath.Dir(long), "stage"), long); err != nil {
-		t.Fatalf("rename: %v", err)
+// deepDir returns a directory path under base whose total length is at
+// least minLen, built from 120-char components.
+func deepDir(base string, minLen int) string {
+	d := base
+	for len(d) < minLen {
+		d = filepath.Join(d, strings.Repeat("d", 120))
 	}
 
-	if len(long) < 128 {
-		t.Fatalf("test path too short (%d) to exceed the d_path buffer", len(long))
-	}
+	return d
+}
 
-	f, err := os.Open(long)
+func openErr(path string) error {
+	f, err := os.Open(path)
 	if f != nil {
 		f.Close() //nolint:errcheck // test cleanup
 	}
 
-	if !isEPERM(err) {
-		t.Fatalf("open of watched name behind an over-long path: want EPERM, got %v", err)
+	return err
+}
+
+// Paths longer than the old 128-byte d_path buffer are resolved now:
+// the suffix is matched on the tail, and unrelated files that merely
+// share a watched name are not killed.
+func TestCredwatchLongPath(t *testing.T) {
+	_, events := credwatchTestEnv(t, []string{"/.testcred/secret"}, false, false)
+
+	dir := t.TempDir()
+	long := deepDir(dir, 300)
+
+	hit := filepath.Join(long, ".testcred", "secret")
+	mustWriteWatched(t, hit)
+
+	if err := openErr(hit); !isEPERM(err) {
+		t.Fatalf("long path + watched suffix: want EPERM, got %v", err)
 	}
 
 	if len(events()) == 0 {
-		t.Fatal("fail-closed open must be reported")
+		t.Fatal("long-path hit must be reported")
+	}
+
+	// Generic name, wrong parent: allowed.
+	miss := filepath.Join(long, "other", "secret")
+	mustWrite(t, miss)
+
+	if err := openErr(miss); err != nil {
+		t.Fatalf("long path + non-matching parent must be allowed, got %v", err)
+	}
+}
+
+// A path beyond the 512-byte buffer makes d_path fail; the (parent,
+// name) pair still decides.
+func TestCredwatchDPathFailureUsesPair(t *testing.T) {
+	_, events := credwatchTestEnv(t, []string{"/.testcred/secret"}, false, false)
+
+	dir := t.TempDir()
+	long := deepDir(dir, 700)
+
+	hit := filepath.Join(long, ".testcred", "secret")
+	mustWriteWatched(t, hit)
+
+	if err := openErr(hit); !isEPERM(err) {
+		t.Fatalf("unresolvable path + watched pair: want EPERM, got %v", err)
+	}
+
+	got := false
+
+	for _, e := range events() {
+		if e.Kind == credwatchKindDPathFail {
+			got = true
+		}
+	}
+
+	if !got {
+		t.Fatal("expected a dpath_fail event")
+	}
+
+	miss := filepath.Join(long, "other", "secret")
+	mustWrite(t, miss)
+
+	if err := openErr(miss); err != nil {
+		t.Fatalf("unresolvable path + unrelated parent must be allowed, got %v", err)
+	}
+}
+
+// Rename/link restrict to the watched (parent, name) pair and to regular
+// files: a same-named file elsewhere is untouched.
+func TestCredwatchRenameLinkIgnoreUnrelated(t *testing.T) {
+	credwatchTestEnv(t, []string{"/.testcred/secret"}, false, false)
+
+	dir := t.TempDir()
+	other := filepath.Join(dir, "work", "secret")
+	mustWrite(t, other)
+
+	if err := os.Link(other, filepath.Join(dir, "work", "l")); err != nil {
+		t.Fatalf("link of unrelated same-named file: %v", err)
+	}
+
+	if err := os.Rename(other, filepath.Join(dir, "work", "moved")); err != nil {
+		t.Fatalf("rename of unrelated same-named file: %v", err)
+	}
+}
+
+func TestCredwatchRenameExchangeDenied(t *testing.T) {
+	credwatchTestEnv(t, []string{"/.testcred/secret"}, false, false)
+
+	dir := t.TempDir()
+	cred := filepath.Join(dir, ".testcred", "secret")
+	plain := filepath.Join(dir, "plain")
+	mustWriteWatched(t, cred)
+	mustWrite(t, plain)
+
+	err := unix.Renameat2(unix.AT_FDCWD, plain, unix.AT_FDCWD, cred, unix.RENAME_EXCHANGE)
+	if !errors.Is(err, unix.EPERM) {
+		t.Fatalf("RENAME_EXCHANGE onto a watched file: want EPERM, got %v", err)
+	}
+}
+
+func TestCredwatchDirectoryRename(t *testing.T) {
+	credwatchTestEnv(t, []string{"/.testcred/secret", "/secrets/tok"}, false, false)
+
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, ".testcred", "x"))
+	mustWrite(t, filepath.Join(dir, "secrets", "x"))
+
+	if err := os.Rename(filepath.Join(dir, ".testcred"), filepath.Join(dir, "gone")); !isEPERM(err) {
+		t.Fatalf("rename of a credentials directory: want EPERM, got %v", err)
+	}
+
+	// "secrets" is a generic directory name: not protected.
+	if err := os.Rename(filepath.Join(dir, "secrets"), filepath.Join(dir, "renamed")); err != nil {
+		t.Fatalf("rename of generic directory must be allowed: %v", err)
+	}
+}
+
+// Excluded suffixes are not acted on by any hook.
+func TestCredwatchExclusionHonouredByRenameLink(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+
+	objs, _ := credwatchTestEnv(t, []string{"/.testcred/secret"}, false, false)
+
+	// Re-populate: add an excluded second suffix.
+	if err := populateWatchedPathMaps(objs, []string{"/.keep/secret", "/.testcred/secret"}, []string{"/.keep/secret"}); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	keep := filepath.Join(dir, ".keep", "secret")
+	mustWriteWatched(t, keep)
+
+	if err := os.Rename(keep, filepath.Join(dir, ".keep", "moved")); err != nil {
+		t.Fatalf("rename of excluded suffix must be allowed: %v", err)
 	}
 }
 

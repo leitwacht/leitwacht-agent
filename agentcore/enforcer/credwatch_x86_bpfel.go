@@ -25,6 +25,13 @@ type credwatchCredwatchEvent struct {
 	Comm        [16]int8
 	Path        [128]int8
 	TimestampNs uint64
+	Kind        uint8
+}
+
+type credwatchPairKey struct {
+	_      structs.HostLayout
+	Parent [32]int8
+	Name   [64]int8
 }
 
 // loadCredwatch returns the embedded CollectionSpec for credwatch.
@@ -82,7 +89,9 @@ type credwatchMapSpecs struct {
 	KnownContainers  *ebpf.MapSpec `ebpf:"known_containers"`
 	PathBuf          *ebpf.MapSpec `ebpf:"path_buf"`
 	ReserveFailures  *ebpf.MapSpec `ebpf:"reserve_failures"`
+	WatchedDirs      *ebpf.MapSpec `ebpf:"watched_dirs"`
 	WatchedFilenames *ebpf.MapSpec `ebpf:"watched_filenames"`
+	WatchedPairs     *ebpf.MapSpec `ebpf:"watched_pairs"`
 	WatchedSuffixes  *ebpf.MapSpec `ebpf:"watched_suffixes"`
 }
 
@@ -117,7 +126,9 @@ type credwatchMaps struct {
 	KnownContainers  *ebpf.Map `ebpf:"known_containers"`
 	PathBuf          *ebpf.Map `ebpf:"path_buf"`
 	ReserveFailures  *ebpf.Map `ebpf:"reserve_failures"`
+	WatchedDirs      *ebpf.Map `ebpf:"watched_dirs"`
 	WatchedFilenames *ebpf.Map `ebpf:"watched_filenames"`
+	WatchedPairs     *ebpf.Map `ebpf:"watched_pairs"`
 	WatchedSuffixes  *ebpf.Map `ebpf:"watched_suffixes"`
 }
 
@@ -127,7 +138,9 @@ func (m *credwatchMaps) Close() error {
 		m.KnownContainers,
 		m.PathBuf,
 		m.ReserveFailures,
+		m.WatchedDirs,
 		m.WatchedFilenames,
+		m.WatchedPairs,
 		m.WatchedSuffixes,
 	)
 }

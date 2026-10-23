@@ -2,7 +2,15 @@
 
 package enforcer
 
-import "github.com/cilium/ebpf"
+import (
+	"log/slog"
+	"time"
+
+	"github.com/cilium/ebpf"
+)
+
+// reserveFailureInterval is how often monitorReserveFailures samples.
+const reserveFailureInterval = 30 * time.Second
 
 // readReserveFailures sums a per-CPU reserve_failures counter (a
 // single-entry PERCPU_ARRAY of u64). A nil map or read error yields 0.
@@ -31,4 +39,28 @@ func readReserveFailures(m *ebpf.Map) uint64 {
 // is unaffected; only the evidence is lost.
 func (h *linuxEBPFHandle) ReserveFailures() uint64 {
 	return readReserveFailures(h.objs.ReserveFailures)
+}
+
+// monitorReserveFailures logs a Warn whenever the counter grew during
+// the last interval (the delta, so a steady overflow is visible without
+// flooding). Returns when stop is closed.
+func monitorReserveFailures(stop <-chan struct{}, name string, read func() uint64, logger *slog.Logger, interval time.Duration) {
+	last := read()
+	ticker := time.NewTicker(interval)
+
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			cur := read()
+			if cur > last {
+				logger.Warn("ringbuf full: events lost", "ring", name, "lost", cur-last, "total", cur)
+			}
+
+			last = cur
+		}
+	}
 }

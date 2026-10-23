@@ -530,6 +530,10 @@ func (h *linuxEBPFHandle) StartRingbufReader(
 		reader.Close() //nolint:errcheck,gosec // cleanup
 	})
 
+	wg.Go(func() {
+		monitorReserveFailures(ctx.Done(), "egress_drop", h.ReserveFailures, h.logger, reserveFailureInterval)
+	})
+
 	// Reader goroutine: processes drop events until reader is closed.
 	wg.Go(func() {
 		for {

@@ -80,6 +80,10 @@ func startProcMemReader(objs *procMemObjects, logger *slog.Logger, onEvent func(
 	})
 
 	wg.Go(func() {
+		monitorReserveFailures(done, "proc_mem", func() uint64 { return readReserveFailures(objs.ReserveFailures) }, logger, reserveFailureInterval)
+	})
+
+	wg.Go(func() {
 		for {
 			record, err := reader.Read()
 			if err != nil {

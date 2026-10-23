@@ -43,10 +43,11 @@ type Webhook struct {
 	sem chan struct{}
 
 	// parent is observed only to notice daemon shutdown; it never
-	// cancels in-flight posts. cancelledAt records when that happened.
-	parent      context.Context
-	cancelledAt atomic.Pointer[time.Time]
-	closed      atomic.Bool
+	// cancels in-flight posts. graceEnd is the shared post-cancel wait
+	// deadline, anchored at the first blocking acquire after cancel.
+	parent   context.Context
+	graceEnd atomic.Pointer[time.Time]
+	closed   atomic.Bool
 
 	dropped atomic.Int64
 }
@@ -92,11 +93,6 @@ func NewWebhookWithLimits(parent context.Context, url string, timeout time.Durat
 		parent:   parent,
 		sem:      make(chan struct{}, maxInflight),
 	}
-	context.AfterFunc(parent, func() {
-		t := time.Now()
-		w.cancelledAt.Store(&t)
-	})
-
 	return w
 }
 
@@ -218,6 +214,13 @@ func (w *Webhook) dispatch(body any) {
 		return
 	}
 
+	if w.closed.Load() { // Flush began while we waited for the slot
+		<-w.sem
+		w.dropped.Add(1)
+
+		return
+	}
+
 	go func() {
 		defer func() { <-w.sem }()
 		w.post(body)
@@ -235,10 +238,9 @@ func (w *Webhook) acquire() bool {
 		return false
 	}
 
-	deadline := time.Now().Add(ShutdownGrace)
-	if t := w.cancelledAt.Load(); t != nil {
-		deadline = t.Add(ShutdownGrace)
-	}
+	end := time.Now().Add(ShutdownGrace)
+	w.graceEnd.CompareAndSwap(nil, &end)
+	deadline := *w.graceEnd.Load()
 
 	timer := time.NewTimer(time.Until(deadline))
 	defer timer.Stop()

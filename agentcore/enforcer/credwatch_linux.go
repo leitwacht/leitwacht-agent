@@ -234,17 +234,20 @@ func startCredwatchReader(objs *credwatchObjects, logger *slog.Logger, onEvent f
 }
 
 // genericDirNames are directory names too common to treat as "a
-// credentials directory": renaming one must not trip credwatch even if a
-// watched suffix lives somewhere beneath it.
+// credentials directory" on their own: a suffix whose directory has no
+// distinguishing grandparent (e.g. "/secrets/vault_token") does not
+// protect renames of that directory. With a grandparent the pair
+// ("rancher", "k3s") is specific enough regardless of the name.
 var genericDirNames = map[string]struct{}{
 	".config": {}, "config": {}, "secrets": {}, "rancher": {}, "etc": {}, "home": {},
 	"root": {}, "usr": {}, "var": {}, "lib": {}, "run": {}, "tmp": {}, "opt": {},
 	".local": {}, "share": {}, ".cache": {}, "cache": {},
 }
 
-// splitSuffix returns the last two components of a watched suffix:
-// the file name and its immediate parent directory name ("" if none).
-func splitSuffix(suffix string) (parent, name string) {
+// splitSuffix returns the last three components of a watched suffix:
+// the file name, its immediate parent directory and that directory's
+// parent ("" if absent).
+func splitSuffix(suffix string) (grandparent, parent, name string) {
 	parts := strings.Split(strings.Trim(suffix, "/"), "/")
 	name = parts[len(parts)-1]
 
@@ -252,7 +255,11 @@ func splitSuffix(suffix string) (parent, name string) {
 		parent = parts[len(parts)-2]
 	}
 
-	return parent, name
+	if len(parts) > 2 {
+		grandparent = parts[len(parts)-3]
+	}
+
+	return grandparent, parent, name
 }
 
 // populateWatchedPathMaps populates the watched_filenames,
@@ -295,7 +302,7 @@ func populateWatchedPathMaps(objs *credwatchObjects, watchedPaths, excludedPaths
 		// watched_pairs: struct pair_key { char parent[32]; char name[64]; }.
 		// Strings are truncated to leave room for the NUL, matching what
 		// the BPF side reads.
-		parent, name := splitSuffix(suffix)
+		grandparent, parent, name := splitSuffix(suffix)
 
 		var pairKey [96]byte
 		copy(pairKey[:31], parent)
@@ -305,10 +312,13 @@ func populateWatchedPathMaps(objs *credwatchObjects, watchedPaths, excludedPaths
 			return fmt.Errorf("put watched_pairs %q: %w", suffix, err)
 		}
 
-		// watched_dirs: the immediate parent directory, unless generic.
-		if _, generic := genericDirNames[parent]; parent != "" && !generic {
-			var dirKey [64]byte
-			copy(dirKey[:63], parent)
+		// watched_dirs: (grandparent, directory) of the file. Generic
+		// directory names are only protected when a grandparent
+		// distinguishes them.
+		if _, generic := genericDirNames[parent]; parent != "" && (!generic || grandparent != "") {
+			var dirKey [96]byte
+			copy(dirKey[:31], grandparent)
+			copy(dirKey[32:95], parent)
 
 			if err := objs.WatchedDirs.Put(dirKey[:], uint8(1)); err != nil {
 				return fmt.Errorf("put watched_dirs %q: %w", parent, err)

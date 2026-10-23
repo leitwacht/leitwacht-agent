@@ -302,19 +302,30 @@ func TestCredwatchRenameExchangeDenied(t *testing.T) {
 }
 
 func TestCredwatchDirectoryRename(t *testing.T) {
-	credwatchTestEnv(t, []string{"/.testcred/secret", "/secrets/tok"}, false, false)
+	credwatchTestEnv(t, []string{"/.testcred/secret", "/secrets/tok", "/rancher/k3s/k3s.yaml"}, false, false)
 
 	dir := t.TempDir()
 	mustWrite(t, filepath.Join(dir, ".testcred", "x"))
 	mustWrite(t, filepath.Join(dir, "secrets", "x"))
+	mustWrite(t, filepath.Join(dir, "rancher", "k3s", "x"))
+	mustWrite(t, filepath.Join(dir, "unrelated", "k3s", "x"))
 
 	if err := os.Rename(filepath.Join(dir, ".testcred"), filepath.Join(dir, "gone")); !isEPERM(err) {
 		t.Fatalf("rename of a credentials directory: want EPERM, got %v", err)
 	}
 
-	// "secrets" is a generic directory name: not protected.
+	// "secrets" has no grandparent in its suffix and is generic: not protected.
 	if err := os.Rename(filepath.Join(dir, "secrets"), filepath.Join(dir, "renamed")); err != nil {
 		t.Fatalf("rename of generic directory must be allowed: %v", err)
+	}
+
+	// rancher/k3s is a watched (grandparent, dir) pair; k3s elsewhere is not.
+	if err := os.Rename(filepath.Join(dir, "rancher", "k3s"), filepath.Join(dir, "rancher", "k3s-old")); !isEPERM(err) {
+		t.Fatalf("rename of rancher/k3s: want EPERM, got %v", err)
+	}
+
+	if err := os.Rename(filepath.Join(dir, "unrelated", "k3s"), filepath.Join(dir, "unrelated", "k3s-old")); err != nil {
+		t.Fatalf("rename of an unrelated k3s directory must be allowed: %v", err)
 	}
 }
 

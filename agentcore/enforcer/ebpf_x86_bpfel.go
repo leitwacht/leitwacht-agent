@@ -41,7 +41,7 @@ type ebpfSockOwner struct {
 	_          structs.HostLayout
 	CgroupId   uint64
 	Pid        uint32
-	Reserved   uint32
+	ExecId32   uint32
 	Comm       [16]int8
 	BinaryPath [256]int8
 }

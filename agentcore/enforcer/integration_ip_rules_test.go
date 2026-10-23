@@ -107,7 +107,8 @@ const ipRuleTestIP = "198.51.100.2"
 func startTestContainer(t *testing.T, name, script string) int {
 	t.Helper()
 
-	const testImage = "docker.io/library/alpine:latest"
+	// Pinned by digest (multi-arch index) so the fixture cannot drift.
+	const testImage = "docker.io/library/alpine@sha256:be2656061b536c1883c4034790e21d0a09c5aaaf51968b89368a3c0371ea2c9a"
 
 	if _, err := exec.LookPath("ctr"); err == nil {
 		_ = exec.Command("ctr", "image", "pull", testImage).Run()
@@ -137,7 +138,7 @@ func startTestContainer(t *testing.T, name, script string) int {
 
 	_ = exec.Command("podman", "rm", "-f", name).Run()
 
-	out, runErr := exec.Command("podman", "run", "-d", "--name", name, testImage,
+	out, runErr := exec.Command("podman", "run", "-d", "--log-driver=none", "--pull=missing", "--name", name, testImage,
 		"sh", "-c", script).CombinedOutput()
 	if runErr != nil {
 		t.Fatalf("podman run: %v\n%s", runErr, out)

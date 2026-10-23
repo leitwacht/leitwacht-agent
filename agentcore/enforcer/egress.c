@@ -185,7 +185,7 @@ struct {
 struct sock_owner {
     __u64 cgroup_id;
     __u32 pid;
-    __u32 _reserved;
+    __u32 exec_id32;   /* low 32 bits of task->self_exec_id at capture */
     char  comm[16];
     char  binary_path[BINARY_PATH_LEN];
 };

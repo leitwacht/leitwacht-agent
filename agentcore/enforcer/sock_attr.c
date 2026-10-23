@@ -17,6 +17,7 @@ struct mm_struct {
 
 struct task_struct {
     unsigned int flags;
+    __u64 self_exec_id;
     struct mm_struct *mm;
 } __attribute__((preserve_access_index));
 
@@ -49,7 +50,7 @@ struct msghdr;
 struct sock_owner {
     __u64 cgroup_id;
     __u32 pid;
-    __u32 _reserved;
+    __u32 exec_id32;   /* low 32 bits of task->self_exec_id at capture */
     char  comm[16];
     char  binary_path[BINARY_PATH_LEN];
 };
@@ -99,6 +100,8 @@ static __always_inline int capture_sock_owner(struct sock *sk) {
      * untrusted pointers ("R1 type=untrusted_ptr_..."). Verified on
      * kernel 6.19. */
     struct task_struct *task = bpf_get_current_task_btf();
+    if (task)
+        o->exec_id32 = (__u32)task->self_exec_id;
     if (task && task->mm && task->mm->exe_file) {
         (void)bpf_d_path(&task->mm->exe_file->f_path,
                          o->binary_path, sizeof(o->binary_path));
@@ -116,7 +119,8 @@ int BPF_PROG(sock_attr_connect, struct socket *sock, struct sockaddr *address, i
 
 /* Unconnected UDP (sendto without prior connect). Skip the (expensive)
  * bpf_d_path re-capture when the socket already has an owner recorded
- * for the CURRENT process; a socket shared across fork/exec (inherited
+ * for the CURRENT process image (same pid AND same exec id, so a process
+ * that exec()s keeps no stale binary_path); a socket shared across fork/exec (inherited
  * fd) is re-captured when a different process sends on it, so the
  * owner tracks the sender. The lookup without F_CREATE is just a map
  * read. */
@@ -132,7 +136,10 @@ int BPF_PROG(sock_attr_sendmsg, struct socket *sock, struct msghdr *msg, int siz
         return 0;
 
     struct sock_owner *o = bpf_sk_storage_get(&sock_owners, sk, NULL, 0);
-    if (o && o->pid == (bpf_get_current_pid_tgid() >> 32))
+    struct task_struct *cur = bpf_get_current_task_btf();
+
+    if (o && cur && o->pid == (bpf_get_current_pid_tgid() >> 32) &&
+        o->exec_id32 == (__u32)cur->self_exec_id)
         return 0;
 
     return capture_sock_owner(sk);

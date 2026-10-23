@@ -105,14 +105,16 @@ struct {
     __type(value, __u8);
 } watched_pairs SEC(".maps");
 
-/* Names of directories that contain a watched file (".ssh", ".aws", ...),
- * excluding generic ones. Renaming such a directory moves every watched
- * file under it out of reach of the suffix match. Keyed like
- * watched_filenames (char[64]). */
+/* (grandparent, directory) pairs for directories that contain a watched
+ * file (".ssh", (".config","gcloud"), ("rancher","k3s"), ...). Renaming
+ * such a directory moves every watched file under it out of reach of the
+ * suffix match. Same key shape as watched_pairs: an all-zero parent
+ * means "any parent". Generic directory names only appear with a
+ * non-empty parent. */
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 64);
-    __type(key, char[64]);
+    __type(key, struct pair_key);
     __type(value, __u8);
 } watched_dirs SEC(".maps");
 
@@ -212,30 +214,40 @@ static __always_inline int read_name(struct dentry *dentry, char *out, __u32 sz)
 /* fill_pair fills k (which must be zero-initialised) with the dentry's
  * parent directory name and its own name. Returns 0 if the name cannot
  * be read. */
+static __always_inline void fill_parent(struct dentry *d, struct pair_key *k)
+{
+    struct dentry *parent = BPF_CORE_READ(d, d_parent);
+
+    if (parent && parent != d)
+        (void)read_name(parent, k->parent, sizeof(k->parent));
+}
+
 static __always_inline int fill_pair(struct dentry *d, struct pair_key *k)
 {
     if (read_name(d, k->name, sizeof(k->name)) == 0)
         return 0;
 
-    struct dentry *parent = BPF_CORE_READ(d, d_parent);
-    if (parent && parent != d)
-        (void)read_name(parent, k->parent, sizeof(k->parent));
+    fill_parent(d, k);
 
     return 1;
 }
 
 /* pair_watched: is (parent, name) a watched pair, or is name watched
  * with no parent requirement? */
+#define PAIR_IN(map_, k_)                                              \
+    ({                                                                 \
+        int _hit = bpf_map_lookup_elem(&(map_), (k_)) != 0;            \
+        if (!_hit) {                                                   \
+            struct pair_key _any = {};                                 \
+            __builtin_memcpy(_any.name, (k_)->name, sizeof(_any.name)); \
+            _hit = bpf_map_lookup_elem(&(map_), &_any) != 0;           \
+        }                                                              \
+        _hit;                                                          \
+    })
+
 static __always_inline int pair_watched(const struct pair_key *k)
 {
-    if (bpf_map_lookup_elem(&watched_pairs, k))
-        return 1;
-
-    struct pair_key any = {};
-
-    __builtin_memcpy(any.name, k->name, sizeof(any.name));
-
-    return bpf_map_lookup_elem(&watched_pairs, &any) != 0;
+    return PAIR_IN(watched_pairs, k);
 }
 
 /* emit_credwatch publishes one event. src is copied into the 128-byte
@@ -312,12 +324,15 @@ int BPF_PROG(credwatch_file_open, struct file *file)
     struct dentry *dentry = BPF_CORE_READ(file, f_path.dentry);
     struct pair_key pk = {};
 
-    if (!fill_pair(dentry, &pk))
+    if (read_name(dentry, pk.name, sizeof(pk.name)) == 0)
         return 0;
 
     __u8 *fname_found = bpf_map_lookup_elem(&watched_filenames, &pk.name);
     if (!fname_found)
         return 0;
+
+    /* Only a prefilter hit pays for the parent-name read. */
+    fill_parent(dentry, &pk);
 
     __u32 zero = 0;
     char *buf = bpf_map_lookup_elem(&path_buf, &zero);
@@ -363,8 +378,9 @@ int BPF_PROG(credwatch_file_open, struct file *file)
  * killing legitimate builds:
  *   - regular files: the (parent directory name, file name) pair must be
  *     a watched pair (".ssh"/"id_rsa"), not just a watched file name;
- *   - directories: the name must be a non-generic parent component of a
- *     watched suffix (".ssh", ".aws", ...). */
+ *   - directories: (parent, name) must be a watched directory pair, i.e.
+ *     the directory holding a watched file (".ssh", ".config/gcloud",
+ *     "rancher/k3s", ...). */
 static __always_inline int dentry_verdict(struct dentry *d, __u8 kind)
 {
     __u64 cgroup_id;
@@ -387,7 +403,7 @@ static __always_inline int dentry_verdict(struct dentry *d, __u8 kind)
         if (!pair_watched(&pk))
             return 0;
     } else if (type == S_IFDIR) {
-        if (!bpf_map_lookup_elem(&watched_dirs, &pk.name))
+        if (!PAIR_IN(watched_dirs, &pk))
             return 0;
     } else {
         return 0;

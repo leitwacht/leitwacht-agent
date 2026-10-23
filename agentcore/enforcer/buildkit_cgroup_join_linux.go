@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -31,6 +32,9 @@ type InotifyCgroupSource struct {
 	// means "nothing to watch"; Run returns ErrCgroupJoinUnsupported
 	// in that case so operators see a loud config issue.
 	WatchPaths []string
+
+	// rewatchEvery overrides rewatchInterval. Test-only.
+	rewatchEvery time.Duration
 }
 
 // NewInotifyCgroupSource constructs an event source bound to the
@@ -40,11 +44,21 @@ func NewInotifyCgroupSource(paths []string) *InotifyCgroupSource {
 	return &InotifyCgroupSource{WatchPaths: paths}
 }
 
-// Run blocks until ctx is cancelled, the inotify fd is closed, or a
-// fatal error fires. Per-event errors are logged by the joiner — the
-// source's contract is just to surface filesystem events as they
-// arrive.
-func (s *InotifyCgroupSource) Run(ctx context.Context, creates chan<- CgroupCreateEvent, removes chan<- CgroupRemoveEvent) error {
+// rewatchInterval is how often a watch that was lost (watched dir
+// deleted or its filesystem unmounted) is retried.
+const rewatchInterval = 2 * time.Second
+
+// Run blocks until ctx is cancelled or a fatal error fires. Per-event
+// errors are logged by the joiner — the source's contract is just to
+// surface filesystem events as they arrive.
+//
+// The loop blocks in poll(2) on the (non-blocking) inotify fd plus an
+// eventfd that a helper goroutine signals on ctx cancellation, so an
+// idle queue costs no CPU. Both fds are closed exactly once, after the
+// helper has been joined, on every return path.
+//
+//nolint:gocognit,cyclop,funlen // single poll/read/dispatch loop reads cleanly top-to-bottom
+func (s *InotifyCgroupSource) Run(ctx context.Context, creates chan<- CgroupCreateEvent, removes chan<- CgroupRemoveEvent) (retErr error) {
 	defer close(creates)
 	defer close(removes)
 
@@ -56,11 +70,40 @@ func (s *InotifyCgroupSource) Run(ctx context.Context, creates chan<- CgroupCrea
 	if err != nil {
 		return fmt.Errorf("inotify init: %w", err)
 	}
-	defer func() { _ = unix.Close(fd) }()
+
+	efd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		_ = unix.Close(fd)
+
+		return fmt.Errorf("eventfd: %w", err)
+	}
+
+	done := make(chan struct{})
+
+	var helper sync.WaitGroup
+
+	helper.Add(1)
+
+	go func() {
+		defer helper.Done()
+
+		select {
+		case <-ctx.Done():
+			one := []byte{1, 0, 0, 0, 0, 0, 0, 0}
+			_, _ = unix.Write(efd, one)
+		case <-done:
+		}
+	}()
+
+	defer func() {
+		close(done)
+		helper.Wait()
+		_ = unix.Close(fd)
+		_ = unix.Close(efd)
+	}()
 
 	wd2path := make(map[int32]string)
-
-	var mu sync.Mutex
+	lost := make(map[string]struct{}) // paths whose watch must be re-established
 
 	addWatch := func(path string) error {
 		wd, addErr := unix.InotifyAddWatch(fd, path, unix.IN_CREATE|unix.IN_DELETE|unix.IN_ONLYDIR)
@@ -68,9 +111,7 @@ func (s *InotifyCgroupSource) Run(ctx context.Context, creates chan<- CgroupCrea
 			return fmt.Errorf("inotify add %s: %w", path, addErr)
 		}
 
-		mu.Lock()
 		wd2path[int32(wd)] = path
-		mu.Unlock()
 
 		return nil
 	}
@@ -81,54 +122,151 @@ func (s *InotifyCgroupSource) Run(ctx context.Context, creates chan<- CgroupCrea
 		}
 	}
 
-	// Cancellation: close the inotify fd from a side goroutine
-	// when ctx fires. The read in the main loop unblocks with EBADF
-	// and we return ctx.Err().
-	go func() {
-		<-ctx.Done()
-		_ = unix.Close(fd)
-	}()
+	// emitExisting reports every directory currently under path as a
+	// create. Used after an event-queue overflow and after re-watching,
+	// to cover events the kernel did not deliver.
+	emitExisting := func(path string) error {
+		entries, readErr := os.ReadDir(path)
+		if readErr != nil {
+			return nil //nolint:nilerr // dir vanished again; the lost-watch path handles it
+		}
 
-	buf := make([]byte, 64*1024)
-
-	for {
-		n, err := unix.Read(fd, buf)
-		if err != nil {
-			if errors.Is(err, unix.EAGAIN) {
-				// Non-blocking mode without epoll integration is
-				// unusual; if we hit EAGAIN, wait briefly via the
-				// poll loop. In practice the fd is blocking once
-				// we're in Read, so this branch is just defensive.
+		for _, e := range entries {
+			if !e.IsDir() {
 				continue
 			}
 
-			// EBADF / EINTR after ctx.Done means cancellation.
-			if ctx.Err() != nil {
+			select {
+			case creates <- CgroupCreateEvent{ContainerID: e.Name(), CgroupPath: filepath.Join(path, e.Name())}:
+			case <-ctx.Done():
 				return ctx.Err()
 			}
-
-			return fmt.Errorf("inotify read: %w", err)
 		}
 
-		offset := 0
+		return nil
+	}
 
-		for offset+unix.SizeofInotifyEvent <= n {
-			raw := (*unix.InotifyEvent)(unsafe.Pointer(&buf[offset]))
-			nameLen := int(raw.Len)
-
-			var name string
-
-			if nameLen > 0 {
-				nameBytes := buf[offset+unix.SizeofInotifyEvent : offset+unix.SizeofInotifyEvent+nameLen]
-				// Names are NUL-padded; trim.
-				name = strings.TrimRight(string(nameBytes), "\x00")
+	retryLost := func() error {
+		for path := range lost {
+			if addErr := addWatch(path); addErr != nil {
+				continue
 			}
 
-			mu.Lock()
-			parent := wd2path[raw.Wd]
-			mu.Unlock()
+			delete(lost, path)
 
-			if parent != "" && name != "" {
+			if err := emitExisting(path); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	rewatch := rewatchInterval
+	if s.rewatchEvery > 0 {
+		rewatch = s.rewatchEvery
+	}
+
+	pollFds := []unix.PollFd{
+		{Fd: int32(fd), Events: unix.POLLIN},
+		{Fd: int32(efd), Events: unix.POLLIN},
+	}
+	buf := make([]byte, 64*1024)
+
+	for {
+		timeout := -1
+		if len(lost) > 0 {
+			timeout = int(rewatch / time.Millisecond)
+		}
+
+		_, pollErr := unix.Poll(pollFds, timeout)
+		if pollErr != nil {
+			if errors.Is(pollErr, unix.EINTR) {
+				continue
+			}
+
+			return fmt.Errorf("inotify poll: %w", pollErr)
+		}
+
+		if pollFds[1].Revents != 0 {
+			return ctx.Err()
+		}
+
+		if len(lost) > 0 {
+			if err := retryLost(); err != nil {
+				return err
+			}
+		}
+
+		if pollFds[0].Revents&(unix.POLLERR|unix.POLLHUP|unix.POLLNVAL) != 0 {
+			return errors.New("inotify fd failed")
+		}
+
+		if pollFds[0].Revents&unix.POLLIN == 0 {
+			continue
+		}
+
+		// Drain the queue until it would block.
+		for {
+			n, err := unix.Read(fd, buf)
+			if err != nil {
+				if errors.Is(err, unix.EAGAIN) {
+					break
+				}
+
+				if errors.Is(err, unix.EINTR) {
+					continue
+				}
+
+				return fmt.Errorf("inotify read: %w", err)
+			}
+
+			offset := 0
+
+			for offset+unix.SizeofInotifyEvent <= n {
+				raw := (*unix.InotifyEvent)(unsafe.Pointer(&buf[offset]))
+				nameLen := int(raw.Len)
+
+				var name string
+
+				if nameLen > 0 {
+					nameBytes := buf[offset+unix.SizeofInotifyEvent : offset+unix.SizeofInotifyEvent+nameLen]
+					// Names are NUL-padded; trim.
+					name = strings.TrimRight(string(nameBytes), "\x00")
+				}
+
+				offset += unix.SizeofInotifyEvent + nameLen
+
+				switch {
+				case raw.Mask&unix.IN_Q_OVERFLOW != 0:
+					// Events were dropped: re-list every watched dir.
+					for _, p := range wd2path {
+						if err := emitExisting(p); err != nil {
+							return err
+						}
+					}
+
+					continue
+				case raw.Mask&unix.IN_IGNORED != 0:
+					// The watch is gone (dir removed or fs unmounted).
+					if p, ok := wd2path[raw.Wd]; ok {
+						delete(wd2path, raw.Wd)
+
+						lost[p] = struct{}{}
+					}
+
+					if err := retryLost(); err != nil {
+						return err
+					}
+
+					continue
+				}
+
+				parent := wd2path[raw.Wd]
+				if parent == "" || name == "" {
+					continue
+				}
+
 				path := filepath.Join(parent, name)
 
 				switch {
@@ -146,8 +284,6 @@ func (s *InotifyCgroupSource) Run(ctx context.Context, creates chan<- CgroupCrea
 					}
 				}
 			}
-
-			offset += unix.SizeofInotifyEvent + nameLen
 		}
 	}
 }

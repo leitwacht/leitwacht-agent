@@ -428,6 +428,7 @@ func TestIntegrationMetadataEndpointsHardBlocked(t *testing.T) {
 		{"ecs", "169.254.170.2"},
 		{"eksidentity", "169.254.170.23"},
 		{"alibaba", "100.100.100.200"},
+		{"tencent", "169.254.0.23"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			violations := runBareIPScenarioFor(t, "meta"+tc.name, tc.ip, []policy.Rule{{

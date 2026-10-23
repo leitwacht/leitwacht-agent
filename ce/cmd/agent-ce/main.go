@@ -412,13 +412,16 @@ func emitProcMemAdvisory(cfg *config.Config, mgr *enforcer.Manager, sink *sinks.
 	})
 }
 
+// wireDNSKill kills the container behind a block-mode DNS violation. The
+// manager invokes the callback off the DNS handler goroutine, once per
+// identified container (retrying a bounded number of times on error), so no
+// empty or guessed container ID ever reaches it.
 func wireDNSKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *sinks.Multi, log *slog.Logger) {
-	mgr.SetOnDNSViolation(func(cgroupID uint64, domain, action string) {
-		containerID := mgr.ContainerIDForCgroup(cgroupID)
-		if containerID != "" {
-			if err := w.KillContainer(context.Background(), containerID); err != nil {
-				log.Warn("dns kill failed", "container", containerID, "error", err)
-			}
+	mgr.SetOnDNSViolation(func(containerID, domain, action string) error {
+		if err := w.KillContainer(context.Background(), containerID); err != nil {
+			log.Warn("dns kill failed", "container", containerID, "error", err)
+
+			return fmt.Errorf("kill container: %w", err)
 		}
 		_ = sink.ReportAdvisory(context.Background(), &advisory.Advisory{
 			ContainerID: containerID,
@@ -429,6 +432,8 @@ func wireDNSKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *sinks.
 		if result := mgr.Detach(containerID); result != nil {
 			sink.ReportAsync(context.Background(), result.Info, &result.Stats, false, time.Time{})
 		}
+
+		return nil
 	})
 }
 

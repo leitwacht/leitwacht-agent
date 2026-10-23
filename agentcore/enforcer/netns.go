@@ -16,27 +16,57 @@ import (
 // IMPORTANT: fn must not spawn goroutines — they would run on different
 // OS threads in the host namespace, not the target namespace.
 func inNetns(pid int, fn func() error) error {
-	runtime.LockOSThread()
-
-	defer runtime.UnlockOSThread()
-
-	origNs, err := netns.Get()
-	if err != nil {
-		return fmt.Errorf("get current netns: %w", err)
-	}
-	defer origNs.Close()    //nolint:errcheck // cleanup
-	defer netns.Set(origNs) //nolint:errcheck // best-effort restore
-
 	targetNs, err := netns.GetFromPid(pid)
 	if err != nil {
 		return fmt.Errorf("get netns for pid %d: %w", pid, err)
 	}
 	defer targetNs.Close() //nolint:errcheck // cleanup
 
-	err = netns.Set(targetNs)
+	return inNetnsHandle(targetNs, fn)
+}
+
+// inNetnsHandle is inNetns for an already-open netns handle, so the target
+// namespace stays reachable after every process that was in it has exited.
+//
+// The work runs in a dedicated goroutine whose result is passed back on a
+// channel. If the original namespace cannot be restored that goroutine exits
+// while still locked to its thread, so the Go runtime discards the thread at
+// once; the caller never continues on a thread stuck in the job netns.
+func inNetnsHandle(target netns.NsHandle, fn func() error) error {
+	done := make(chan error, 1)
+
+	go func() { done <- inNetnsHandleLocked(target, fn) }()
+
+	return <-done
+}
+
+func inNetnsHandleLocked(target netns.NsHandle, fn func() error) error {
+	runtime.LockOSThread()
+
+	origNs, err := netns.Get()
 	if err != nil {
-		return fmt.Errorf("set netns for pid %d: %w", pid, err)
+		runtime.UnlockOSThread()
+
+		return fmt.Errorf("get current netns: %w", err)
+	}
+	defer origNs.Close() //nolint:errcheck // cleanup
+
+	err = netns.Set(target)
+	if err != nil {
+		// Never left the original namespace; the thread is safe to reuse.
+		runtime.UnlockOSThread()
+
+		return fmt.Errorf("set netns: %w", err)
 	}
 
-	return fn()
+	fnErr := fn()
+
+	if restoreErr := netns.Set(origNs); restoreErr != nil {
+		// Do NOT unlock: the thread dies with this goroutine.
+		return fmt.Errorf("restore netns: %w", restoreErr)
+	}
+
+	runtime.UnlockOSThread()
+
+	return fnErr
 }

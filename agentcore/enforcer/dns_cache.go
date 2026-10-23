@@ -43,7 +43,9 @@ func (c *DNSCache) Record(domain string, ips []string) {
 	defer c.mu.Unlock()
 
 	for _, ip := range ips {
-		if ip == "" {
+		// The sinkhole address is shared by every blocked name; caching
+		// it would attribute any sinkhole_hit to the last blocked domain.
+		if ip == "" || ip == SinkholeIPv4 {
 			continue
 		}
 

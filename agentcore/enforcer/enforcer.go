@@ -79,10 +79,11 @@ type NetnsContext struct {
 	// Loaded by the DNS proxy goroutine on every reserved-name query.
 	egressAttached atomic.Bool
 
-	ebpf           EBPFHandle
-	dnsProxy       *DNSProxy
-	stopRingbuf    func()
-	dockerUpstream *net.UDPConn // pre-bound marked socket for Docker DNS; nil on K8s
+	ebpf        EBPFHandle
+	dnsProxy    *DNSProxy
+	stopRingbuf func()
+	// upstreamDialer holds the job netns open for Docker DNS chaining; nil on K8s.
+	upstreamDialer UpstreamDialer
 
 	refcount        int                           // protected by Manager.mu
 	cgroupRecorders map[uint64]*ViolationRecorder // cgroup_id -> per-container recorder
@@ -242,14 +243,15 @@ type Manager struct {
 
 	// Credwatch LSM (global, not per-container).
 	// Fields used by credwatch_linux.go; appear unused on non-linux builds.
-	credwatchCfg               CredwatchConfig                              //nolint:unused,nolintlint // used in credwatch_linux.go
-	credwatchLSMLoaded         bool                                         //nolint:unused,nolintlint // true after successful LSM load
-	credwatchState             any                                          //nolint:unused,nolintlint // *credwatchLSMImpl on Linux
-	credwatchStop              func()                                       //nolint:unused,nolintlint // stops ring buffer reader
-	credwatchContainers        map[string]*credwatchContainerState          //nolint:unused,nolintlint // containerID → tracked state
-	credwatchCgroupToContainer map[uint64]string                            //nolint:unused,nolintlint // cgroupID → containerID
-	OnCredwatchEvent           func(event CredwatchEvent)                   //nolint:unused,nolintlint // callback for kill + report
-	onDNSViolation             func(cgroupID uint64, domain, action string) // called from DNS proxy on block-mode violations
+	credwatchCfg               CredwatchConfig                     //nolint:unused,nolintlint // used in credwatch_linux.go
+	credwatchLSMLoaded         bool                                //nolint:unused,nolintlint // true after successful LSM load
+	credwatchState             any                                 //nolint:unused,nolintlint // *credwatchLSMImpl on Linux
+	credwatchStop              func()                              //nolint:unused,nolintlint // stops ring buffer reader
+	credwatchContainers        map[string]*credwatchContainerState //nolint:unused,nolintlint // containerID → tracked state
+	credwatchCgroupToContainer map[uint64]string                   //nolint:unused,nolintlint // cgroupID → containerID
+	OnCredwatchEvent           func(event CredwatchEvent)          //nolint:unused,nolintlint // callback for kill + report
+	onDNSViolation             DNSViolationFunc                    // called from DNS proxy on block-mode violations
+	dnsViolationState          map[string]int                      // containerID -> attempts (-1: in flight or done); protected by mu
 
 	// Proc_mem LSM (global, not per-container).
 	// Fields used by proc_mem_linux.go; appear unused on non-linux builds.
@@ -288,9 +290,18 @@ func (m *Manager) Platform() Platform {
 	return m.platform
 }
 
+// DNSViolationFunc handles a block-mode DNS violation for an identified
+// container. The manager calls it asynchronously, once per container; a
+// non-nil error (e.g. a failed kill) allows a bounded number of retries on
+// later violations.
+type DNSViolationFunc func(containerID, domain, action string) error
+
 // SetOnDNSViolation sets the callback invoked when a DNS violation occurs
 // in block mode. CE wires this to kill the container; EE may quarantine.
-func (m *Manager) SetOnDNSViolation(fn func(cgroupID uint64, domain, action string)) {
+func (m *Manager) SetOnDNSViolation(fn DNSViolationFunc) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	m.onDNSViolation = fn
 }
 
@@ -308,7 +319,9 @@ func (m *Manager) ContainerIDForCgroup(cgroupID uint64) string {
 		return id
 	}
 
-	return ""
+	// Those maps only exist when the credwatch/proc_mem features are on;
+	// fall back to the cgroup IDs recorded at attach.
+	return m.containerIDFromEnforcersLocked(cgroupID)
 }
 
 // ContainerInfo returns the CI attribution recorded for an attached
@@ -1030,13 +1043,14 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 
 	bindInNetnsMs := time.Since(stepStart).Milliseconds()
 
-	// Step 2.5: Docker mode — create marked upstream socket to Docker DNS.
+	// Step 2.5: Docker mode — hold the job netns open so per-query upstream
+	// sockets can be created inside it even after the original process exits.
 	if m.IsDocker {
-		du, dialErr := m.platform.DialUpstreamInNetns(pid, "127.0.0.11:53", agentMark)
+		d, dialErr := m.platform.NewUpstreamDialer(pid)
 		if dialErr != nil {
-			m.logger.Warn("docker upstream socket failed, falling back to host DNS", "error", dialErr)
+			m.logger.Warn("docker upstream dialer failed, falling back to host DNS", "error", dialErr)
 		} else {
-			nctx.dockerUpstream = du
+			nctx.upstreamDialer = d
 		}
 	}
 
@@ -1045,8 +1059,8 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 
 	setupErr := m.platform.SetupDNSRedirect(pid)
 	if setupErr != nil {
-		if nctx.dockerUpstream != nil {
-			_ = nctx.dockerUpstream.Close()
+		if nctx.upstreamDialer != nil {
+			_ = nctx.upstreamDialer.Close()
 		}
 
 		if udpConn != nil {
@@ -1077,11 +1091,17 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 		// attachPodLink for K8s pods, attachEnforcer for non-pod). Closes
 		// the race where the signal fires before AttachCgroup.
 		EgressReady: nctx.egressAttached.Load,
+		OnDNSViolation: func(cgroupID uint64, domain, action string) {
+			m.handleDNSViolation(nctx, cgroupID, domain, action)
+		},
 	}
 
-	if nctx.dockerUpstream != nil {
-		proxyCfg.DockerUpstream = nctx.dockerUpstream
-		proxyCfg.DockerUpstreamMu = &sync.Mutex{}
+	if nctx.upstreamDialer != nil {
+		// Docker mode: chain to the embedded resolver from a fresh marked
+		// socket opened inside the job netns per query.
+		d := nctx.upstreamDialer
+		proxyCfg.DockerUDPDial = func() (*net.UDPConn, error) { return d.DialUDP("127.0.0.11:53", agentMark) }
+		proxyCfg.DockerTCPDial = func() (net.Conn, error) { return d.DialTCP("127.0.0.11:53", agentMark) }
 	}
 
 	if m.dnsPIDTracker != nil {
@@ -1101,6 +1121,10 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 		context.Background(), nctx.lookupPacketRecorder, &nctx.auditMode)
 	if err != nil {
 		nctx.dnsProxy.Stop()
+
+		if nctx.upstreamDialer != nil {
+			_ = nctx.upstreamDialer.Close()
+		}
 
 		_ = m.platform.RemoveDNSRedirect(pid)
 		_ = ebpfHandle.Close()
@@ -1129,6 +1153,18 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 //nolint:funlen // sequential register-recorder + LSM + DNS + timing fields; tight coupling to nctx state
 func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.ResolvedPolicy, nctx *NetnsContext) (*Enforcer, error) {
 	start := time.Now()
+
+	// A CAP_NET_ADMIN container can forge the agent's SO_MARK (or edit the
+	// nftables rules) and so bypass DNS interception. Unenforceable; say so.
+	hasNetAdmin, capErr := procHasCapNetAdmin(pid)
+
+	switch {
+	case capErr != nil:
+		m.logger.Debug("cap_net_admin check failed", "container_id", shortID(info.ContainerID), "error", capErr)
+	case hasNetAdmin:
+		m.logger.Warn("container holds CAP_NET_ADMIN: DNS interception can be bypassed (unenforceable configuration)",
+			"container_id", shortID(info.ContainerID), "pid", pid)
+	}
 
 	// Resolve cgroup path.
 	cgroupPath := info.CgroupPath
@@ -1553,8 +1589,8 @@ func (m *Manager) teardownNetnsContext(nctx *NetnsContext) {
 		nctx.dnsProxy.Stop()
 	}
 
-	if nctx.dockerUpstream != nil {
-		_ = nctx.dockerUpstream.Close()
+	if nctx.upstreamDialer != nil {
+		_ = nctx.upstreamDialer.Close()
 	}
 
 	if nctx.stopRingbuf != nil {
@@ -1585,6 +1621,7 @@ func (m *Manager) Detach(containerID string) *DetachResult {
 	m.mu.Lock()
 	e, ok := m.enforcers[containerID]
 	delete(m.enforcers, containerID)
+	delete(m.dnsViolationState, containerID)
 
 	if !ok || e == nil {
 		m.mu.Unlock()

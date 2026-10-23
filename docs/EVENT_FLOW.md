@@ -291,3 +291,50 @@ This means a domain-only rule set still catches IP-bypass attempts
 without any extra `deny_ips` configuration. See
 `agentcore/enforcer/integration_test.go::TestIntegrationBareIPBlocked`
 for the regression covering this case end-to-end.
+
+### DNS interception: what the job can and cannot bypass
+
+Port-53 traffic leaving the job's netns is redirected (nftables, `nat
+output`) to the agent's proxy on `127.0.0.1:15353`. In Docker mode the
+proxy forwards to Docker's embedded resolver (`127.0.0.11`) from a
+socket stamped with the agent's `SO_MARK`.
+
+- **Direct queries to the embedded resolver.** Docker's resolver also
+  listens on a random high port on `127.0.0.11`, and the egress program
+  allows loopback, so a job could query it there without touching the
+  proxy. A `filter output` chain (`docker_dns_guard`, after the NAT
+  chain) drops any unmarked packet to `127.0.0.11`, all ports, UDP and
+  TCP. Ordinary port-53 lookups are redirected before that chain and
+  are unaffected. There is no IPv6 variant: Docker does not expose an
+  IPv6 embedded resolver by default and the datapath is IPv4-only.
+- **Forged upstream replies.** The proxy's upstream socket lives in the
+  job's netns, so the job can read its port and aim datagrams at it.
+  Three layers apply: (1) the same `docker_dns_guard` chain drops any
+  original-direction packet whose source is `127.0.0.11` (genuine
+  replies belong to the proxy's marked flow and are reply-direction in
+  conntrack; raw sockets also traverse OUTPUT); (2) the Docker upstream is a fresh marked socket per query,
+  opened inside the job netns through a netns handle held for the
+  netns's lifetime (UDP, so Docker keeps forwarding upstream over UDP;
+  marked TCP only to retry a truncated reply); single-label names that
+  Docker cannot answer get SERVFAIL rather than leaking to host
+  resolvers; (3) the reply must carry a fresh random
+  DNS ID and echo the exact question, the client's ID is restored, and
+  only `A` records owned by the queried name or its CNAME chain are
+  returned and seeded into the allow map. The redirect chain runs one
+  priority ahead of Docker's own `DOCKER_OUTPUT` DNAT so it
+  deterministically wins.
+- **`CAP_NET_ADMIN` is unenforceable.** A container with
+  `CAP_NET_ADMIN` can set `SO_MARK` itself (skipping the redirect and
+  the guard above) or rewrite the nftables rules. The agent cannot stop
+  that; it logs a warning at attach when the container's effective
+  capabilities include it. Do not grant it to monitored workloads.
+- **Load shedding.** Each proxy handles at most 256 queries at once and
+  answers `SERVFAIL` beyond that. DNS evidence is capped per bucket
+  (resolved IPs per entry, entries per container); blocked/denied
+  entries have reserved headroom, and drops are counted
+  (`resolved_ips_dropped`, and the report's `overflow_count`).
+- **DNS-violation kill attribution.** In block mode a blocked query is
+  always sinkholed. The container kill additionally needs the query
+  attributed to a known container by cgroup; with no attribution (or an
+  unknown cgroup) the agent takes no kill action rather than guessing
+  among sibling containers.

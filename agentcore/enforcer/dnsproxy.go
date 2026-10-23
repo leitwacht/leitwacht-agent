@@ -2,6 +2,8 @@
 package enforcer
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,7 +23,10 @@ var (
 	ErrAllUpstreamsFailed = errors.New("all upstreams failed")
 	// ErrDockerDNSIDMismatch is returned when the Docker DNS upstream returns
 	// responses with mismatched IDs (stale packets from timed-out queries).
-	ErrDockerDNSIDMismatch = errors.New("docker dns: id mismatch after retries")
+	ErrDockerDNSIDMismatch = errors.New("docker dns: reply id mismatch")
+	// ErrDNSQuestionMismatch is returned when an upstream reply does not
+	// echo the question that was asked.
+	ErrDNSQuestionMismatch = errors.New("dns reply question mismatch")
 )
 
 const (
@@ -31,6 +36,19 @@ const (
 	tcpReadTimeout  = 5 * time.Second
 	tcpWriteTimeout = 5 * time.Second
 	tcpMaxQueries   = 128
+
+	// maxInflightQueries bounds concurrently-processed queries per proxy.
+	// A job can fire packets as fast as it likes; beyond this the proxy
+	// answers SERVFAIL immediately instead of spawning unbounded work
+	// (goroutines, upstream sockets, log lines).
+	maxInflightQueries = 256
+
+	// maxUpstreamReads bounds how many non-matching datagrams one UDP
+	// upstream exchange will skip before giving up.
+	maxUpstreamReads = 16
+
+	// upstreamFailLogInterval rate-limits the upstream-failure log line.
+	upstreamFailLogInterval = time.Second
 
 	// upstreamUDPSize is the UDP receive-buffer size for upstream
 	// responses. Without it the dns library defaults to MinMsgSize
@@ -79,12 +97,15 @@ type DNSProxyConfig struct {
 	// (see (*DNSProxy).Start).
 	LookupDNSPID func(netnsCookie uint64, srcPort uint16) (pid uint32, comm string, parentComm string, binaryPath string, cgroupID uint64)
 
-	// DockerUpstream is a pre-bound, SO_MARK-ed UDP socket in the container
-	// netns pointing at Docker's embedded DNS (127.0.0.11:53). Nil on K8s.
-	DockerUpstream *net.UDPConn
-	// DockerUpstreamMu serializes access to DockerUpstream. Non-nil when
-	// DockerUpstream is set.
-	DockerUpstreamMu *sync.Mutex
+	// DockerUDPDial / DockerTCPDial open a fresh SO_MARK-ed socket to
+	// Docker's embedded resolver (127.0.0.11:53) from inside the container
+	// netns, once per query. UDP is the normal path (it keeps Docker's own
+	// upstream forwarding on UDP); TCP is used only to retry a truncated
+	// reply. The per-query socket plus a random ID and question check, and
+	// the nftables guard against job-sourced "127.0.0.11" packets, protect
+	// against forged replies. Both nil on K8s.
+	DockerUDPDial func() (*net.UDPConn, error)
+	DockerTCPDial func() (net.Conn, error)
 
 	// AgentVersion is echoed in the TXT record for attachedName.
 	// Empty strings render as "unknown" — leaving this unset is not a bug.
@@ -103,6 +124,12 @@ type DNSProxyConfig struct {
 	// Nil means "no gating" (treated as ready) — preserves the prior
 	// behaviour for any caller that doesn't wire it.
 	EgressReady func() bool
+
+	// upstreamFailLast / upstreamFailSuppressed rate-limit the
+	// per-query upstream-failure log (unix nanos of the last emission,
+	// and how many lines were swallowed since).
+	upstreamFailLast       atomic.Int64
+	upstreamFailSuppressed atomic.Int64
 }
 
 // HandleDNSQuery processes a single DNS query under ordered-rule policy.
@@ -305,7 +332,7 @@ func forwardAndFilter(msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uin
 
 	resp, err := forwardQuery(msg, cfg)
 	if err != nil {
-		cfg.Logger.Error("upstream dns failed", "domain", qname, "error", err)
+		logUpstreamFailure(cfg, err)
 
 		return servfailResponse(msg), nil, false
 	}
@@ -315,9 +342,21 @@ func forwardAndFilter(msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uin
 		filtered []dns.RR
 	)
 
+	// Only A records owned by the queried name or by a name in its
+	// validated CNAME chain are trusted (returned and seeded). Anything
+	// else in the answer section is injected data, not an answer to this
+	// question.
+	chain := cnameChain(qname, resp.Answer)
+
 	for _, rr := range resp.Answer {
 		switch r := rr.(type) {
 		case *dns.A:
+			if !chain[canonicalName(r.Hdr.Name)] {
+				cfg.Logger.Debug("dropped out-of-chain A record")
+
+				continue
+			}
+
 			ips = append(ips, r.A.String())
 			capTTL(r.Header())
 
@@ -334,6 +373,57 @@ func forwardAndFilter(msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uin
 	resp.Answer = filtered
 
 	return resp, ips, true
+}
+
+// canonicalName lowercases a DNS name and strips the trailing root dot.
+func canonicalName(name string) string {
+	return strings.TrimSuffix(strings.ToLower(name), ".")
+}
+
+// cnameChain returns the set of owner names reachable from qname by
+// following CNAME records present in answers (qname itself included).
+func cnameChain(qname string, answers []dns.RR) map[string]bool {
+	chain := map[string]bool{canonicalName(qname): true}
+
+	for range len(answers) {
+		grew := false
+
+		for _, rr := range answers {
+			cn, ok := rr.(*dns.CNAME)
+			if !ok || !chain[canonicalName(cn.Hdr.Name)] {
+				continue
+			}
+
+			target := canonicalName(cn.Target)
+			if !chain[target] {
+				chain[target] = true
+				grew = true
+			}
+		}
+
+		if !grew {
+			break
+		}
+	}
+
+	return chain
+}
+
+// logUpstreamFailure logs an upstream failure at most once per
+// upstreamFailLogInterval, at Debug and without the queried name (which
+// is attacker-chosen), so a query flood cannot flood the log.
+func logUpstreamFailure(cfg *DNSProxyConfig, err error) {
+	now := time.Now().UnixNano()
+
+	last := cfg.upstreamFailLast.Load()
+	if now-last < int64(upstreamFailLogInterval) || !cfg.upstreamFailLast.CompareAndSwap(last, now) {
+		cfg.upstreamFailSuppressed.Add(1)
+
+		return
+	}
+
+	cfg.Logger.Debug("upstream dns failed", "error", err,
+		"suppressed", cfg.upstreamFailSuppressed.Swap(0))
 }
 
 // seedAllowMap adds the resolved IPs to the eBPF allow map on the given
@@ -377,16 +467,20 @@ func seedAllowMap(cfg *DNSProxyConfig, ips []string, rulePorts []int, prio uint3
 }
 
 func forwardQuery(msg *dns.Msg, cfg *DNSProxyConfig) (*dns.Msg, error) {
-	// Try Docker upstream first (pre-bound marked socket in container netns).
-	if cfg.DockerUpstream != nil {
-		cfg.DockerUpstreamMu.Lock()
-		resp, err := exchangeViaConn(cfg.DockerUpstream, msg)
-		cfg.DockerUpstreamMu.Unlock()
-
+	// Try Docker upstream first (marked TCP connection from the container netns).
+	if cfg.DockerUDPDial != nil {
+		resp, err := exchangeViaDocker(cfg.DockerUDPDial, cfg.DockerTCPDial, msg)
 		if err == nil {
 			return resp, nil
 		}
-		// Fall through to regular upstreams on error.
+
+		// Single-label names are Docker service-discovery names (container
+		// or service names) that host resolvers cannot answer, and
+		// forwarding them would leak the internal name.
+		if !strings.Contains(canonicalName(msg.Question[0].Name), ".") {
+			return nil, err
+		}
+		// Otherwise fall through to regular upstreams.
 	}
 
 	udpClient := &dns.Client{Timeout: upstreamTimeout, Net: "udp", UDPSize: upstreamUDPSize}
@@ -394,13 +488,13 @@ func forwardQuery(msg *dns.Msg, cfg *DNSProxyConfig) (*dns.Msg, error) {
 
 	for _, upstream := range cfg.Upstreams {
 		resp, _, err := udpClient.Exchange(msg, upstream)
-		if err != nil {
+		if err != nil || !questionMatches(msg, resp) {
 			continue
 		}
 		// Retry over TCP if response was truncated.
 		if resp.Truncated {
 			tcpResp, _, tcpErr := tcpClient.Exchange(msg, upstream)
-			if tcpErr == nil {
+			if tcpErr == nil && questionMatches(msg, tcpResp) {
 				return tcpResp, nil
 			}
 			// Fall through to return the truncated UDP response.
@@ -409,39 +503,137 @@ func forwardQuery(msg *dns.Msg, cfg *DNSProxyConfig) (*dns.Msg, error) {
 		return resp, nil
 	}
 
-	return nil, fmt.Errorf("%w for %s", ErrAllUpstreamsFailed, msg.Question[0].Name)
+	return nil, fmt.Errorf("%w", ErrAllUpstreamsFailed)
 }
 
-// exchangeViaConn sends a DNS query over an existing UDP connection and reads
-// the response. Retries on ID mismatch to skip stale responses from prior
-// timed-out queries.
-func exchangeViaConn(conn *net.UDPConn, msg *dns.Msg) (*dns.Msg, error) {
-	// UDPSize must be set or ReadMsg defaults to a 512-byte buffer and
-	// fails to parse larger upstream answers (see upstreamUDPSize).
-	co := &dns.Conn{Conn: conn, UDPSize: upstreamUDPSize}
+// exchangeViaDocker sends one query to Docker's embedded resolver over a
+// fresh marked UDP socket (dialUDP) and, only if the reply is truncated,
+// retries over a fresh marked TCP connection (dialTCP).
+//
+// The sockets live in the job's netns. The query goes out under a fresh
+// random message ID; a reply is accepted only with that ID AND the exact
+// question, and the client's ID is restored. Job-injected datagrams claiming
+// to be the resolver are additionally dropped by the nftables guard.
+func exchangeViaDocker(
+	dialUDP func() (*net.UDPConn, error), dialTCP func() (net.Conn, error), msg *dns.Msg,
+) (*dns.Msg, error) {
+	resp, err := exchangeDockerUDP(dialUDP, msg)
+	if err != nil {
+		return nil, err
+	}
 
-	deadlineErr := co.SetDeadline(time.Now().Add(upstreamTimeout))
+	if !resp.Truncated || dialTCP == nil {
+		return resp, nil
+	}
+
+	tcpResp, tcpErr := exchangeDockerTCP(dialTCP, msg)
+	if tcpErr != nil {
+		// Better a truncated answer (the client retries over TCP itself)
+		// than none.
+		return resp, nil //nolint:nilerr // intentional fallback to the truncated reply
+	}
+
+	return tcpResp, nil
+}
+
+func exchangeDockerUDP(dial func() (*net.UDPConn, error), msg *dns.Msg) (*dns.Msg, error) {
+	uc, err := dial()
+	if err != nil {
+		return nil, fmt.Errorf("docker dns dial: %w", err)
+	}
+	defer uc.Close() //nolint:errcheck // per-query socket
+
+	return exchangeConn(&dns.Conn{Conn: uc, UDPSize: upstreamUDPSize}, uc, msg, true)
+}
+
+func exchangeDockerTCP(dial func() (net.Conn, error), msg *dns.Msg) (*dns.Msg, error) {
+	nc, err := dial()
+	if err != nil {
+		return nil, fmt.Errorf("docker dns dial: %w", err)
+	}
+	defer nc.Close() //nolint:errcheck // per-query connection
+
+	return exchangeConn(&dns.Conn{Conn: nc}, nc, msg, false)
+}
+
+// exchangeConn writes msg (under a random ID) and reads the matching reply.
+// For UDP, non-matching datagrams are skipped (bounded); for TCP a
+// non-matching reply is an error.
+func exchangeConn(co *dns.Conn, nc net.Conn, msg *dns.Msg, skipMismatches bool) (*dns.Msg, error) {
+	deadlineErr := nc.SetDeadline(time.Now().Add(upstreamTimeout))
 	if deadlineErr != nil {
 		return nil, fmt.Errorf("docker dns deadline: %w", deadlineErr)
 	}
 
-	writeErr := co.WriteMsg(msg)
+	upID, idErr := randomDNSID()
+	if idErr != nil {
+		return nil, fmt.Errorf("docker dns id: %w", idErr)
+	}
+
+	out := msg.Copy()
+	out.Id = upID
+
+	writeErr := co.WriteMsg(out)
 	if writeErr != nil {
 		return nil, fmt.Errorf("docker dns write: %w", writeErr)
 	}
 
-	for range 3 {
+	reads := 1
+	if skipMismatches {
+		reads = maxUpstreamReads
+	}
+
+	var mismatch error = ErrDockerDNSIDMismatch
+
+	for range reads {
 		resp, readErr := co.ReadMsg()
 		if readErr != nil {
 			return nil, fmt.Errorf("docker dns read: %w", readErr)
 		}
 
-		if resp.Id == msg.Id {
-			return resp, nil
+		if resp.Id != upID {
+			mismatch = ErrDockerDNSIDMismatch
+
+			continue
 		}
+
+		if !questionMatches(msg, resp) {
+			mismatch = ErrDNSQuestionMismatch
+
+			continue
+		}
+
+		resp.Id = msg.Id
+
+		return resp, nil
 	}
 
-	return nil, ErrDockerDNSIDMismatch
+	return nil, mismatch
+}
+
+// randomDNSID returns a cryptographically random 16-bit DNS message ID.
+func randomDNSID() (uint16, error) {
+	var b [2]byte
+
+	_, err := rand.Read(b[:])
+	if err != nil {
+		return 0, fmt.Errorf("read random: %w", err)
+	}
+
+	return binary.BigEndian.Uint16(b[:]), nil
+}
+
+// questionMatches reports whether resp echoes exactly the question of req
+// (name case-insensitively, type and class exactly).
+func questionMatches(req, resp *dns.Msg) bool {
+	if len(req.Question) != 1 || len(resp.Question) != 1 {
+		return false
+	}
+
+	rq, pq := req.Question[0], resp.Question[0]
+
+	return rq.Qtype == pq.Qtype && rq.Qclass == pq.Qclass &&
+		strings.EqualFold(rq.Name, pq.Name)
 }
 
 func capTTL(hdr *dns.RR_Header) {
@@ -569,6 +761,9 @@ type DNSProxy struct {
 	tcpListener net.Listener
 	wg          sync.WaitGroup
 
+	// sem bounds in-flight queries (see maxInflightQueries).
+	sem chan struct{}
+
 	// netnsCookie identifies the netns the proxy's bound sockets live
 	// in. Populated once in Start() via getsockopt(SO_NETNS_COOKIE) on
 	// udpConn and passed to LookupDNSPID for every query. Zero if the
@@ -581,7 +776,7 @@ type DNSProxy struct {
 
 // NewDNSProxy creates a proxy with the given config.
 func NewDNSProxy(cfg *DNSProxyConfig) *DNSProxy {
-	p := &DNSProxy{cfg: cfg}
+	p := &DNSProxy{cfg: cfg, sem: make(chan struct{}, maxInflightQueries)}
 	p.policy.Store(cfg.Policy)
 
 	return p
@@ -608,6 +803,16 @@ func (p *DNSProxy) Start(udpConn net.PacketConn, tcpListener net.Listener) {
 	p.netnsCookie = netnsCookieFromConn(udpConn, p.cfg.Logger)
 
 	handler := dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		select {
+		case p.sem <- struct{}{}:
+			defer func() { <-p.sem }()
+		default:
+			// Saturated: shed load rather than queue unbounded work.
+			_ = w.WriteMsg(servfailResponse(r))
+
+			return
+		}
+
 		var (
 			pid        uint32
 			comm       string

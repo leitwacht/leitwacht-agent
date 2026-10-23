@@ -12,9 +12,21 @@ import (
 	"gitlab.com/leitwacht/leitwacht-agent/agentcore/policy"
 )
 
-// fakeUpstream is a TCP DNS server whose replies are produced by fn from the
-// query; it returns a dial function suitable for DNSProxyConfig.DockerDial.
-func fakeUpstream(t *testing.T, fn func(q *dns.Msg) []*dns.Msg) func() (net.Conn, error) {
+// fakeDocker is a UDP+TCP DNS server standing in for Docker's embedded
+// resolver; dialUDP/dialTCP match DNSProxyConfig.DockerUDPDial/DockerTCPDial.
+type fakeDocker struct {
+	dialUDP func() (*net.UDPConn, error)
+	dialTCP func() (net.Conn, error)
+}
+
+// fakeUpstream serves fn on both UDP and TCP.
+func fakeUpstream(t *testing.T, fn func(q *dns.Msg) []*dns.Msg) *fakeDocker {
+	t.Helper()
+
+	return fakeDockerSplit(t, fn, fn)
+}
+
+func fakeDockerSplit(t *testing.T, udpFn, tcpFn func(q *dns.Msg) []*dns.Msg) *fakeDocker {
 	t.Helper()
 
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
@@ -41,14 +53,48 @@ func fakeUpstream(t *testing.T, fn func(q *dns.Msg) []*dns.Msg) func() (net.Conn
 					return
 				}
 
-				for _, r := range fn(q) {
+				for _, r := range tcpFn(q) {
 					_ = co.WriteMsg(r)
 				}
 			}()
 		}
 	}()
 
-	return func() (net.Conn, error) { return net.Dial("tcp4", ln.Addr().String()) }
+	srv, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+
+	t.Cleanup(func() { _ = srv.Close() })
+
+	go func() {
+		buf := make([]byte, 4096)
+
+		for {
+			n, from, readErr := srv.ReadFromUDP(buf)
+			if readErr != nil {
+				return
+			}
+
+			q := new(dns.Msg)
+			if q.Unpack(buf[:n]) != nil {
+				continue
+			}
+
+			for _, r := range udpFn(q) {
+				if packed, packErr := r.Pack(); packErr == nil {
+					_, _ = srv.WriteToUDP(packed, from)
+				}
+			}
+		}
+	}()
+
+	return &fakeDocker{
+		dialUDP: func() (*net.UDPConn, error) {
+			return net.DialUDP("udp4", nil, srv.LocalAddr().(*net.UDPAddr))
+		},
+		dialTCP: func() (net.Conn, error) { return net.Dial("tcp4", ln.Addr().String()) },
+	}
 }
 
 func aRR(name, ip string) dns.RR {
@@ -90,7 +136,7 @@ func TestExchangeViaDocker_RandomIDAndRestore(t *testing.T) {
 		msg := makeQuery("a.example.com", dns.TypeA)
 		msg.Id = 4242
 
-		resp, err := exchangeViaDocker(conn, msg)
+		resp, err := exchangeViaDocker(conn.dialUDP, conn.dialTCP, msg)
 		if err != nil {
 			t.Fatalf("exchange: %v", err)
 		}
@@ -109,13 +155,79 @@ func TestExchangeViaDocker_RandomIDAndRestore(t *testing.T) {
 	}
 }
 
-func TestExchangeViaDocker_WrongIDRejected(t *testing.T) {
+func TestExchangeViaDocker_UDPSkipsForgedWrongID(t *testing.T) {
+	conn := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
+		return []*dns.Msg{
+			replyTo(q, q.Id+1, aRR("a.example.com", "203.0.113.66")), // forged: wrong ID
+			replyTo(q, q.Id, aRR("a.example.com", "198.51.100.4")),
+		}
+	})
+
+	resp, err := exchangeViaDocker(conn.dialUDP, conn.dialTCP, makeQuery("a.example.com", dns.TypeA))
+	if err != nil {
+		t.Fatalf("exchange: %v", err)
+	}
+
+	if len(resp.Answer) != 1 || resp.Answer[0].(*dns.A).A.String() != "198.51.100.4" {
+		t.Fatalf("accepted forged reply: %v", resp.Answer)
+	}
+}
+
+func TestExchangeDockerTCP_WrongIDRejected(t *testing.T) {
 	conn := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
 		return []*dns.Msg{replyTo(q, q.Id+1, aRR("a.example.com", "203.0.113.66"))}
 	})
 
-	if _, err := exchangeViaDocker(conn, makeQuery("a.example.com", dns.TypeA)); err == nil {
+	if _, err := exchangeDockerTCP(conn.dialTCP, makeQuery("a.example.com", dns.TypeA)); err == nil {
 		t.Fatal("reply with a wrong ID was accepted")
+	}
+}
+
+func TestExchangeViaDocker_TruncatedRetriesOverTCP(t *testing.T) {
+	var tcpHits atomic.Int32
+
+	conn := fakeDockerSplit(t,
+		func(q *dns.Msg) []*dns.Msg {
+			r := replyTo(q, q.Id)
+			r.Truncated = true
+
+			return []*dns.Msg{r}
+		},
+		func(q *dns.Msg) []*dns.Msg {
+			tcpHits.Add(1)
+
+			return []*dns.Msg{replyTo(q, q.Id, aRR("a.example.com", "198.51.100.4"))}
+		})
+
+	resp, err := exchangeViaDocker(conn.dialUDP, conn.dialTCP, makeQuery("a.example.com", dns.TypeA))
+	if err != nil || resp.Truncated || len(resp.Answer) != 1 || tcpHits.Load() != 1 {
+		t.Fatalf("err=%v truncated=%v answers=%d tcp=%d", err, resp != nil && resp.Truncated, len(resp.Answer), tcpHits.Load())
+	}
+}
+
+func TestExchangeViaDocker_UDPUsedFirstNoTCPWhenNotTruncated(t *testing.T) {
+	var tcpHits atomic.Int32
+
+	conn := fakeDockerSplit(t,
+		func(q *dns.Msg) []*dns.Msg { return []*dns.Msg{replyTo(q, q.Id, aRR("a.example.com", "198.51.100.4"))} },
+		func(q *dns.Msg) []*dns.Msg { tcpHits.Add(1); return nil })
+
+	if _, err := exchangeViaDocker(conn.dialUDP, conn.dialTCP, makeQuery("a.example.com", dns.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+
+	if tcpHits.Load() != 0 {
+		t.Fatal("TCP used although the UDP reply was complete")
+	}
+}
+
+func TestForwardQuery_SingleLabelDockerFailureServfails(t *testing.T) {
+	cfg, _, _ := testDNSConfig(policy.ActionAudit, nil)
+	cfg.Upstreams = []string{"127.0.0.1:1"}                                             // would be tried if we fell through
+	cfg.DockerUDPDial = func() (*net.UDPConn, error) { return nil, errors.New("down") } //nolint:err113 // test
+
+	if _, err := forwardQuery(makeQuery("db", dns.TypeA), cfg); err == nil {
+		t.Fatal("expected failure for single-label name")
 	}
 }
 
@@ -129,7 +241,7 @@ func TestExchangeViaDocker_LargeAnswerOverTCP(t *testing.T) {
 		return []*dns.Msg{replyTo(q, q.Id, rrs...)}
 	})
 
-	resp, err := exchangeViaDocker(conn, makeQuery("a.example.com", dns.TypeA))
+	resp, err := exchangeViaDocker(conn.dialUDP, conn.dialTCP, makeQuery("a.example.com", dns.TypeA))
 	if err != nil || len(resp.Answer) != 100 {
 		t.Fatalf("large answer: err=%v n=%d", err, len(resp.Answer))
 	}
@@ -143,7 +255,7 @@ func TestExchangeViaDocker_QuestionMismatchRejected(t *testing.T) {
 		return []*dns.Msg{r}
 	})
 
-	_, err := exchangeViaDocker(conn, makeQuery("a.example.com", dns.TypeA))
+	_, err := exchangeViaDocker(conn.dialUDP, conn.dialTCP, makeQuery("a.example.com", dns.TypeA))
 	if err == nil {
 		t.Fatal("reply for a different question was accepted")
 	}
@@ -157,7 +269,7 @@ func TestExchangeViaDocker_QuestionCaseInsensitive(t *testing.T) {
 		return []*dns.Msg{r}
 	})
 
-	_, err := exchangeViaDocker(conn, makeQuery("a.example.com", dns.TypeA))
+	_, err := exchangeViaDocker(conn.dialUDP, conn.dialTCP, makeQuery("a.example.com", dns.TypeA))
 	if err != nil {
 		t.Fatalf("case-different question rejected: %v", err)
 	}
@@ -165,12 +277,13 @@ func TestExchangeViaDocker_QuestionCaseInsensitive(t *testing.T) {
 
 // dockerCfg returns a block-mode config forwarding via a fake Docker
 // upstream, capturing allow-map seeds.
-func dockerCfg(t *testing.T, dial func() (net.Conn, error)) (*DNSProxyConfig, *policy.ResolvedPolicy, *[]string) {
+func dockerCfg(t *testing.T, dock *fakeDocker) (*DNSProxyConfig, *policy.ResolvedPolicy, *[]string) {
 	t.Helper()
 
 	cfg, pol, _ := testDNSConfig(policy.ActionBlock, []policy.Rule{allowFQDN("a.example.com", 443)})
 	cfg.Upstreams = nil
-	cfg.DockerDial = dial
+	cfg.DockerUDPDial = dock.dialUDP
+	cfg.DockerTCPDial = dock.dialTCP
 
 	var seeded []string
 

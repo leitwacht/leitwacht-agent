@@ -18,7 +18,10 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/google/nftables"
+	"github.com/vishvananda/netns"
 )
+
+var errNotUDPConn = errors.New("dial returned non-UDP conn")
 
 // minDropEventSize = dst_ip(4) + dst_port(2) + protocol(1) + cgroup_id(8) +
 // reason(1) + pid(4) + comm(16) + binary_path(256) = 292.
@@ -132,35 +135,51 @@ func (p *LinuxPlatform) RemoveDNSRedirect(pid int) error {
 	return nil
 }
 
-// DialUpstreamTCPInNetns opens a marked TCP connection to addr inside the
-// netns of pid. See Platform.DialUpstreamTCPInNetns.
-func (p *LinuxPlatform) DialUpstreamTCPInNetns(pid int, addr string, mark int) (net.Conn, error) {
-	var conn net.Conn
+// NewUpstreamDialer opens the netns of pid. See Platform.NewUpstreamDialer.
+func (p *LinuxPlatform) NewUpstreamDialer(pid int) (UpstreamDialer, error) {
+	h, err := netns.GetFromPid(pid)
+	if err != nil {
+		return nil, fmt.Errorf("get netns for pid %d: %w", pid, err)
+	}
 
-	err := inNetns(pid, func() error {
-		d := net.Dialer{
-			Timeout: upstreamTimeout,
-			Control: func(_, _ string, c syscall.RawConn) error {
-				var sErr error
+	return &netnsDialer{handle: h}, nil
+}
 
-				ctlErr := c.Control(func(fd uintptr) {
-					sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, mark) //nolint:gosec // fd fits int on 64-bit Linux
-				})
-				if ctlErr != nil {
-					return fmt.Errorf("raw control: %w", ctlErr)
-				}
+// netnsDialer dials from inside a held netns handle.
+type netnsDialer struct {
+	handle netns.NsHandle
+}
 
-				if sErr != nil {
-					return fmt.Errorf("set SO_MARK: %w", sErr)
-				}
+func (d *netnsDialer) Close() error { return d.handle.Close() }
 
-				return nil
-			},
+func markControl(mark int) func(_, _ string, c syscall.RawConn) error {
+	return func(_, _ string, c syscall.RawConn) error {
+		var sErr error
+
+		ctlErr := c.Control(func(fd uintptr) {
+			sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_MARK, mark) //nolint:gosec // fd fits int on 64-bit Linux
+		})
+		if ctlErr != nil {
+			return fmt.Errorf("raw control: %w", ctlErr)
 		}
 
-		nc, dialErr := d.DialContext(context.Background(), "tcp4", addr)
+		if sErr != nil {
+			return fmt.Errorf("set SO_MARK: %w", sErr)
+		}
+
+		return nil
+	}
+}
+
+func (d *netnsDialer) dial(network, addr string, mark int) (net.Conn, error) {
+	var conn net.Conn
+
+	err := inNetnsHandle(d.handle, func() error {
+		dl := net.Dialer{Timeout: upstreamTimeout, Control: markControl(mark)}
+
+		nc, dialErr := dl.DialContext(context.Background(), network, addr)
 		if dialErr != nil {
-			return fmt.Errorf("dial marked tcp: %w", dialErr)
+			return fmt.Errorf("dial marked %s: %w", network, dialErr)
 		}
 
 		conn = nc
@@ -168,10 +187,34 @@ func (p *LinuxPlatform) DialUpstreamTCPInNetns(pid int, addr string, mark int) (
 		return nil
 	})
 	if err != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+
 		return nil, err
 	}
 
 	return conn, nil
+}
+
+func (d *netnsDialer) DialUDP(addr string, mark int) (*net.UDPConn, error) {
+	nc, err := d.dial("udp4", addr, mark)
+	if err != nil {
+		return nil, err
+	}
+
+	uc, ok := nc.(*net.UDPConn)
+	if !ok {
+		_ = nc.Close()
+
+		return nil, errNotUDPConn
+	}
+
+	return uc, nil
+}
+
+func (d *netnsDialer) DialTCP(addr string, mark int) (net.Conn, error) {
+	return d.dial("tcp4", addr, mark)
 }
 
 // LoadEBPF loads the eBPF egress filter program and maps (without attaching to a cgroup).

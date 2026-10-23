@@ -107,7 +107,7 @@ func (f *fakePlatform) CgroupID(_ string) (uint64, error) {
 	return f.cgroupIDCounter.Add(1), nil
 }
 
-func (f *fakePlatform) DialUpstreamTCPInNetns(_ int, _ string, _ int) (net.Conn, error) {
+func (f *fakePlatform) NewUpstreamDialer(_ int) (UpstreamDialer, error) {
 	return nil, errors.New("fake: no docker upstream") //nolint:err113 // test fake
 }
 

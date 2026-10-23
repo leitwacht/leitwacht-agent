@@ -306,10 +306,12 @@ socket stamped with the agent's `SO_MARK`.
   Three layers apply: (1) the same `docker_dns_guard` chain drops any
   original-direction packet whose source is `127.0.0.11` (genuine
   replies belong to the proxy's marked flow and are reply-direction in
-  conntrack; raw sockets also traverse OUTPUT); (2) the Docker upstream
-  is a fresh marked **TCP** connection per query, opened inside the job
-  netns, so a reply needs the connection's sequence numbers and there
-  is no truncation to retry; (3) the reply must carry a fresh random
+  conntrack; raw sockets also traverse OUTPUT); (2) the Docker upstream is a fresh marked socket per query,
+  opened inside the job netns through a netns handle held for the
+  netns's lifetime (UDP, so Docker keeps forwarding upstream over UDP;
+  marked TCP only to retry a truncated reply); single-label names that
+  Docker cannot answer get SERVFAIL rather than leaking to host
+  resolvers; (3) the reply must carry a fresh random
   DNS ID and echo the exact question, the client's ID is restored, and
   only `A` records owned by the queried name or its CNAME chain are
   returned and seeded into the allow map. The redirect chain runs one

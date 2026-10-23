@@ -15,6 +15,7 @@ import (
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
+	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
 )
 
@@ -222,6 +223,15 @@ func runGuardScenario(t *testing.T) error {
 		return rerr == nil
 	}
 
+	// The production dialer, holding this (throwaway) netns open.
+	nsHandle, err := netns.Get()
+	if err != nil {
+		return err
+	}
+
+	dialer := &netnsDialer{handle: nsHandle}
+	defer dialer.Close()
+
 	// 1. Unmarked UDP to the resolver's high port: dropped. Marked: delivered.
 	c, err := udpDial(fmt.Sprintf("%s:%d", guardResolverIP, guardResolverPort), 0)
 	if err != nil {
@@ -272,7 +282,7 @@ func runGuardScenario(t *testing.T) error {
 	c.Close()
 
 	// 3. Marked UDP :53 -> DNAT -> resolver; its genuine reply returns.
-	marked, err := udpDial(guardResolverIP+":53", agentMark)
+	marked, err := dialer.DialUDP(guardResolverIP+":53", agentMark)
 	if err != nil {
 		return err
 	}
@@ -291,7 +301,7 @@ func runGuardScenario(t *testing.T) error {
 	// (once the query's conntrack entry exists the kernel's own clash
 	// handling swallows them, so only the pre-send matters). Nothing may
 	// arrive.
-	victim, err := udpDial(guardResolverIP+":53", agentMark)
+	victim, err := dialer.DialUDP(guardResolverIP+":53", agentMark)
 	if err != nil {
 		return err
 	}
@@ -332,19 +342,7 @@ func runGuardScenario(t *testing.T) error {
 		tc.Close()
 	}
 
-	d := net.Dialer{Timeout: time.Second, Control: func(_, _ string, rc syscall.RawConn) error {
-		var sErr error
-
-		if cErr := rc.Control(func(fd uintptr) {
-			sErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_MARK, agentMark)
-		}); cErr != nil {
-			return cErr
-		}
-
-		return sErr
-	}}
-
-	mc, err := d.Dial("tcp4", guardResolverIP+":53")
+	mc, err := dialer.DialTCP(guardResolverIP+":53", agentMark)
 	if err != nil {
 		t.Errorf("marked TCP :53 connect failed: %v", err)
 	} else {

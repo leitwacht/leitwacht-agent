@@ -82,6 +82,8 @@ type NetnsContext struct {
 	ebpf        EBPFHandle
 	dnsProxy    *DNSProxy
 	stopRingbuf func()
+	// upstreamDialer holds the job netns open for Docker DNS chaining; nil on K8s.
+	upstreamDialer UpstreamDialer
 
 	refcount        int                           // protected by Manager.mu
 	cgroupRecorders map[uint64]*ViolationRecorder // cgroup_id -> per-container recorder
@@ -1027,11 +1029,26 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 
 	bindInNetnsMs := time.Since(stepStart).Milliseconds()
 
+	// Step 2.5: Docker mode — hold the job netns open so per-query upstream
+	// sockets can be created inside it even after the original process exits.
+	if m.IsDocker {
+		d, dialErr := m.platform.NewUpstreamDialer(pid)
+		if dialErr != nil {
+			m.logger.Warn("docker upstream dialer failed, falling back to host DNS", "error", dialErr)
+		} else {
+			nctx.upstreamDialer = d
+		}
+	}
+
 	// Step 3: Set up nftables DNS redirect in container netns.
 	stepStart = time.Now()
 
 	setupErr := m.platform.SetupDNSRedirect(pid)
 	if setupErr != nil {
+		if nctx.upstreamDialer != nil {
+			_ = nctx.upstreamDialer.Close()
+		}
+
 		if udpConn != nil {
 			_ = udpConn.Close()
 		}
@@ -1065,16 +1082,12 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 		},
 	}
 
-	if m.IsDocker {
-		// Docker mode: chain to the embedded resolver over a fresh marked
-		// TCP connection opened inside the job netns per query.
-		proxyCfg.DockerDial = func() (net.Conn, error) {
-			nctx.mu.RLock()
-			dialPID := nctx.primaryPID
-			nctx.mu.RUnlock()
-
-			return m.platform.DialUpstreamTCPInNetns(dialPID, "127.0.0.11:53", agentMark)
-		}
+	if nctx.upstreamDialer != nil {
+		// Docker mode: chain to the embedded resolver from a fresh marked
+		// socket opened inside the job netns per query.
+		d := nctx.upstreamDialer
+		proxyCfg.DockerUDPDial = func() (*net.UDPConn, error) { return d.DialUDP("127.0.0.11:53", agentMark) }
+		proxyCfg.DockerTCPDial = func() (net.Conn, error) { return d.DialTCP("127.0.0.11:53", agentMark) }
 	}
 
 	if m.dnsPIDTracker != nil {
@@ -1556,6 +1569,10 @@ func (m *Manager) deferredTeardown(nctx *NetnsContext) {
 func (m *Manager) teardownNetnsContext(nctx *NetnsContext) {
 	if nctx.dnsProxy != nil {
 		nctx.dnsProxy.Stop()
+	}
+
+	if nctx.upstreamDialer != nil {
+		_ = nctx.upstreamDialer.Close()
 	}
 
 	if nctx.stopRingbuf != nil {

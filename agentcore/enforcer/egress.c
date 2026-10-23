@@ -417,12 +417,14 @@ int egress_filter(struct __sk_buff *skb) {
          169.254.170.2    ECS task role credentials
          169.254.170.23   EKS Pod Identity agent
          100.100.100.200  Alibaba Cloud metadata
+         169.254.0.23     Tencent Cloud metadata
        IPv6 (e.g. fd00:ec2::254) needs no entry: all non-loopback IPv6
        is dropped above in block mode. */
     if (dst_ip == bpf_htonl(0xA9FEA9FE) ||
         dst_ip == bpf_htonl(0xA9FEAA02) ||
         dst_ip == bpf_htonl(0xA9FEAA17) ||
-        dst_ip == bpf_htonl(0x646464C8))
+        dst_ip == bpf_htonl(0x646464C8) ||
+        dst_ip == bpf_htonl(0xA9FE0017))
         return apply_drop(skb, dst_ip, dst_port, protocol, DROP_REASON_POLICY);
 
     /* DoT: always block port 853 */

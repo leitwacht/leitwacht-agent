@@ -35,7 +35,8 @@ type credwatchEventBPF struct {
 
 // credwatchContainerState tracks cgroup ID for a container in the credwatch LSM.
 type credwatchContainerState struct {
-	CgroupID    uint64
+	CgroupID    uint64   // first registered id (kept for callers that want one)
+	CgroupIDs   []uint64 // every registered id: scope and any /init leaf
 	AddedAt     time.Time
 	ObserveOnly bool
 }
@@ -52,3 +53,12 @@ const (
 
 // credwatchEventSize is the expected packed size of struct credwatch_event in BPF bytecode.
 const credwatchEventSize = 164
+
+// allCgroupIDs returns every cgroup id registered for the container.
+func (s *credwatchContainerState) allCgroupIDs() []uint64 {
+	if len(s.CgroupIDs) > 0 {
+		return s.CgroupIDs
+	}
+
+	return []uint64{s.CgroupID}
+}

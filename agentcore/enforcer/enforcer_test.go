@@ -1452,3 +1452,38 @@ func contains(haystack []string, needle string) bool {
 	}
 	return false
 }
+
+// TestAttachEnforcerRecordsScopeAndLeafCgroups: Docker's systemd driver
+// puts the main PID in .scope/init. The LSM programs key on the task's
+// leaf cgroup id, so the enforcer must remember both paths for LSM
+// registration (not just the scope-stripped attach point).
+func TestAttachEnforcerRecordsScopeAndLeafCgroups(t *testing.T) {
+	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/system.slice/docker-abc.scope/init"}
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr.NetnsGrace = 0
+	defer mgr.DetachAll()
+
+	e, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "abcdef123456"}, 1234, testPolicy("audit"))
+	if err != nil || e == nil {
+		t.Fatalf("attach = (%v, %v)", e, err)
+	}
+
+	want := []string{
+		"/sys/fs/cgroup/system.slice/docker-abc.scope",
+		"/sys/fs/cgroup/system.slice/docker-abc.scope/init",
+	}
+
+	got := e.lsmCgroupPaths()
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("lsmCgroupPaths = %v, want %v", got, want)
+	}
+
+	st := &credwatchContainerState{CgroupID: 1, CgroupIDs: []uint64{1, 2}}
+	if ids := st.allCgroupIDs(); len(ids) != 2 {
+		t.Fatalf("allCgroupIDs = %v, want both ids", ids)
+	}
+
+	if ids := (&procMemContainerState{CgroupID: 7}).allCgroupIDs(); len(ids) != 1 || ids[0] != 7 {
+		t.Fatalf("legacy single-id state: allCgroupIDs = %v", ids)
+	}
+}

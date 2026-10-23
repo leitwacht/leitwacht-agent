@@ -271,8 +271,12 @@ func (p *LinuxPlatform) LoadEBPF(auditMode bool, trustedCIDRs []net.IPNet) (EBPF
 		return nil, fmt.Errorf("set config map: %w", err)
 	}
 
-	// Populate trusted CIDRs LPM trie.
+	// Populate trusted CIDRs LPM trie. Count only entries that actually
+	// landed: the map is bounded (trusted_nets max_entries), and a CIDR
+	// that does not fit is an allow that silently never takes effect.
 	cidrPuts := 0
+	cidrFailed := 0
+	trustedCap := int(objs.TrustedNets.MaxEntries())
 
 	for _, cidr := range trustedCIDRs {
 		ones, _ := cidr.Mask.Size()
@@ -286,10 +290,19 @@ func (p *LinuxPlatform) LoadEBPF(auditMode bool, trustedCIDRs []net.IPNet) (EBPF
 
 		putErr := objs.TrustedNets.Put(key[:], uint8(1))
 		if putErr != nil {
-			p.Logger.Error("put trusted_nets", "cidr", cidr.String(), "error", putErr)
+			cidrFailed++
+
+			p.Logger.Error("put trusted_nets", "cidr", cidr.String(), "error", putErr, "capacity", trustedCap)
+
+			continue
 		}
 
 		cidrPuts++
+	}
+
+	if cidrFailed > 0 {
+		p.Logger.Error("trusted CIDRs not loaded; traffic to them will be dropped",
+			"loaded", cidrPuts, "failed", cidrFailed, "capacity", trustedCap)
 	}
 
 	postLoadMs := time.Since(stepStart).Milliseconds()
@@ -372,9 +385,22 @@ func (h *linuxEBPFHandle) AttachCgroup(cgroupPath string) (CgroupLink, error) {
 	return &linuxCgroupLink{link: cgroupLink}, nil
 }
 
+// AddAllowedIP records a DNS-derived allow. prio is the priority of the
+// fqdn rule that authorised the resolution. Several names can resolve to
+// one address (shared CDN fronts), and the map holds one value per key:
+// a blind overwrite made the result depend on query order, so a later
+// lower-ranked rule could displace the better one. Keep the better
+// (lower) of the existing and new priority instead.
 func (h *linuxEBPFHandle) AddAllowedIP(ip net.IP, ports []int, prio uint32) error {
 	for _, port := range ports {
 		key := PackAllowKey(ip, port)
+
+		var existing uint32
+
+		lookupErr := h.objs.AllowedIps.Lookup(key[:], &existing)
+		if lookupErr == nil && existing < prio {
+			continue
+		}
 
 		putErr := h.objs.AllowedIps.Put(key[:], prio)
 		if putErr != nil {

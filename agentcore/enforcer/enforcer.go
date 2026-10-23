@@ -205,6 +205,11 @@ type Enforcer struct {
 	cgroupID   uint64        // for attribution + cgroupRecorders key
 	recorder   *ViolationRecorder
 
+	// cgroupPaths is every cgroup path the container's events can be
+	// attributed to: the BPF attach point (scope) first, then the original
+	// /init leaf when scope-stripping applied.
+	cgroupPaths []string
+
 	// sockAttrCgroupIDs are the cgroup_ids registered with the LSM
 	// sock_attr filter. Includes the BPF attach point's inode plus
 	// any stripped /init leaf (Docker systemd-driver containers
@@ -825,11 +830,11 @@ func (m *Manager) finalizeAttach(info ContainerInfo, e *Enforcer, nctx *NetnsCon
 	// "observe" attaches with the BPF observe-only bit; "enforce" (and the
 	// empty/unset default) attaches in killing mode.
 	if info.CredwatchMode != policy.LSMModeOff {
-		m.AttachCredwatch(info.ContainerID, e.cgroup, info.AllowCredWatch, info.CredwatchMode == policy.LSMModeObserve)
+		m.AttachCredwatchPaths(info.ContainerID, e.lsmCgroupPaths(), info.AllowCredWatch, info.CredwatchMode == policy.LSMModeObserve)
 	}
 
 	if info.ProcMemMode != policy.LSMModeOff {
-		m.AttachProcMem(info.ContainerID, e.cgroup, info.AllowProcMemRead, info.ProcMemMode == policy.LSMModeObserve)
+		m.AttachProcMemPaths(info.ContainerID, e.lsmCgroupPaths(), info.AllowProcMemRead, info.ProcMemMode == policy.LSMModeObserve)
 	}
 }
 
@@ -1499,6 +1504,7 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 		info:              info,
 		policy:            pol,
 		cgroup:            cgroupPath,
+		cgroupPaths:       relevantPaths,
 		pid:               pid,
 		logger:            m.logger.With("container_id", truncID(info.ContainerID)),
 		ctx:               nctx,
@@ -1823,6 +1829,16 @@ func (m *Manager) teardownNetnsContext(nctx *NetnsContext) {
 	if nctx.ebpf != nil {
 		_ = nctx.ebpf.Close()
 	}
+}
+
+// lsmCgroupPaths returns the cgroup paths to register with the LSM
+// known_containers maps: scope and leaf.
+func (e *Enforcer) lsmCgroupPaths() []string {
+	if len(e.cgroupPaths) > 0 {
+		return e.cgroupPaths
+	}
+
+	return []string{e.cgroup}
 }
 
 // Detach stops enforcement for a container and returns collected stats + original context.

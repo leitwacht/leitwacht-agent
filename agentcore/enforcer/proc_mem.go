@@ -33,7 +33,8 @@ type procMemEventBPF struct {
 
 // procMemContainerState tracks cgroup ID for a container in the proc_mem LSM.
 type procMemContainerState struct {
-	CgroupID    uint64
+	CgroupID    uint64   // first registered id (kept for callers that want one)
+	CgroupIDs   []uint64 // every registered id: scope and any /init leaf
 	AddedAt     time.Time
 	ObserveOnly bool
 }
@@ -50,3 +51,12 @@ const (
 
 // procMemEventSize is the expected packed size of struct proc_mem_event in BPF bytecode.
 const procMemEventSize = 100
+
+// allCgroupIDs returns every cgroup id registered for the container.
+func (s *procMemContainerState) allCgroupIDs() []uint64 {
+	if len(s.CgroupIDs) > 0 {
+		return s.CgroupIDs
+	}
+
+	return []uint64{s.CgroupID}
+}

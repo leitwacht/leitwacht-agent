@@ -16,3 +16,6 @@ func (m *Manager) AttachProcMem(_, _ string, _, _ bool) {}
 
 // DetachProcMem is a no-op on non-linux.
 func (m *Manager) DetachProcMem(_ string) {}
+
+// AttachProcMemPaths is a no-op on non-linux.
+func (m *Manager) AttachProcMemPaths(_ string, _ []string, _, _ bool) {}

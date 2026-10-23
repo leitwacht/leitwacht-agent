@@ -114,14 +114,24 @@ int BPF_PROG(sock_attr_connect, struct socket *sock, struct sockaddr *address, i
     return capture_sock_owner(sock->sk);
 }
 
-/* Unconnected UDP (sendto without prior connect). F_CREATE is a no-op
- * after the first send for a given socket, so per-send cost is just a
- * map lookup once the entry exists. */
+/* Unconnected UDP (sendto without prior connect). Once a socket has an
+ * owner, return before capture_sock_owner so the (expensive)
+ * bpf_d_path is not re-run on every send; the lookup without
+ * F_CREATE is just a map read. The owner is written at the first
+ * connect/send and kept for the socket's lifetime. */
 SEC("lsm/socket_sendmsg")
 int BPF_PROG(sock_attr_sendmsg, struct socket *sock, struct msghdr *msg, int size) {
     if (!sock)
         return 0;
-    return capture_sock_owner(sock->sk);
+
+    /* Single load of sock->sk: re-reading the field would hand the
+     * verifier a fresh or-null pointer after the NULL check. */
+    struct sock *sk = sock->sk;
+    if (!sk)
+        return 0;
+    if (bpf_sk_storage_get(&sock_owners, sk, NULL, 0))
+        return 0;
+    return capture_sock_owner(sk);
 }
 
 char __license[] SEC("license") = "GPL";

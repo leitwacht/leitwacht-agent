@@ -8,6 +8,9 @@
 
 #define BINARY_PATH_LEN 256
 
+/* Max gap between the LSM exec hook and the exec tracepoint of one exec. */
+#define EXEC_SAME_WINDOW_NS 20000000ULL
+
 /* DNS attribution record: populated by kprobes on udp_sendmsg and
    tcp_connect, read synchronously from userspace by the DNS proxy when
    handling each query. Keyed by (netns_cookie, src_port).
@@ -242,8 +245,12 @@ int BPF_PROG(dns_pid_bprm, struct linux_binprm *bprm)
    string, not a symlink-resolved canonical path. The LSM path above
    gets the kernel-resolved canonical path via bpf_d_path; this
    fallback is what we ship with when the LSM program can't load.
-   Inserted with BPF_NOEXIST so the LSM's canonical entry wins when
-   both fire. */
+   The LSM hook (bprm_committed_creds) fires a few microseconds
+   before this tracepoint for the same exec and stores the canonical
+   path. This fallback therefore overwrites an existing entry (BPF_ANY,
+   so a re-exec or recycled pid never keeps a stale path) EXCEPT when
+   the entry is fresher than EXEC_SAME_WINDOW_NS, which means the LSM
+   already recorded this very exec. */
 SEC("tracepoint/sched/sched_process_exec")
 int dns_pid_exec(struct trace_event_raw_sched_process_exec *ctx)
 {
@@ -257,9 +264,27 @@ int dns_pid_exec(struct trace_event_raw_sched_process_exec *ctx)
     (void)bpf_probe_read_kernel_str(&pi.binary_path, sizeof(pi.binary_path),
                                     (char *)ctx + file_off);
 
-    /* BPF_NOEXIST expected to "fail" (EEXIST) whenever the LSM primary
-       already populated this pid — that's the design. Ignore. */
-    (void)bpf_map_update_elem(&process_info, &pid, &pi, BPF_NOEXIST);
+    struct process_info *cur = bpf_map_lookup_elem(&process_info, &pid);
+    if (cur && pi.exec_ts - cur->exec_ts < EXEC_SAME_WINDOW_NS)
+        return 0; /* LSM already stored the canonical path for this exec */
+
+    (void)bpf_map_update_elem(&process_info, &pid, &pi, BPF_ANY);
+    return 0;
+}
+
+/* Drop the process_info entry when the process exits so PID reuse
+   cannot inherit it. sched_process_exit fires per thread; only the
+   thread-group leader (pid == tid) is the process's key. */
+SEC("tracepoint/sched/sched_process_exit")
+int dns_pid_exit(void *ctx)
+{
+    __u64 id = bpf_get_current_pid_tgid();
+    __u32 pid = id >> 32;
+
+    if ((__u32)id != pid)
+        return 0;
+
+    (void)bpf_map_delete_elem(&process_info, &pid);
     return 0;
 }
 

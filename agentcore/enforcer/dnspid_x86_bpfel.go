@@ -81,6 +81,7 @@ type dnspidSpecs struct {
 type dnspidProgramSpecs struct {
 	DnsPidBprm       *ebpf.ProgramSpec `ebpf:"dns_pid_bprm"`
 	DnsPidExec       *ebpf.ProgramSpec `ebpf:"dns_pid_exec"`
+	DnsPidExit       *ebpf.ProgramSpec `ebpf:"dns_pid_exit"`
 	DnsPidSendmsg    *ebpf.ProgramSpec `ebpf:"dns_pid_sendmsg"`
 	DnsPidTcpConnect *ebpf.ProgramSpec `ebpf:"dns_pid_tcp_connect"`
 }
@@ -145,6 +146,7 @@ type dnspidVariables struct {
 type dnspidPrograms struct {
 	DnsPidBprm       *ebpf.Program `ebpf:"dns_pid_bprm"`
 	DnsPidExec       *ebpf.Program `ebpf:"dns_pid_exec"`
+	DnsPidExit       *ebpf.Program `ebpf:"dns_pid_exit"`
 	DnsPidSendmsg    *ebpf.Program `ebpf:"dns_pid_sendmsg"`
 	DnsPidTcpConnect *ebpf.Program `ebpf:"dns_pid_tcp_connect"`
 }
@@ -153,6 +155,7 @@ func (p *dnspidPrograms) Close() error {
 	return _DnspidClose(
 		p.DnsPidBprm,
 		p.DnsPidExec,
+		p.DnsPidExit,
 		p.DnsPidSendmsg,
 		p.DnsPidTcpConnect,
 	)

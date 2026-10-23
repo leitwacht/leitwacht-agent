@@ -171,6 +171,19 @@ func NewDNSPIDTracker(logger *slog.Logger) (*DNSPIDTracker, error) {
 			"error", execErr)
 	}
 
+	// Drop process_info entries on process exit so a recycled pid cannot
+	// inherit a previous process's binary_path. Best-effort: without it
+	// the map still works, bounded by LRU, with the original staleness
+	// risk.
+	if objs.DnsPidExit != nil {
+		exit, exitErr := link.Tracepoint("sched", "sched_process_exit", objs.DnsPidExit, nil)
+		if exitErr != nil {
+			logger.Debug("dns_pid sched_process_exit tracepoint unavailable", "error", exitErr)
+		} else {
+			tracker.links = append(tracker.links, exit)
+		}
+	}
+
 	// Seed process_info for pre-existing processes. The path is the
 	// agent's host-namespace view of /proc/<pid>/exe (overlay path for
 	// container processes), so it's a placeholder — it gets overwritten
@@ -255,6 +268,7 @@ func loadWithoutLSM(objs *dnspidObjects) error {
 	objs.DnsPidSendmsg = coll.Programs["dns_pid_sendmsg"]
 	objs.DnsPidTcpConnect = coll.Programs["dns_pid_tcp_connect"]
 	objs.DnsPidExec = coll.Programs["dns_pid_exec"]
+	objs.DnsPidExit = coll.Programs["dns_pid_exit"]
 	objs.DnsKnownCgroups = coll.Maps["dns_known_cgroups"]
 	objs.DnsPidAttribution = coll.Maps["dns_pid_attribution"]
 	objs.ProcessInfo = coll.Maps["process_info"]

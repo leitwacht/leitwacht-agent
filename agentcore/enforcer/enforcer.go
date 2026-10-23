@@ -115,6 +115,10 @@ type NetnsContext struct {
 	// them (reconcileNetnsPolicy). Protected by Manager.mu.
 	members []netnsMember
 
+	// effective is the policy the DNS proxy and eBPF mode currently
+	// follow. Protected by Manager.mu.
+	effective *policy.ResolvedPolicy
+
 	// denyOwners / allowOwners refcount each map key across the
 	// containers sharing the netns (key -> owner -> priority). Two
 	// containers with an identical rule own the same key; the map value
@@ -237,6 +241,9 @@ type Manager struct {
 	mu sync.Mutex
 	// containerID → Enforcer (nil sentinel during in-flight Attach).
 	enforcers map[string]*Enforcer
+	// passive marks containerIDs in enforcers that were admitted as passive
+	// sentinels; they are excluded from the maxConc count.
+	passive map[string]struct{}
 	// netns inode → NetnsContext (refcounted, shared across pod siblings).
 	netnsContexts map[uint64]*NetnsContext
 	logger        *slog.Logger
@@ -328,10 +335,12 @@ func (m *Manager) CgroupPathForPID(pid int) (string, error) {
 	return m.platform.GetCgroupPath(pid)
 }
 
-// PodAttachedForPID reports whether the pid's network namespace is
-// already covered by a pod-level egress attach (K8s sandbox path). Such
-// containers are enforced from their first packet, so the pre-attach
-// freeze is unnecessary for them.
+// PodAttachedForPID reports whether the pid's network namespace already has
+// a pod-level egress attach (K8s sandbox path). The pre-attach freeze is
+// skipped for such containers: on K8s the pre-job gate is the
+// leitwacht-initc init container, not a freeze. Note this does not mean the
+// pod is enforcing yet: the sandbox primes the netns in audit-all mode and
+// the real policy is applied when the build container's Attach joins it.
 func (m *Manager) PodAttachedForPID(pid int) bool {
 	ino, err := m.platform.NetnsInode(pid)
 	if err != nil || ino == 0 {
@@ -411,6 +420,7 @@ func NewManager(
 ) *Manager {
 	return &Manager{
 		enforcers:                  make(map[string]*Enforcer),
+		passive:                    make(map[string]struct{}),
 		netnsContexts:              make(map[uint64]*NetnsContext),
 		logger:                     logger,
 		maxConc:                    maxConcurrent,
@@ -468,10 +478,18 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 		return existing, nil
 	}
 
+	// Passive sentinel attaches (non-enrolled projects: audit, no rules)
+	// enforce nothing, so they neither count against the limit nor can be
+	// refused by it. Counting only enforcing attaches is the simplest
+	// correct bound: the limit exists to cap enforcement state, and
+	// refusing a sentinel would break the init-container gate for jobs that
+	// opted out of enforcement.
+	passive := policyStrictness(pol) == 0
+
 	// Fail closed at capacity: returning (nil, nil) here used to leave
 	// the container running with no enforcement and no signal to the
 	// caller, which only logged on error.
-	if len(m.enforcers) >= m.maxConc {
+	if !passive && len(m.enforcers)-len(m.passive) >= m.maxConc {
 		m.mu.Unlock()
 		m.logger.Error("max concurrent enforcement reached, container not enforced",
 			"container_id", truncID(info.ContainerID),
@@ -482,11 +500,16 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 	}
 
 	m.enforcers[info.ContainerID] = nil
+
+	if passive {
+		m.passive[info.ContainerID] = struct{}{}
+	}
 	m.mu.Unlock()
 
 	releaseSlot := func() {
 		m.mu.Lock()
 		delete(m.enforcers, info.ContainerID)
+		delete(m.passive, info.ContainerID)
 		m.mu.Unlock()
 	}
 
@@ -639,6 +662,18 @@ func (m *Manager) reconcileNetnsPolicy(nctx *NetnsContext) {
 	if best == nil {
 		return
 	}
+
+	// DNS-derived allow entries carry the priority of the rule that
+	// authorised them under the policy in force at resolution time. When
+	// the effective policy changes they are stale and could outrank the new
+	// policy's deny rules; drop them and let live queries re-seed.
+	if nctx.effective != nil && nctx.effective != best && nctx.ebpf != nil {
+		if err := nctx.ebpf.FlushAllowedIPs(); err != nil {
+			m.logger.Warn("flush dns allow map on policy change", "netns_inode", nctx.inode, "error", err)
+		}
+	}
+
+	nctx.effective = best
 
 	if nctx.dnsProxy != nil {
 		nctx.dnsProxy.UpdatePolicy(best)
@@ -1249,10 +1284,10 @@ func (m *Manager) removeJoinerIPRules(nctx *NetnsContext, containerID string) {
 // and tagged as sinkhole_hit. Owned by the netns lifetime (netnsOwner),
 // not by any joiner — survives sibling detach, and a joiner rule for
 // the same key can neither lower nor delete it.
-func (m *Manager) seedSinkholeDeny(nctx *NetnsContext) {
+func (m *Manager) seedSinkholeDeny(nctx *NetnsContext) error {
 	sinkIP := net.ParseIP(SinkholeIPv4)
 	if sinkIP == nil {
-		return
+		return nil
 	}
 
 	if nctx.denyOwners == nil {
@@ -1266,7 +1301,11 @@ func (m *Manager) seedSinkholeDeny(nctx *NetnsContext) {
 	})
 	if err != nil {
 		m.logger.Warn("seed sinkhole deny", "error", err)
+
+		return fmt.Errorf("seed sinkhole deny: %w", err)
 	}
+
+	return nil
 }
 
 //nolint:funlen // sequential setup + per-step timings, splitting obscures the rollback chain
@@ -1275,6 +1314,7 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 
 	auditMode := pol.Action == policy.ActionAudit
 	nctx.primaryPID = pid
+	nctx.effective = pol
 	nctx.auditMode.Store(auditMode)
 	nctx.dnsCache = NewDNSCache()
 	nctx.sharedDNSRecorder = NewViolationRecorder(nctx.dnsCache)
@@ -1296,7 +1336,14 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 	// joiner-owned. Joiner-specific deny IPs (including the creator's
 	// own) are installed separately via addJoinerIPRules so Detach can
 	// reverse them.
-	m.seedSinkholeDeny(nctx)
+	//
+	// In block mode a missing sinkhole deny means blocked DNS answers
+	// point at an address the datapath does not drop: fail the creator.
+	if seedErr := m.seedSinkholeDeny(nctx); seedErr != nil && !auditMode {
+		_ = ebpfHandle.Close()
+
+		return seedErr
+	}
 
 	// Step 2: Bind sockets inside the container netns.
 	stepStart = time.Now()
@@ -1880,6 +1927,7 @@ func (m *Manager) Detach(containerID string) *DetachResult {
 	m.mu.Lock()
 	e, ok := m.enforcers[containerID]
 	delete(m.enforcers, containerID)
+	delete(m.passive, containerID)
 
 	if !ok || e == nil {
 		m.mu.Unlock()

@@ -498,3 +498,110 @@ func TestStrictestMemberPolicyWins(t *testing.T) {
 		t.Fatalf("dns proxy policy after detach = %+v, want the audit-with-rules member's", got)
 	}
 }
+
+// TestPassiveSentinelExemptFromConcurrencyLimit: a non-enrolled project's
+// passive attach enforces nothing and must neither be refused by, nor
+// consume, the enforcement limit.
+func TestPassiveSentinelExemptFromConcurrencyLimit(t *testing.T) {
+	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
+	mgr := NewManager(testLogger(), 1, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr.NetnsGrace = 0
+
+	defer mgr.DetachAll()
+
+	ctx := context.Background()
+	passive := ipRulePolicy("audit")
+
+	if _, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "passive000001"}, 10, passive); err != nil {
+		t.Fatalf("passive attach: %v", err)
+	}
+
+	// The passive sentinel does not consume the single enforcement slot...
+	if _, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "enforced00001"}, 11, ipRulePolicy("block", cidrRule("10.0.0.1/32", policy.ActionDeny))); err != nil {
+		t.Fatalf("enforcing attach refused because of a passive sentinel: %v", err)
+	}
+
+	// ...a second enforcing container is refused, a second sentinel is not.
+	if _, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "enforced00002"}, 12, ipRulePolicy("block", cidrRule("10.0.0.1/32", policy.ActionDeny))); !errors.Is(err, ErrMaxConcurrent) {
+		t.Fatalf("err = %v, want ErrMaxConcurrent", err)
+	}
+
+	if _, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "passive000002"}, 13, passive); err != nil {
+		t.Fatalf("second passive attach refused: %v", err)
+	}
+
+	mgr.Detach("passive000001")
+	mgr.Detach("passive000002")
+	mgr.Detach("enforced00001")
+
+	if _, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "enforced00003"}, 14, ipRulePolicy("block", cidrRule("10.0.0.1/32", policy.ActionDeny))); err != nil {
+		t.Fatalf("slot not released after detach: %v", err)
+	}
+}
+
+// TestPolicyChangeFlushesDNSAllows: DNS-derived allows carry the priority
+// of the policy in force when they were seeded; when a stricter member
+// changes the effective policy they must be dropped.
+func TestPolicyChangeFlushesDNSAllows(t *testing.T) {
+	mgr, fp := sharedNetnsManager(t)
+	ctx := context.Background()
+
+	if _, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "helper000000"}, 100, ipRulePolicy("audit", cidrRule("10.0.0.9/32", policy.ActionAllow))); err != nil {
+		t.Fatalf("attach helper: %v", err)
+	}
+
+	mgr.mu.Lock()
+	h := mgr.enforcers["helper000000"].ctx.ebpf
+	mgr.mu.Unlock()
+
+	if err := h.AddAllowedIP(net.ParseIP("203.0.113.5"), []int{443}, 1); err != nil {
+		t.Fatalf("seed allow: %v", err)
+	}
+
+	if _, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "build0000000"}, 101, ipRulePolicy("block", cidrRule("10.0.0.7/32", policy.ActionDeny))); err != nil {
+		t.Fatalf("attach build: %v", err)
+	}
+
+	if len(fp.allowedIPs) != 0 {
+		t.Fatalf("dns allows survived a policy change: %v", fp.allowedIPs)
+	}
+}
+
+// TestSinkholeSeedFailureFailsBlockCreator: without the sinkhole deny,
+// blocked DNS answers point at an address the datapath doesn't drop.
+func TestSinkholeSeedFailureFailsBlockCreator(t *testing.T) {
+	fp := &sinkholeFailPlatform{&fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}}
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr.NetnsGrace = 0
+
+	defer mgr.DetachAll()
+
+	if _, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "block0000000"}, 100, ipRulePolicy("block")); err == nil {
+		t.Fatal("block-mode attach succeeded without a sinkhole deny")
+	}
+
+	if e, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "audit0000000"}, 101, ipRulePolicy("audit")); err != nil || e == nil {
+		t.Fatalf("audit-mode attach = (%v, %v), want success", e, err)
+	}
+}
+
+type sinkholeFailPlatform struct{ *fakePlatform }
+
+func (f *sinkholeFailPlatform) LoadEBPF(a bool, c []net.IPNet) (EBPFHandle, error) {
+	h, err := f.fakePlatform.LoadEBPF(a, c)
+	if err != nil {
+		return nil, err
+	}
+
+	return &sinkholeFailHandle{EBPFHandle: h}, nil
+}
+
+type sinkholeFailHandle struct{ EBPFHandle }
+
+func (h *sinkholeFailHandle) AddDeniedIP(ip net.IP, port int, prio uint32) error {
+	if ip.String() == SinkholeIPv4 {
+		return errors.New("synthetic map full")
+	}
+
+	return h.EBPFHandle.AddDeniedIP(ip, port, prio)
+}

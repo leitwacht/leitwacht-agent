@@ -354,6 +354,10 @@ type linuxEBPFHandle struct {
 	objs   *ebpfObjects
 	logger *slog.Logger
 	lsm    *linuxLSMHandle // process-singleton; nil in degraded mode
+
+	// allowMu serialises AddAllowedIP's lookup-then-put so two resolutions
+	// of one address cannot interleave and lose the better priority.
+	allowMu sync.Mutex
 }
 
 // linuxCgroupLink wraps a single cgroup attachment.
@@ -392,6 +396,9 @@ func (h *linuxEBPFHandle) AttachCgroup(cgroupPath string) (CgroupLink, error) {
 // lower-ranked rule could displace the better one. Keep the better
 // (lower) of the existing and new priority instead.
 func (h *linuxEBPFHandle) AddAllowedIP(ip net.IP, ports []int, prio uint32) error {
+	h.allowMu.Lock()
+	defer h.allowMu.Unlock()
+
 	for _, port := range ports {
 		key := PackAllowKey(ip, port)
 

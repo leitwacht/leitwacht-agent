@@ -167,56 +167,38 @@ func (m *Manager) handleExistingPodSandbox(netnsIno uint64, podCgroup string, in
 
 	oldLink := nctx.podCgroupLink
 	oldCgID := nctx.podCgroupID
+	m.mu.Unlock()
 
-	// Reset the pod-attach state under m.mu (the lock every reader of
-	// these fields holds). The replaced sandbox's reference is released
-	// only after the new one is taken, so the count never dips to zero
-	// mid-replacement while a real container is detaching.
-	nctx.podCgroupLink = nil
-	nctx.podCgroupID = 0
-	nctx.podAttached = false
-	nctx.sandboxID = ""
+	// Attach the new link BEFORE closing the old one: closing first leaves
+	// a window with no egress filter on the pod cgroup while containers
+	// are running. Links are independently attachable to one cgroup, so the
+	// program briefly runs twice, which is harmless. On failure the old
+	// link and state stay in place, so the pod keeps its filter.
+	attachErr := m.attachPodLink(nctx, podCgroup, info)
+	if attachErr != nil {
+		return true, attachErr
+	}
+
+	// attachPodLink took a reference for the new sandbox. Release the
+	// replaced sandbox's here; without this release each SandboxChanged
+	// leaked one, so the netns context could never reach refcount 0 and
+	// was never torn down. The count never dips mid-replacement.
+	m.mu.Lock()
+	nctx.refcount--
+	newCgID := nctx.podCgroupID
 	m.mu.Unlock()
 
 	if oldLink != nil {
 		_ = oldLink.Close() // swallow ENOENT
 	}
 
-	nctx.mu.Lock()
-	delete(nctx.cgroupRecorders, oldCgID)
-	nctx.mu.Unlock()
-
-	attachErr := m.attachPodLink(nctx, podCgroup, info)
-
-	// attachPodLink took a reference for the new sandbox on success. The
-	// replaced sandbox's reference is released here either way; without
-	// this release each SandboxChanged leaked one, so the netns context
-	// could never reach refcount 0 and was never torn down.
-	m.mu.Lock()
-	nctx.refcount--
-	m.mu.Unlock()
-
-	if attachErr != nil {
-		// No new reference was taken. If that leaves the context
-		// unreferenced, tear it down like a failed first attach would.
-		m.mu.Lock()
-		shouldTeardown := nctx.refcount <= 0 && !nctx.tornDown
-
-		if shouldTeardown {
-			nctx.tornDown = true
-
-			if nctx.inode != 0 {
-				delete(m.netnsContexts, nctx.inode)
-			}
-		}
-		m.mu.Unlock()
-
-		if shouldTeardown {
-			m.teardownNetnsContext(nctx)
-		}
+	if oldCgID != newCgID {
+		nctx.mu.Lock()
+		delete(nctx.cgroupRecorders, oldCgID)
+		nctx.mu.Unlock()
 	}
 
-	return true, attachErr
+	return true, nil
 }
 
 // attachPodLink performs the AttachCgroup call and stores pod-attach state

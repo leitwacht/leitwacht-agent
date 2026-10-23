@@ -227,3 +227,50 @@ func TestIntegrationBlockModeKillsOnAttachFailure(t *testing.T) {
 
 	var _ advisory.Sink = adv
 }
+
+// TestIntegrationRecoverFrozenAfterAgentDeath freezes a real container,
+// abandons the Freezer without thawing (the agent "crashed"), and checks a
+// fresh Freezer on the same state dir thaws it.
+//
+// Run: sudo -E go test ./agentcore/handler/ -tags integration -run TestIntegrationRecoverFrozenAfterAgentDeath -v -count=1.
+func TestIntegrationRecoverFrozenAfterAgentDeath(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+
+	const name = "leitwacht-integ-recover"
+
+	pid := itContainer(t, name)
+
+	cg, err := (&enforcer.LinuxPlatform{Logger: quietLogger()}).GetCgroupPath(pid)
+	if err != nil {
+		t.Fatalf("cgroup path: %v", err)
+	}
+
+	cg = enforcer.ScopeCgroup(cg)
+	state := t.TempDir()
+
+	if _, err = (&Freezer{Logger: quietLogger(), StateDir: state}).Freeze(context.Background(), name, cg, 5*time.Second); err != nil {
+		t.Fatalf("Freeze: %v", err)
+	}
+
+	before := cpuUsageUsec(t, cg)
+
+	time.Sleep(200 * time.Millisecond)
+
+	if delta := cpuUsageUsec(t, cg) - before; delta > 20_000 {
+		t.Fatalf("container not frozen (cpu delta %dus)", delta)
+	}
+
+	if n := (&Freezer{Logger: quietLogger(), StateDir: state}).RecoverFrozen(context.Background()); n != 1 {
+		t.Fatalf("RecoverFrozen processed %d markers, want 1", n)
+	}
+
+	before = cpuUsageUsec(t, cg)
+
+	time.Sleep(300 * time.Millisecond)
+
+	if delta := cpuUsageUsec(t, cg) - before; delta < 50_000 {
+		t.Fatalf("container still stopped after recovery (cpu delta %dus)", delta)
+	}
+}

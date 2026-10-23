@@ -43,3 +43,9 @@ func procHasCapNetAdmin(pid int) (bool, error) {
 
 	return false, fmt.Errorf("CapEff not found in /proc/%d/status", pid) //nolint:err113 // one-off diagnostic
 }
+
+// shortID truncates a container ID for log fields without risking a panic
+// on short input.
+func shortID(id string) string {
+	return id[:min(len(id), 12)]
+}

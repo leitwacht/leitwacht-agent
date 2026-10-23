@@ -44,10 +44,12 @@ type Platform interface {
 	// which matches what bpf_get_current_cgroup_id() returns.
 	CgroupID(cgroupPath string) (uint64, error)
 
-	// DialUpstreamInNetns creates a UDP connection to addr inside the
-	// container's netns, marked with SO_MARK to bypass nftables redirect.
-	// Used for Docker DNS chaining. Returns nil, nil when not needed.
-	DialUpstreamInNetns(pid int, addr string, mark int) (*net.UDPConn, error)
+	// DialUpstreamTCPInNetns opens a TCP connection to addr from inside the
+	// netns of pid, marked with SO_MARK to bypass the nftables redirect.
+	// Used for Docker DNS chaining: the socket must live in the job's netns
+	// (127.0.0.11 is only reachable there) and be marked; TCP means a
+	// forged reply needs the connection's sequence numbers, not a 16-bit ID.
+	DialUpstreamTCPInNetns(pid int, addr string, mark int) (net.Conn, error)
 }
 
 // EBPFHandle represents a loaded eBPF program with its maps.

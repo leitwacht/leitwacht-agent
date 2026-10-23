@@ -301,11 +301,20 @@ socket stamped with the agent's `SO_MARK`.
   TCP. Ordinary port-53 lookups are redirected before that chain and
   are unaffected. There is no IPv6 variant: Docker does not expose an
   IPv6 embedded resolver by default and the datapath is IPv4-only.
-- **Forged upstream replies.** The upstream socket lives in the job's
-  netns. Queries go out with a fresh random DNS ID, the reply must
-  echo that ID and the exact question, and only `A` records owned by
-  the queried name or its CNAME chain are returned and seeded into the
-  allow map. The client's original ID is restored on the reply.
+- **Forged upstream replies.** The proxy's upstream socket lives in the
+  job's netns, so the job can read its port and aim datagrams at it.
+  Three layers apply: (1) the same `docker_dns_guard` chain drops any
+  original-direction packet whose source is `127.0.0.11` (genuine
+  replies belong to the proxy's marked flow and are reply-direction in
+  conntrack; raw sockets also traverse OUTPUT); (2) the Docker upstream
+  is a fresh marked **TCP** connection per query, opened inside the job
+  netns, so a reply needs the connection's sequence numbers and there
+  is no truncation to retry; (3) the reply must carry a fresh random
+  DNS ID and echo the exact question, the client's ID is restored, and
+  only `A` records owned by the queried name or its CNAME chain are
+  returned and seeded into the allow map. The redirect chain runs one
+  priority ahead of Docker's own `DOCKER_OUTPUT` DNAT so it
+  deterministically wins.
 - **`CAP_NET_ADMIN` is unenforceable.** A container with
   `CAP_NET_ADMIN` can set `SO_MARK` itself (skipping the redirect and
   the guard above) or rewrite the nftables rules. The agent cannot stop
@@ -316,3 +325,8 @@ socket stamped with the agent's `SO_MARK`.
   (resolved IPs per entry, entries per container); blocked/denied
   entries have reserved headroom, and drops are counted
   (`resolved_ips_dropped`, and the report's `overflow_count`).
+- **DNS-violation kill attribution.** In block mode a blocked query is
+  always sinkholed. The container kill additionally needs the query
+  attributed to a known container by cgroup; with no attribution (or an
+  unknown cgroup) the agent takes no kill action rather than guessing
+  among sibling containers.

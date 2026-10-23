@@ -1,95 +1,68 @@
 package enforcer
 
+// maxDNSViolationAttempts bounds how often a failing violation callback
+// (e.g. a kill that errored) is retried for one container.
+const maxDNSViolationAttempts = 3
+
 // handleDNSViolation is the DNSProxyConfig.OnDNSViolation hook for one
-// netns context. It resolves which container the offending query came from,
-// de-duplicates, and invokes the callback registered via SetOnDNSViolation
-// asynchronously so a slow kill never stalls the DNS handler.
+// netns context. It resolves which container the offending query came from
+// and invokes the callback registered via SetOnDNSViolation asynchronously,
+// so a slow kill never stalls the DNS handler, at most once per container
+// (retrying only after a failure, up to maxDNSViolationAttempts).
 //
-// Containers that cannot be identified are skipped: acting on an empty or
-// guessed ID would kill, report on, or detach the wrong thing.
-func (m *Manager) handleDNSViolation(nctx *NetnsContext, cgroupID uint64, domain, action string) {
+// There is deliberately no "only container in the netns" fallback: when the
+// PID tracker misses (cgroup 0) or reports a cgroup that is not a known
+// container, acting would mean guessing. In block mode the query has already
+// been sinkholed, so skipping loses no containment, only the kill.
+func (m *Manager) handleDNSViolation(_ *NetnsContext, cgroupID uint64, domain, action string) {
+	if cgroupID == 0 {
+		m.logger.Debug("dns violation: no cgroup attribution, no action", "action", action)
+
+		return
+	}
+
 	m.mu.Lock()
 	fn := m.onDNSViolation
-	m.mu.Unlock()
+	containerID := m.containerIDFromEnforcersLocked(cgroupID)
 
-	if fn == nil {
-		return
-	}
-
-	containerID, resolvedCgroup := m.resolveDNSViolator(nctx, cgroupID)
-	if containerID == "" {
-		m.logger.Debug("dns violation: container unresolved, no action", "action", action)
-
-		return
-	}
-
-	m.mu.Lock()
-	if m.dnsViolationSeen == nil {
-		m.dnsViolationSeen = make(map[string]struct{})
-	}
-
-	// Forget containers that are gone so the set stays bounded.
-	for id := range m.dnsViolationSeen {
-		if _, live := m.enforcers[id]; !live {
-			delete(m.dnsViolationSeen, id)
-		}
-	}
-
-	_, dup := m.dnsViolationSeen[containerID]
-	m.dnsViolationSeen[containerID] = struct{}{}
-	m.mu.Unlock()
-
-	if dup {
-		return
-	}
-
-	go fn(resolvedCgroup, domain, action)
-}
-
-// resolveDNSViolator maps the cgroup the DNS PID tracker attributed a query
-// to onto a container in nctx. The returned cgroup ID is one that
-// ContainerIDForCgroup resolves back to the same container.
-//
-// If the tracker missed (cgroupID 0, e.g. a short-lived process) and the
-// netns holds exactly one container, that container is the only possible
-// source. With several siblings the source is ambiguous, so nothing is
-// returned.
-func (m *Manager) resolveDNSViolator(nctx *NetnsContext, cgroupID uint64) (string, uint64) {
-	if cgroupID != 0 {
-		m.mu.Lock()
-		id := m.containerIDFromEnforcersLocked(cgroupID)
+	if fn == nil || containerID == "" {
 		m.mu.Unlock()
 
-		if id != "" {
-			return id, cgroupID
+		if fn != nil {
+			m.logger.Debug("dns violation: container unresolved, no action", "action", action)
 		}
+
+		return
 	}
 
-	nctx.mu.RLock()
+	if m.dnsViolationState == nil {
+		m.dnsViolationState = make(map[string]int)
+	}
 
-	var only string
+	attempts := m.dnsViolationState[containerID]
+	if attempts < 0 || attempts >= maxDNSViolationAttempts {
+		m.mu.Unlock()
 
-	if len(nctx.pids) == 1 {
-		for id := range nctx.pids {
-			only = id
+		return
+	}
+
+	m.dnsViolationState[containerID] = -1 // in flight / done
+	m.mu.Unlock()
+
+	go func() {
+		err := fn(containerID, domain, action)
+		if err == nil {
+			return
 		}
-	}
 
-	nctx.mu.RUnlock()
+		m.logger.Warn("dns violation handler failed", "container_id", shortID(containerID), "error", err)
 
-	if only == "" {
-		return "", 0
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	e := m.enforcers[only]
-	if e == nil {
-		return "", 0
-	}
-
-	return only, e.cgroupID
+		m.mu.Lock()
+		if _, live := m.dnsViolationState[containerID]; live {
+			m.dnsViolationState[containerID] = attempts + 1
+		}
+		m.mu.Unlock()
+	}()
 }
 
 // containerIDFromEnforcersLocked finds the attached container whose

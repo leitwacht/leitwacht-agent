@@ -23,7 +23,7 @@ var (
 	ErrAllUpstreamsFailed = errors.New("all upstreams failed")
 	// ErrDockerDNSIDMismatch is returned when the Docker DNS upstream returns
 	// responses with mismatched IDs (stale packets from timed-out queries).
-	ErrDockerDNSIDMismatch = errors.New("docker dns: id mismatch after retries")
+	ErrDockerDNSIDMismatch = errors.New("docker dns: reply id mismatch")
 	// ErrDNSQuestionMismatch is returned when an upstream reply does not
 	// echo the question that was asked.
 	ErrDNSQuestionMismatch = errors.New("dns reply question mismatch")
@@ -42,10 +42,6 @@ const (
 	// answers SERVFAIL immediately instead of spawning unbounded work
 	// (goroutines, upstream sockets, log lines).
 	maxInflightQueries = 256
-
-	// maxUpstreamReads bounds how many non-matching datagrams one
-	// upstream exchange will skip before giving up.
-	maxUpstreamReads = 16
 
 	// upstreamFailLogInterval rate-limits the upstream-failure log line.
 	upstreamFailLogInterval = time.Second
@@ -97,12 +93,12 @@ type DNSProxyConfig struct {
 	// (see (*DNSProxy).Start).
 	LookupDNSPID func(netnsCookie uint64, srcPort uint16) (pid uint32, comm string, parentComm string, binaryPath string, cgroupID uint64)
 
-	// DockerUpstream is a pre-bound, SO_MARK-ed UDP socket in the container
-	// netns pointing at Docker's embedded DNS (127.0.0.11:53). Nil on K8s.
-	DockerUpstream *net.UDPConn
-	// DockerUpstreamMu serializes access to DockerUpstream. Non-nil when
-	// DockerUpstream is set.
-	DockerUpstreamMu *sync.Mutex
+	// DockerDial opens a connection to Docker's embedded resolver
+	// (127.0.0.11:53) from inside the container netns, SO_MARK-ed so it
+	// bypasses the redirect. Called once per query; the connection is TCP so
+	// that a reply cannot be forged without the connection's sequence
+	// numbers. Nil on K8s.
+	DockerDial func() (net.Conn, error)
 
 	// AgentVersion is echoed in the TXT record for attachedName.
 	// Empty strings render as "unknown" — leaving this unset is not a bug.
@@ -450,12 +446,9 @@ func seedAllowMap(cfg *DNSProxyConfig, ips []string, rulePorts []int, prio uint3
 }
 
 func forwardQuery(msg *dns.Msg, cfg *DNSProxyConfig) (*dns.Msg, error) {
-	// Try Docker upstream first (pre-bound marked socket in container netns).
-	if cfg.DockerUpstream != nil {
-		cfg.DockerUpstreamMu.Lock()
-		resp, err := exchangeViaConn(cfg.DockerUpstream, msg)
-		cfg.DockerUpstreamMu.Unlock()
-
+	// Try Docker upstream first (marked TCP connection from the container netns).
+	if cfg.DockerDial != nil {
+		resp, err := exchangeViaDocker(cfg.DockerDial, msg)
 		if err == nil {
 			return resp, nil
 		}
@@ -485,18 +478,22 @@ func forwardQuery(msg *dns.Msg, cfg *DNSProxyConfig) (*dns.Msg, error) {
 	return nil, fmt.Errorf("%w", ErrAllUpstreamsFailed)
 }
 
-// exchangeViaConn sends a DNS query over an existing UDP connection and reads
-// the response. The upstream socket lives in the job's netns, so the job can
-// race forged datagrams at it: the query goes out under a fresh random ID
-// (not the client's, which the job knows), and a reply is accepted only if it
-// carries that ID AND echoes the question. Non-matching datagrams are
-// skipped; the client's original ID is restored on the accepted reply.
-func exchangeViaConn(conn *net.UDPConn, msg *dns.Msg) (*dns.Msg, error) {
-	// UDPSize must be set or ReadMsg defaults to a 512-byte buffer and
-	// fails to parse larger upstream answers (see upstreamUDPSize).
-	co := &dns.Conn{Conn: conn, UDPSize: upstreamUDPSize}
+// exchangeViaDocker sends one query to Docker's embedded resolver over a
+// fresh TCP connection opened by dial and reads the reply.
+//
+// The connection lives in the job's netns, where the job can race forged
+// datagrams at UDP sockets; TCP removes that, and the exchange keeps the
+// belt-and-braces checks anyway: a fresh random message ID, the reply must
+// echo that ID and the exact question, and the client's ID is restored.
+// TCP also has no truncation, so large answers need no retry.
+func exchangeViaDocker(dial func() (net.Conn, error), msg *dns.Msg) (*dns.Msg, error) {
+	nc, err := dial()
+	if err != nil {
+		return nil, fmt.Errorf("docker dns dial: %w", err)
+	}
+	defer nc.Close() //nolint:errcheck // per-query connection
 
-	deadlineErr := co.SetDeadline(time.Now().Add(upstreamTimeout))
+	deadlineErr := nc.SetDeadline(time.Now().Add(upstreamTimeout))
 	if deadlineErr != nil {
 		return nil, fmt.Errorf("docker dns deadline: %w", deadlineErr)
 	}
@@ -509,39 +506,29 @@ func exchangeViaConn(conn *net.UDPConn, msg *dns.Msg) (*dns.Msg, error) {
 	out := msg.Copy()
 	out.Id = upID
 
+	co := &dns.Conn{Conn: nc}
+
 	writeErr := co.WriteMsg(out)
 	if writeErr != nil {
 		return nil, fmt.Errorf("docker dns write: %w", writeErr)
 	}
 
-	sawBadQuestion := false
-
-	for range maxUpstreamReads {
-		resp, readErr := co.ReadMsg()
-		if readErr != nil {
-			return nil, fmt.Errorf("docker dns read: %w", readErr)
-		}
-
-		if resp.Id != upID {
-			continue
-		}
-
-		if !questionMatches(msg, resp) {
-			sawBadQuestion = true
-
-			continue
-		}
-
-		resp.Id = msg.Id
-
-		return resp, nil
+	resp, readErr := co.ReadMsg()
+	if readErr != nil {
+		return nil, fmt.Errorf("docker dns read: %w", readErr)
 	}
 
-	if sawBadQuestion {
+	if resp.Id != upID {
+		return nil, ErrDockerDNSIDMismatch
+	}
+
+	if !questionMatches(msg, resp) {
 		return nil, ErrDNSQuestionMismatch
 	}
 
-	return nil, ErrDockerDNSIDMismatch
+	resp.Id = msg.Id
+
+	return resp, nil
 }
 
 // randomDNSID returns a cryptographically random 16-bit DNS message ID.

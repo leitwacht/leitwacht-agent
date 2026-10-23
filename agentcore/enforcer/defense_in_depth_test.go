@@ -363,9 +363,9 @@ func TestDefenseInDepth_AllThreeKillPoints(t *testing.T) {
 		credEvents    []CredwatchEvent
 		procMemEvents []ProcMemEvent
 		dnsViolations []struct {
-			cgroupID uint64
-			domain   string
-			action   string
+			containerID string
+			domain      string
+			action      string
 		}
 	)
 
@@ -383,15 +383,17 @@ func TestDefenseInDepth_AllThreeKillPoints(t *testing.T) {
 		t.Logf("PROC_MEM KILL: container=%s pid=%d path=%s", ev.ContainerID, ev.PID, ev.Path)
 	}
 
-	mgr.SetOnDNSViolation(func(cgroupID uint64, domain, action string) {
+	mgr.SetOnDNSViolation(func(containerID, domain, action string) error {
 		mu.Lock()
 		dnsViolations = append(dnsViolations, struct {
-			cgroupID uint64
-			domain   string
-			action   string
-		}{cgroupID: cgroupID, domain: domain, action: action})
+			containerID string
+			domain      string
+			action      string
+		}{containerID: containerID, domain: domain, action: action})
 		mu.Unlock()
-		t.Logf("DNS KILL: cgroup=%d domain=%s action=%s", cgroupID, domain, action)
+		t.Logf("DNS KILL: container=%s domain=%s action=%s", containerID, domain, action)
+
+		return nil
 	})
 
 	// Create credential file before registering our cgroup, so the
@@ -454,7 +456,7 @@ func TestDefenseInDepth_AllThreeKillPoints(t *testing.T) {
 	// Simulate a DNS violation by calling the onDNSViolation callback
 	// directly (testing the Manager wiring, not the DNS proxy itself).
 	if mgr.onDNSViolation != nil {
-		mgr.onDNSViolation(0, "evil.example.com", "dns_blocked")
+		_ = mgr.onDNSViolation("test-container", "evil.example.com", "dns_blocked")
 	}
 
 	// Wait for ringbuf events

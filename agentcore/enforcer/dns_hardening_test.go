@@ -2,8 +2,8 @@ package enforcer
 
 import (
 	"context"
+	"errors"
 	"net"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -12,48 +12,43 @@ import (
 	"gitlab.com/leitwacht/leitwacht-agent/agentcore/policy"
 )
 
-// fakeUpstream is a UDP DNS server whose reply is produced by fn from the
-// query. fn returns the datagrams to send, in order.
-func fakeUpstream(t *testing.T, fn func(q *dns.Msg) []*dns.Msg) *net.UDPConn {
+// fakeUpstream is a TCP DNS server whose replies are produced by fn from the
+// query; it returns a dial function suitable for DNSProxyConfig.DockerDial.
+func fakeUpstream(t *testing.T, fn func(q *dns.Msg) []*dns.Msg) func() (net.Conn, error) {
 	t.Helper()
 
-	srv, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
 
-	t.Cleanup(func() { _ = srv.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 
 	go func() {
-		buf := make([]byte, 4096)
-
 		for {
-			n, from, readErr := srv.ReadFromUDP(buf)
-			if readErr != nil {
+			c, acceptErr := ln.Accept()
+			if acceptErr != nil {
 				return
 			}
 
-			q := new(dns.Msg)
-			if q.Unpack(buf[:n]) != nil {
-				continue
-			}
+			go func() {
+				defer c.Close()
 
-			for _, r := range fn(q) {
-				if packed, packErr := r.Pack(); packErr == nil {
-					_, _ = srv.WriteToUDP(packed, from)
+				co := &dns.Conn{Conn: c}
+
+				q, readErr := co.ReadMsg()
+				if readErr != nil {
+					return
 				}
-			}
+
+				for _, r := range fn(q) {
+					_ = co.WriteMsg(r)
+				}
+			}()
 		}
 	}()
 
-	conn, err := net.DialUDP("udp4", nil, srv.LocalAddr().(*net.UDPAddr))
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-
-	t.Cleanup(func() { _ = conn.Close() })
-
-	return conn
+	return func() (net.Conn, error) { return net.Dial("tcp4", ln.Addr().String()) }
 }
 
 func aRR(name, ip string) dns.RR {
@@ -79,13 +74,13 @@ func replyTo(q *dns.Msg, id uint16, rrs ...dns.RR) *dns.Msg {
 	return r
 }
 
-func TestExchangeViaConn_RandomIDAndRestore(t *testing.T) {
+func TestExchangeViaDocker_RandomIDAndRestore(t *testing.T) {
 	var seen atomic.Uint32
 
 	conn := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
 		seen.Store(uint32(q.Id))
 
-		return []*dns.Msg{replyTo(q, q.Id, aRR("a.example.com", "1.2.3.4"))}
+		return []*dns.Msg{replyTo(q, q.Id, aRR("a.example.com", "198.51.100.4"))}
 	})
 
 	// Over many queries the upstream ID must not simply equal the client's.
@@ -95,7 +90,7 @@ func TestExchangeViaConn_RandomIDAndRestore(t *testing.T) {
 		msg := makeQuery("a.example.com", dns.TypeA)
 		msg.Id = 4242
 
-		resp, err := exchangeViaConn(conn, msg)
+		resp, err := exchangeViaDocker(conn, msg)
 		if err != nil {
 			t.Fatalf("exchange: %v", err)
 		}
@@ -114,47 +109,55 @@ func TestExchangeViaConn_RandomIDAndRestore(t *testing.T) {
 	}
 }
 
-func TestExchangeViaConn_WrongIDIgnored(t *testing.T) {
+func TestExchangeViaDocker_WrongIDRejected(t *testing.T) {
 	conn := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
-		return []*dns.Msg{
-			replyTo(q, q.Id+1, aRR("a.example.com", "6.6.6.6")), // forged: wrong ID
-			replyTo(q, q.Id, aRR("a.example.com", "1.2.3.4")),
-		}
+		return []*dns.Msg{replyTo(q, q.Id+1, aRR("a.example.com", "203.0.113.66"))}
 	})
 
-	resp, err := exchangeViaConn(conn, makeQuery("a.example.com", dns.TypeA))
-	if err != nil {
-		t.Fatalf("exchange: %v", err)
-	}
-
-	if len(resp.Answer) != 1 || resp.Answer[0].(*dns.A).A.String() != "1.2.3.4" {
-		t.Fatalf("accepted forged reply: %v", resp.Answer)
+	if _, err := exchangeViaDocker(conn, makeQuery("a.example.com", dns.TypeA)); err == nil {
+		t.Fatal("reply with a wrong ID was accepted")
 	}
 }
 
-func TestExchangeViaConn_QuestionMismatchRejected(t *testing.T) {
+func TestExchangeViaDocker_LargeAnswerOverTCP(t *testing.T) {
 	conn := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
-		r := replyTo(q, q.Id, aRR("other.example.net", "6.6.6.6"))
+		var rrs []dns.RR
+		for i := range 100 {
+			rrs = append(rrs, aRR("a.example.com", net.IPv4(198, 51, 100, byte(i)).String()))
+		}
+
+		return []*dns.Msg{replyTo(q, q.Id, rrs...)}
+	})
+
+	resp, err := exchangeViaDocker(conn, makeQuery("a.example.com", dns.TypeA))
+	if err != nil || len(resp.Answer) != 100 {
+		t.Fatalf("large answer: err=%v n=%d", err, len(resp.Answer))
+	}
+}
+
+func TestExchangeViaDocker_QuestionMismatchRejected(t *testing.T) {
+	conn := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
+		r := replyTo(q, q.Id, aRR("other.example.net", "203.0.113.66"))
 		r.Question = []dns.Question{{Name: "other.example.net.", Qtype: dns.TypeA, Qclass: dns.ClassINET}}
 
 		return []*dns.Msg{r}
 	})
 
-	_, err := exchangeViaConn(conn, makeQuery("a.example.com", dns.TypeA))
+	_, err := exchangeViaDocker(conn, makeQuery("a.example.com", dns.TypeA))
 	if err == nil {
 		t.Fatal("reply for a different question was accepted")
 	}
 }
 
-func TestExchangeViaConn_QuestionCaseInsensitive(t *testing.T) {
+func TestExchangeViaDocker_QuestionCaseInsensitive(t *testing.T) {
 	conn := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
-		r := replyTo(q, q.Id, aRR("a.example.com", "1.2.3.4"))
+		r := replyTo(q, q.Id, aRR("a.example.com", "198.51.100.4"))
 		r.Question[0].Name = "A.EXAMPLE.COM."
 
 		return []*dns.Msg{r}
 	})
 
-	_, err := exchangeViaConn(conn, makeQuery("a.example.com", dns.TypeA))
+	_, err := exchangeViaDocker(conn, makeQuery("a.example.com", dns.TypeA))
 	if err != nil {
 		t.Fatalf("case-different question rejected: %v", err)
 	}
@@ -162,13 +165,12 @@ func TestExchangeViaConn_QuestionCaseInsensitive(t *testing.T) {
 
 // dockerCfg returns a block-mode config forwarding via a fake Docker
 // upstream, capturing allow-map seeds.
-func dockerCfg(t *testing.T, conn *net.UDPConn) (*DNSProxyConfig, *policy.ResolvedPolicy, *[]string) {
+func dockerCfg(t *testing.T, dial func() (net.Conn, error)) (*DNSProxyConfig, *policy.ResolvedPolicy, *[]string) {
 	t.Helper()
 
 	cfg, pol, _ := testDNSConfig(policy.ActionBlock, []policy.Rule{allowFQDN("a.example.com", 443)})
 	cfg.Upstreams = nil
-	cfg.DockerUpstream = conn
-	cfg.DockerUpstreamMu = &sync.Mutex{}
+	cfg.DockerDial = dial
 
 	var seeded []string
 
@@ -184,8 +186,8 @@ func dockerCfg(t *testing.T, conn *net.UDPConn) (*DNSProxyConfig, *policy.Resolv
 func TestHandleDNSQuery_OutOfChainARecordNotSeeded(t *testing.T) {
 	conn := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
 		return []*dns.Msg{replyTo(q, q.Id,
-			aRR("a.example.com", "1.2.3.4"),
-			aRR("evil.example.net", "6.6.6.6"), // not the qname, not in a CNAME chain
+			aRR("a.example.com", "198.51.100.4"),
+			aRR("evil.example.net", "203.0.113.66"), // not the qname, not in a CNAME chain
 		)}
 	})
 
@@ -193,12 +195,12 @@ func TestHandleDNSQuery_OutOfChainARecordNotSeeded(t *testing.T) {
 
 	resp := HandleDNSQuery(makeQuery("a.example.com", dns.TypeA), cfg, pol, nil, 0, "", "", "", 1)
 
-	if len(*seeded) != 1 || (*seeded)[0] != "1.2.3.4" {
-		t.Fatalf("seeded = %v, want only 1.2.3.4", *seeded)
+	if len(*seeded) != 1 || (*seeded)[0] != "198.51.100.4" {
+		t.Fatalf("seeded = %v, want only 198.51.100.4", *seeded)
 	}
 
 	for _, rr := range resp.Answer {
-		if a, ok := rr.(*dns.A); ok && a.A.String() == "6.6.6.6" {
+		if a, ok := rr.(*dns.A); ok && a.A.String() == "203.0.113.66" {
 			t.Fatal("out-of-chain A record was returned to the client")
 		}
 	}
@@ -208,10 +210,10 @@ func TestHandleDNSQuery_CNAMEChainSeeded(t *testing.T) {
 	conn := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
 		// Records deliberately out of order.
 		return []*dns.Msg{replyTo(q, q.Id,
-			aRR("edge.cdn.example.org", "9.9.9.9"),
+			aRR("edge.cdn.example.org", "198.51.100.9"),
 			cnameRR("mid.cdn.example.org", "edge.cdn.example.org"),
 			cnameRR("a.example.com", "mid.cdn.example.org"),
-			aRR("unrelated.example.org", "6.6.6.6"),
+			aRR("unrelated.example.org", "203.0.113.66"),
 		)}
 	})
 
@@ -219,12 +221,12 @@ func TestHandleDNSQuery_CNAMEChainSeeded(t *testing.T) {
 
 	_ = HandleDNSQuery(makeQuery("A.Example.com", dns.TypeA), cfg, pol, nil, 0, "", "", "", 1)
 
-	if len(*seeded) != 1 || (*seeded)[0] != "9.9.9.9" {
-		t.Fatalf("seeded = %v, want only 9.9.9.9", *seeded)
+	if len(*seeded) != 1 || (*seeded)[0] != "198.51.100.9" {
+		t.Fatalf("seeded = %v, want only 198.51.100.9", *seeded)
 	}
 }
 
-func TestDNSProxy_SheddsWhenSaturated(t *testing.T) {
+func TestDNSProxy_ShedsWhenSaturated(t *testing.T) {
 	cfg, pol, _ := testDNSConfig(policy.ActionBlock, nil)
 	p := NewDNSProxy(cfg)
 	_ = pol
@@ -276,7 +278,7 @@ func TestRecordDNS_ResolvedIPsCappedAndDeduped(t *testing.T) {
 	r := NewViolationRecorder(nil)
 
 	for i := range 200 {
-		ip := net.IPv4(10, 0, byte(i/256), byte(i%256)).String()
+		ip := net.IPv4(198, 51, byte(i/256), byte(i%256)).String()
 		r.RecordDNS("big.example.com", "A", "dns_allowed", []string{ip, ip}, 0, "", "", "")
 	}
 
@@ -337,13 +339,13 @@ func itoa(i int) string {
 
 func TestDNSCache_SkipsSinkholeIP(t *testing.T) {
 	c := NewDNSCache()
-	c.Record("blocked.example.com", []string{SinkholeIPv4, "1.2.3.4"})
+	c.Record("blocked.example.com", []string{SinkholeIPv4, "198.51.100.4"})
 
 	if got := c.Lookup(SinkholeIPv4); got != "" {
 		t.Fatalf("sinkhole IP cached as %q", got)
 	}
 
-	if got := c.Lookup("1.2.3.4"); got != "blocked.example.com" {
+	if got := c.Lookup("198.51.100.4"); got != "blocked.example.com" {
 		t.Fatalf("real IP not cached: %q", got)
 	}
 }
@@ -359,14 +361,16 @@ func TestManager_DNSViolationWiredAndDeduped(t *testing.T) {
 	defer mgr.DetachAll()
 
 	type call struct {
-		cgroupID uint64
-		domain   string
+		containerID string
+		domain      string
 	}
 
 	calls := make(chan call, 8)
 
-	mgr.SetOnDNSViolation(func(cgroupID uint64, domain, _ string) {
-		calls <- call{cgroupID, domain}
+	mgr.SetOnDNSViolation(func(containerID, domain, _ string) error {
+		calls <- call{containerID, domain}
+
+		return nil
 	})
 
 	const cid = "abcdef123456"
@@ -390,18 +394,13 @@ func TestManager_DNSViolationWiredAndDeduped(t *testing.T) {
 
 	// Attributed by cgroup ID.
 	hook(e.cgroupID, "evil.example.com", "dns_blocked")
-	// Duplicates, and an attribution miss (cgroup 0, single container), are suppressed.
+	// Duplicates are suppressed.
 	hook(e.cgroupID, "evil2.example.com", "dns_blocked")
-	hook(0, "evil3.example.com", "dns_blocked")
 
 	select {
 	case c := <-calls:
-		if c.domain != "evil.example.com" {
-			t.Fatalf("domain = %q", c.domain)
-		}
-
-		if got := mgr.ContainerIDForCgroup(c.cgroupID); got != cid {
-			t.Fatalf("callback cgroup %d resolves to %q, want %q", c.cgroupID, got, cid)
+		if c.domain != "evil.example.com" || c.containerID != cid {
+			t.Fatalf("call = %+v", c)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("callback not invoked")
@@ -412,9 +411,75 @@ func TestManager_DNSViolationWiredAndDeduped(t *testing.T) {
 		t.Fatalf("callback fired more than once per container: %+v", c)
 	case <-time.After(200 * time.Millisecond):
 	}
+}
 
-	// Unknown cgroup with several containers in the netns is ambiguous: skipped.
-	if id, _ := mgr.resolveDNSViolator(&NetnsContext{pids: map[string]int{"a": 1, "b": 2}}, 999999); id != "" {
-		t.Fatalf("ambiguous violator resolved to %q", id)
+// TestManager_DNSViolationUnresolvedNoAction: with a single container in the
+// netns, neither a missing (0) nor an unknown non-zero cgroup may fall back
+// to "the only container".
+func TestManager_DNSViolationUnresolvedNoAction(t *testing.T) {
+	mgr, e, hook := attachedBlockManager(t)
+
+	calls := make(chan string, 4)
+
+	mgr.SetOnDNSViolation(func(containerID, _, _ string) error {
+		calls <- containerID
+
+		return nil
+	})
+
+	hook(0, "evil.example.com", "dns_blocked")
+	hook(e.cgroupID+1000, "evil.example.com", "dns_blocked")
+
+	select {
+	case id := <-calls:
+		t.Fatalf("callback fired for unresolved cgroup (container %q)", id)
+	case <-time.After(200 * time.Millisecond):
 	}
+}
+
+// TestManager_DNSViolationRetriesAfterFailure: a failed handler may be
+// retried by a later violation, but only a bounded number of times.
+func TestManager_DNSViolationRetriesAfterFailure(t *testing.T) {
+	mgr, e, hook := attachedBlockManager(t)
+
+	var n atomic.Int32
+
+	mgr.SetOnDNSViolation(func(_, _, _ string) error {
+		n.Add(1)
+
+		return errors.New("kill failed") //nolint:err113 // test
+	})
+
+	for range 10 {
+		hook(e.cgroupID, "evil.example.com", "dns_blocked")
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	if got := n.Load(); got != maxDNSViolationAttempts {
+		t.Fatalf("handler ran %d times, want %d", got, maxDNSViolationAttempts)
+	}
+}
+
+func attachedBlockManager(t *testing.T) (*Manager, *Enforcer, func(uint64, string, string)) {
+	t.Helper()
+
+	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr.NetnsGrace = 0
+
+	t.Cleanup(func() { mgr.DetachAll() })
+
+	e, err := mgr.Attach(context.Background(), ContainerInfo{ContainerID: "abcdef123456", ProjectPath: "p/x"}, 1234, testPolicy("block"))
+	if err != nil || e == nil {
+		t.Fatalf("attach: %v", err)
+	}
+
+	mgr.mu.Lock()
+	var nctx *NetnsContext
+	for _, n := range mgr.netnsContexts {
+		nctx = n
+	}
+	mgr.mu.Unlock()
+
+	return mgr, e, nctx.dnsProxy.cfg.OnDNSViolation
 }

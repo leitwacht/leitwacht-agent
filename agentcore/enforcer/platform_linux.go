@@ -48,8 +48,6 @@ func actionForDrop(reason uint8, auditMode bool) string {
 	return "packet_dropped"
 }
 
-var errNotUDPConn = errors.New("dial returned non-UDP conn")
-
 // LinuxPlatform is the production Platform using eBPF, netns, and nftables.
 type LinuxPlatform struct {
 	Logger *slog.Logger
@@ -134,13 +132,14 @@ func (p *LinuxPlatform) RemoveDNSRedirect(pid int) error {
 	return nil
 }
 
-// DialUpstreamInNetns creates a marked UDP connection to addr inside the container's netns.
-// The SO_MARK prevents nftables from redirecting the proxy's own upstream queries.
-func (p *LinuxPlatform) DialUpstreamInNetns(pid int, addr string, mark int) (*net.UDPConn, error) {
-	var conn *net.UDPConn
+// DialUpstreamTCPInNetns opens a marked TCP connection to addr inside the
+// netns of pid. See Platform.DialUpstreamTCPInNetns.
+func (p *LinuxPlatform) DialUpstreamTCPInNetns(pid int, addr string, mark int) (net.Conn, error) {
+	var conn net.Conn
 
 	err := inNetns(pid, func() error {
 		d := net.Dialer{
+			Timeout: upstreamTimeout,
 			Control: func(_, _ string, c syscall.RawConn) error {
 				var sErr error
 
@@ -159,19 +158,12 @@ func (p *LinuxPlatform) DialUpstreamInNetns(pid int, addr string, mark int) (*ne
 			},
 		}
 
-		nc, dialErr := d.DialContext(context.Background(), "udp4", addr)
+		nc, dialErr := d.DialContext(context.Background(), "tcp4", addr)
 		if dialErr != nil {
-			return fmt.Errorf("dial marked udp: %w", dialErr)
+			return fmt.Errorf("dial marked tcp: %w", dialErr)
 		}
 
-		udpConn, ok := nc.(*net.UDPConn)
-		if !ok {
-			nc.Close() //nolint:errcheck,gosec // cleanup
-
-			return errNotUDPConn
-		}
-
-		conn = udpConn
+		conn = nc
 
 		return nil
 	})

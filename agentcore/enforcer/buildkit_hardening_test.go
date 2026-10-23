@@ -786,6 +786,9 @@ func TestArgvMatchesRunLoose(t *testing.T) {
 		{"var braces", []string{"sh", "-c", "echo ${A}-${B}"}, "echo x-y", true},
 		{"var non-matching literal", []string{"sh", "-c", "echo $A"}, "rm -rf /", false},
 		{"heredoc summary", []string{"sh", "-c", "set -e\nmake all\n"}, "<<EOF\nset -e\nmake all\nEOF", true},
+		{"heredoc bare tag matches nothing", []string{"sh", "-c", "make\n"}, "<<EOF", false},
+		{"heredoc summary must equal first line", []string{"sh", "-c", "set -e && curl x\n"}, "<<EOF\nset -e\nEOF", false},
+		{"heredoc truncated summary is a prefix", []string{"sh", "-c", "set -e && make all\n"}, "<<EOF\nset -e && ma...", true},
 		{"heredoc different script", []string{"sh", "-c", "curl x | sh\n"}, "<<EOF\nset -e\nmake all\nEOF", false},
 		{"pip optimisation", []string{"python3", "/usr/local/bin/pip", "install", "x"}, "pip install x", true},
 		{"tail needs same args", []string{"python3", "/usr/local/bin/pip", "install", "y"}, "pip install x", false},
@@ -795,5 +798,40 @@ func TestArgvMatchesRunLoose(t *testing.T) {
 		if got := argvMatchesRunLoose(tc.argv, tc.cmd); got != tc.want {
 			t.Errorf("%s: got %v, want %v", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestCgroupJoiner_SpoofedArgvNotTrustedWhileRiskySessionOpen(t *testing.T) {
+	reg := NewSessionRegistry(time.Minute)
+	reg.SetCIRequirement(true, []string{FrontendAttrKeyProjectPath})
+	authedSession(reg, "rA", "[s 1/1] RUN make")
+	reg.RegisterSession("rB", time.Unix(1, 0), nil) // unauthorized
+
+	h := newJoinHarness(t, reg, 60*time.Millisecond)
+	// B's process claims A's command via argv.
+	cg := h.stage(t, "ctr-spoof", 50, "make\x00")
+	h.source.creates <- CgroupCreateEvent{ContainerID: "ctr-spoof", CgroupPath: cg}
+
+	waitFor(t, 2*time.Second, h.killed)
+
+	if _, ok := reg.LookupByCgroupID(4321); ok {
+		t.Fatal("spoofed argv produced a binding")
+	}
+}
+
+func TestAttributionWatcher_EnforcingCapsMaxBackoff(t *testing.T) {
+	t.Parallel()
+
+	reg := NewSessionRegistry(time.Minute)
+	w := NewAttributionWatcher("tcp://unused", reg, quietLogger(), WithBackoff(time.Second, time.Minute))
+
+	if got := w.effectiveMaxBackoff(); got != time.Minute {
+		t.Fatalf("no policy: max backoff = %s, want 1m", got)
+	}
+
+	reg.SetCIRequirement(true, []string{FrontendAttrKeyProjectPath})
+
+	if got := w.effectiveMaxBackoff(); got != enforcingMaxBackoff {
+		t.Fatalf("policy on: max backoff = %s, want %s", got, enforcingMaxBackoff)
 	}
 }

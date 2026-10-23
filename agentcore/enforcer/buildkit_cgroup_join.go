@@ -345,6 +345,10 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 			return true
 		}
 
+		if j.distrustArgvMatch(cgroupID, evt, 1) {
+			return true
+		}
+
 		j.link(cgroupID, evt, m)
 
 		j.logger.Info("buildkit cgroup linked",
@@ -379,6 +383,10 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 			}
 		}
 
+		if j.distrustArgvMatch(cgroupID, evt, len(matches)) {
+			return true
+		}
+
 		// Tiebreaker: environ. Read /proc/<pid>/environ and pick
 		// the candidate whose FrontendAttrs values appear in the
 		// process environment. Falls through to ambiguous if the
@@ -407,6 +415,29 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 
 		return true
 	}
+}
+
+// distrustArgvMatch implements the fail-closed rule for argv-derived
+// matches: argv is controlled by the process (exec -a, setproctitle), so
+// a match proves nothing about which session owns the cgroup. Under a
+// policy, while any unauthorized, placeholder or deny-matching session
+// is open, no match is trusted and the cgroup is killed instead of
+// bound. Returns true when it killed (the caller must stop).
+func (j *CgroupJoiner) distrustArgvMatch(cgroupID uint64, evt CgroupCreateEvent, candidates int) bool {
+	if !j.registry.EnforcementEnabled() || !j.registry.PolicyCandidates().Risky {
+		return false
+	}
+
+	if j.killCgroup(evt.CgroupPath) {
+		j.logger.Warn("buildkit cgroup killed: argv match not trusted while an unauthorized or denied session is open",
+			"cgroup_id", cgroupID,
+			"container_id", evt.ContainerID,
+			"cgroup_path", evt.CgroupPath,
+			"candidates", candidates,
+		)
+	}
+
+	return true
 }
 
 // noMatch handles a miss. Non-final misses just ask for a retry. A
@@ -775,26 +806,32 @@ func execFormMatches(argv, elems []string) bool {
 
 var heredocTagRE = regexp.MustCompile(`^<<-?\s*["']?[A-Za-z_][A-Za-z0-9_]*["']?\s*`)
 
+// heredocMatches compares the heredoc summary in the vertex name (its
+// first body line) with the script's first line. Equality is required;
+// a prefix is accepted only when the summary was truncated with "...".
+// A bare "<<EOF" with no summary matches nothing.
 func heredocMatches(script, runCmd string) bool {
-	head := normalizeWS(heredocTagRE.ReplaceAllString(runCmd, ""))
+	head := firstNonEmptyLine(heredocTagRE.ReplaceAllString(runCmd, ""))
+	truncated := strings.HasSuffix(head, "...")
 	head = strings.TrimSpace(strings.TrimSuffix(head, "..."))
 
-	first := ""
+	first := firstNonEmptyLine(script)
 
-	for _, line := range strings.Split(script, "\n") {
-		if l := normalizeWS(line); l != "" {
-			first = l
-
-			break
-		}
-	}
-
-	if first == "" {
+	if head == "" || first == "" {
 		return false
 	}
 
-	// An empty summary (bare "<<EOF") matches any script.
-	return head == "" || strings.HasPrefix(head, first) || strings.HasPrefix(first, head)
+	return head == first || (truncated && strings.HasPrefix(first, head))
+}
+
+func firstNonEmptyLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if l := normalizeWS(line); l != "" {
+			return l
+		}
+	}
+
+	return ""
 }
 
 var shellVarRE = regexp.MustCompile(`\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*`)

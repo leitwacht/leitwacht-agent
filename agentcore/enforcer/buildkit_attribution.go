@@ -960,7 +960,7 @@ func (w *AttributionWatcher) Run(ctx context.Context) error {
 				return sleepErr
 			}
 
-			backoff = nextBackoff(backoff, w.maxBackoff)
+			backoff = nextBackoff(backoff, w.effectiveMaxBackoff())
 
 			continue
 		}
@@ -989,7 +989,7 @@ func (w *AttributionWatcher) Run(ctx context.Context) error {
 		// A stream that delivered something, or simply stayed up longer
 		// than the maximum backoff (an idle ActiveOnly stream delivers
 		// nothing), was healthy: retry quickly.
-		healthy := streamWasHealthy(hc.received.Load(), time.Since(connStart), w.maxBackoff)
+		healthy := streamWasHealthy(hc.received.Load(), time.Since(connStart), w.effectiveMaxBackoff())
 		if healthy {
 			backoff = w.minBackoff
 		}
@@ -1003,9 +1003,22 @@ func (w *AttributionWatcher) Run(ctx context.Context) error {
 		}
 
 		if !healthy {
-			backoff = nextBackoff(backoff, w.maxBackoff)
+			backoff = nextBackoff(backoff, w.effectiveMaxBackoff())
 		}
 	}
+}
+
+// enforcingMaxBackoff caps reconnect backoff when a kill policy is on:
+// while the stream is down the registry is blind and unmatched cgroups
+// are killed, so builds after a buildkitd restart must not wait long.
+const enforcingMaxBackoff = 5 * time.Second
+
+func (w *AttributionWatcher) effectiveMaxBackoff() time.Duration {
+	if w.registry.EnforcementEnabled() && w.maxBackoff > enforcingMaxBackoff {
+		return enforcingMaxBackoff
+	}
+
+	return w.maxBackoff
 }
 
 // streamWasHealthy decides whether a finished history stream earns a

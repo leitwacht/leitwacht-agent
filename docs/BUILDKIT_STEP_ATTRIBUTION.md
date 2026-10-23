@@ -315,7 +315,12 @@ element-wise), heredoc bodies (summary against the script's first line),
 `$VAR` / `${VAR}` in the shell command (expanded in the vertex name, so
 treated as wildcards), and the shell replacing itself with the last
 command (`pip install` runs as `python3 /usr/local/bin/pip install`).
-Each widening can only over-match, which produces an ambiguous candidate
+Matches are not proof of ownership: the process controls its own argv
+(`exec -a`, `setproctitle`), so a cgroup can claim another session's
+command. Under a policy, while any unauthorized, placeholder or
+deny-matching session is open, no argv-derived match is trusted and the
+cgroup is killed instead of bound; only when every open session is
+authorized does a match bind. Each widening can only over-match, which produces an ambiguous candidate
 set that the checks above treat fail-closed. A cgroup already bound is
 not re-judged when a rescan re-reports it.
 
@@ -333,7 +338,7 @@ kernel-visible ties a runc cgroup to a particular BuildKit session; when
 several sessions run the same command the environ tiebreaker is
 best-effort and the remainder is reported as ambiguous.
 
-**Resilience.** The history subscriber backs off between reconnects and
+**Resilience.** The history subscriber backs off between reconnects (capped at 5s when a kill policy is on, because unmatched cgroups are killed while it is down) and
 closes sessions absent from a reconnect replay (the grace starts only
 once the stream is established, and a later STARTED record reopens a
 session); sessions with no activity are swept after

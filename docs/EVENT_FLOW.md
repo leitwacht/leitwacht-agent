@@ -249,13 +249,30 @@ seeds inherit that fqdn rule's index.
 
 Two things sit outside the ordering by design:
 
-- **Hard blocks** — cloud metadata (`169.254.169.254`), DoT
-  (port 853), and the loopback / link-local carve-outs. These are
-  invariants, not policy; no rule ordering can reach them.
+- **Hard blocks** — cloud metadata and workload-credential
+  endpoints (`169.254.169.254`, the ECS task-role endpoint
+  `169.254.170.2`, the EKS Pod Identity endpoint `169.254.170.23` and
+  Alibaba's `100.100.100.200`), DoT (port 853), and the loopback /
+  link-local carve-outs. These are invariants, not policy; no rule
+  ordering can reach them. IPv6 metadata addresses (for example
+  `fd00:ec2::254`) need no entry of their own: in block mode all
+  non-loopback IPv6 is dropped.
 - **Trusted CIDRs** (`TRUSTED_CIDRS`, the Docker bridge / pod
   network) hold no position in any rule list, so they are consulted
   only after every rule has missed. An explicit deny rule still
   overrides node-level trust.
+
+**Known exposure — link-local.** Apart from the endpoints listed
+above, the rest of `169.254.0.0/16` is allowed before any policy is
+evaluated (it carries node-local services such as NodeLocal DNS). A
+platform that serves credentials or metadata from another link-local
+address is therefore not covered by the hard-block list; restrict such
+endpoints at the network layer or add the address to the list.
+
+**Allow keys carry no protocol.** Entries in the allow maps are keyed
+by `{ip, port}` only. A rule that allows `tcp/443` therefore also
+permits `udp/443` (QUIC) to the same address. Narrowing this would
+need the protocol added to the map key; it is intentionally unchanged.
 
 `cidr` allow rules must name a single host (a bare address, `/32` or
 `/128`) — the allow map is an exact-match hash. Wider prefixes are

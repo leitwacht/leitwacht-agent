@@ -171,6 +171,13 @@ func startTestContainer(t *testing.T, name, script string) int {
 func runBareIPScenario(t *testing.T, name string, rules []policy.Rule) []Violation {
 	t.Helper()
 
+	return runBareIPScenarioFor(t, name, ipRuleTestIP, rules)
+}
+
+// runBareIPScenarioFor is runBareIPScenario for an arbitrary destination IP.
+func runBareIPScenarioFor(t *testing.T, name, targetIP string, rules []policy.Rule) []Violation {
+	t.Helper()
+
 	if os.Getuid() != 0 {
 		t.Skip("requires root")
 	}
@@ -182,7 +189,7 @@ func runBareIPScenario(t *testing.T, name string, rules []policy.Rule) []Violati
 	// Dial in a loop so the traffic is still flowing when the enforcer
 	// attaches — a single early nc could race the attach and produce a
 	// false "allowed" result.
-	script := "while true; do nc -z -w 2 " + ipRuleTestIP + " 80 >/dev/null 2>&1 || true; sleep 2; done"
+	script := "while true; do nc -z -w 2 " + targetIP + " 80 >/dev/null 2>&1 || true; sleep 2; done"
 
 	pid := startTestContainer(t, container, script)
 	if pid == 0 {
@@ -196,7 +203,7 @@ func runBareIPScenario(t *testing.T, name string, rules []policy.Rule) []Violati
 		t.Fatalf("bring up loopback: %v\n%s", loErr, loOut)
 	}
 
-	route := exec.Command("nsenter", netns, "ip", "route", "add", ipRuleTestIP, "dev", "lo")
+	route := exec.Command("nsenter", netns, "ip", "route", "add", targetIP, "dev", "lo")
 	if routeOut, routeErr := route.CombinedOutput(); routeErr != nil {
 		t.Fatalf("add bare-IP route: %v\n%s", routeErr, routeOut)
 	}
@@ -406,4 +413,82 @@ func TestIntegrationIPRuleOrdering(t *testing.T) {
 				"the datapath is still hardcoding deny-beats-allow", ipRuleTestIP, v.Action)
 		}
 	})
+}
+
+// TestIntegrationMetadataEndpointsHardBlocked pins the cloud metadata and
+// workload-credential endpoints as invariants: even an explicit allow
+// rule must not open them, because they are checked before the rule
+// maps.
+//
+// Run: sudo -E go test ./agentcore/enforcer/ -tags integration -run TestIntegrationMetadataEndpointsHardBlocked -v -count=1.
+func TestIntegrationMetadataEndpointsHardBlocked(t *testing.T) {
+	for _, tc := range []struct{ name, ip string }{
+		{"imds", "169.254.169.254"},
+		{"ecs", "169.254.170.2"},
+		{"eksidentity", "169.254.170.23"},
+		{"alibaba", "100.100.100.200"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			violations := runBareIPScenarioFor(t, "meta"+tc.name, tc.ip, []policy.Rule{{
+				Pattern:     tc.ip + "/32",
+				PatternType: policy.PatternCIDR,
+				Action:      policy.ActionAllow,
+				Ports:       []int{80},
+			}})
+
+			if violationForIP(violations, tc.ip) == nil {
+				t.Fatalf("%s was reachable despite the metadata hard block", tc.ip)
+			}
+		})
+	}
+}
+
+// TestIntegrationDeniedIPsFullMapFailsLoudly pins denied_ips as a plain
+// HASH: filling it must surface an error on the next Put and must not
+// evict an earlier deny (an LRU silently turned evicted denies into
+// allows).
+//
+// Run: sudo -E go test ./agentcore/enforcer/ -tags integration -run TestIntegrationDeniedIPsFullMapFailsLoudly -v -count=1.
+func TestIntegrationDeniedIPsFullMapFailsLoudly(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	platform := &LinuxPlatform{Logger: logger}
+
+	handle, err := platform.LoadEBPF(false, nil)
+	if err != nil {
+		t.Fatalf("load ebpf: %v", err)
+	}
+
+	defer func() { _ = handle.Close() }()
+
+	h, ok := handle.(*linuxEBPFHandle)
+	if !ok {
+		t.Fatalf("unexpected handle type %T", handle)
+	}
+
+	const capacity = 4096
+
+	ipAt := func(i int) net.IP { return net.IPv4(10, byte(i>>16), byte(i>>8), byte(i)) }
+
+	for i := range capacity {
+		if err = h.AddDeniedIP(ipAt(i), 0, policy.SystemRulePriority); err != nil {
+			t.Fatalf("add deny %d: %v", i, err)
+		}
+	}
+
+	if err = h.AddDeniedIP(ipAt(capacity), 0, policy.SystemRulePriority); err == nil {
+		t.Fatal("Put into a full denied_ips map succeeded; expected an error, not an eviction")
+	}
+
+	key := PackAllowKey(ipAt(0), 0)
+
+	var prio uint32
+	if err = h.objs.DeniedIps.Lookup(key[:], &prio); err != nil {
+		t.Fatalf("earliest deny was evicted from denied_ips: %v", err)
+	}
+
+	t.Logf("egress drop-ring reserve failures: %d", h.ReserveFailures())
 }

@@ -95,15 +95,16 @@ type ebpfProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type ebpfMapSpecs struct {
-	AllowedHosts *ebpf.MapSpec `ebpf:"allowed_hosts"`
-	AllowedIps   *ebpf.MapSpec `ebpf:"allowed_ips"`
-	Config       *ebpf.MapSpec `ebpf:"config"`
-	DeniedIps    *ebpf.MapSpec `ebpf:"denied_ips"`
-	DropDedup    *ebpf.MapSpec `ebpf:"drop_dedup"`
-	DropEvents   *ebpf.MapSpec `ebpf:"drop_events"`
-	SockOwners   *ebpf.MapSpec `ebpf:"sock_owners"`
-	Stats        *ebpf.MapSpec `ebpf:"stats"`
-	TrustedNets  *ebpf.MapSpec `ebpf:"trusted_nets"`
+	AllowedHosts    *ebpf.MapSpec `ebpf:"allowed_hosts"`
+	AllowedIps      *ebpf.MapSpec `ebpf:"allowed_ips"`
+	Config          *ebpf.MapSpec `ebpf:"config"`
+	DeniedIps       *ebpf.MapSpec `ebpf:"denied_ips"`
+	DropDedup       *ebpf.MapSpec `ebpf:"drop_dedup"`
+	DropEvents      *ebpf.MapSpec `ebpf:"drop_events"`
+	ReserveFailures *ebpf.MapSpec `ebpf:"reserve_failures"`
+	SockOwners      *ebpf.MapSpec `ebpf:"sock_owners"`
+	Stats           *ebpf.MapSpec `ebpf:"stats"`
+	TrustedNets     *ebpf.MapSpec `ebpf:"trusted_nets"`
 }
 
 // ebpfVariableSpecs contains global variables before they are loaded into the kernel.
@@ -134,15 +135,16 @@ func (o *ebpfObjects) Close() error {
 //
 // It can be passed to loadEbpfObjects or ebpf.CollectionSpec.LoadAndAssign.
 type ebpfMaps struct {
-	AllowedHosts *ebpf.Map `ebpf:"allowed_hosts"`
-	AllowedIps   *ebpf.Map `ebpf:"allowed_ips"`
-	Config       *ebpf.Map `ebpf:"config"`
-	DeniedIps    *ebpf.Map `ebpf:"denied_ips"`
-	DropDedup    *ebpf.Map `ebpf:"drop_dedup"`
-	DropEvents   *ebpf.Map `ebpf:"drop_events"`
-	SockOwners   *ebpf.Map `ebpf:"sock_owners"`
-	Stats        *ebpf.Map `ebpf:"stats"`
-	TrustedNets  *ebpf.Map `ebpf:"trusted_nets"`
+	AllowedHosts    *ebpf.Map `ebpf:"allowed_hosts"`
+	AllowedIps      *ebpf.Map `ebpf:"allowed_ips"`
+	Config          *ebpf.Map `ebpf:"config"`
+	DeniedIps       *ebpf.Map `ebpf:"denied_ips"`
+	DropDedup       *ebpf.Map `ebpf:"drop_dedup"`
+	DropEvents      *ebpf.Map `ebpf:"drop_events"`
+	ReserveFailures *ebpf.Map `ebpf:"reserve_failures"`
+	SockOwners      *ebpf.Map `ebpf:"sock_owners"`
+	Stats           *ebpf.Map `ebpf:"stats"`
+	TrustedNets     *ebpf.Map `ebpf:"trusted_nets"`
 }
 
 func (m *ebpfMaps) Close() error {
@@ -153,6 +155,7 @@ func (m *ebpfMaps) Close() error {
 		m.DeniedIps,
 		m.DropDedup,
 		m.DropEvents,
+		m.ReserveFailures,
 		m.SockOwners,
 		m.Stats,
 		m.TrustedNets,

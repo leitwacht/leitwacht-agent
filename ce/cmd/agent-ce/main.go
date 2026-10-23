@@ -404,13 +404,22 @@ func emitProcMemAdvisory(cfg *config.Config, mgr *enforcer.Manager, sink *sinks.
 	})
 }
 
+// wireDNSKill kills the container behind a block-mode DNS violation. The
+// manager invokes the callback off the DNS handler goroutine, once per
+// container, and only for containers it could identify; the empty-ID guard
+// here is defence in depth so an unresolved container is never killed,
+// reported on, or detached.
 func wireDNSKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *sinks.Multi, log *slog.Logger) {
 	mgr.SetOnDNSViolation(func(cgroupID uint64, domain, action string) {
 		containerID := mgr.ContainerIDForCgroup(cgroupID)
-		if containerID != "" {
-			if err := w.KillContainer(context.Background(), containerID); err != nil {
-				log.Warn("dns kill failed", "container", containerID, "error", err)
-			}
+		if containerID == "" {
+			log.Debug("dns violation: container unresolved, not killing", "action", action)
+
+			return
+		}
+
+		if err := w.KillContainer(context.Background(), containerID); err != nil {
+			log.Warn("dns kill failed", "container", containerID, "error", err)
 		}
 		_ = sink.ReportAdvisory(context.Background(), &advisory.Advisory{
 			ContainerID: containerID,

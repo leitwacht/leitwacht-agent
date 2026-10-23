@@ -250,6 +250,7 @@ type Manager struct {
 	credwatchCgroupToContainer map[uint64]string                            //nolint:unused,nolintlint // cgroupID → containerID
 	OnCredwatchEvent           func(event CredwatchEvent)                   //nolint:unused,nolintlint // callback for kill + report
 	onDNSViolation             func(cgroupID uint64, domain, action string) // called from DNS proxy on block-mode violations
+	dnsViolationSeen           map[string]struct{}                          // containerIDs already handed to onDNSViolation; protected by mu
 
 	// Proc_mem LSM (global, not per-container).
 	// Fields used by proc_mem_linux.go; appear unused on non-linux builds.
@@ -291,6 +292,9 @@ func (m *Manager) Platform() Platform {
 // SetOnDNSViolation sets the callback invoked when a DNS violation occurs
 // in block mode. CE wires this to kill the container; EE may quarantine.
 func (m *Manager) SetOnDNSViolation(fn func(cgroupID uint64, domain, action string)) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	m.onDNSViolation = fn
 }
 
@@ -308,7 +312,9 @@ func (m *Manager) ContainerIDForCgroup(cgroupID uint64) string {
 		return id
 	}
 
-	return ""
+	// Those maps only exist when the credwatch/proc_mem features are on;
+	// fall back to the cgroup IDs recorded at attach.
+	return m.containerIDFromEnforcersLocked(cgroupID)
 }
 
 // ContainerInfo returns the CI attribution recorded for an attached
@@ -1050,6 +1056,13 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 
 	setupDNSRedirectMs := time.Since(stepStart).Milliseconds()
 
+	// A CAP_NET_ADMIN container can forge the agent's SO_MARK (or edit the
+	// nftables rules) and so bypass DNS interception. Unenforceable; say so.
+	if hasCap, capErr := procHasCapNetAdmin(pid); capErr == nil && hasCap {
+		m.logger.Warn("container holds CAP_NET_ADMIN: DNS interception can be bypassed (unenforceable configuration)",
+			"pid", pid, "netns_inode", nctx.inode)
+	}
+
 	// Step 4: Create and start DNS proxy with shared DNS recorder.
 	// DNS activity from all sibling containers lands in sharedDNSRecorder.
 	proxyCfg := &DNSProxyConfig{
@@ -1063,6 +1076,9 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 		// attachPodLink for K8s pods, attachEnforcer for non-pod). Closes
 		// the race where the signal fires before AttachCgroup.
 		EgressReady: nctx.egressAttached.Load,
+		OnDNSViolation: func(cgroupID uint64, domain, action string) {
+			m.handleDNSViolation(nctx, cgroupID, domain, action)
+		},
 	}
 
 	if nctx.dockerUpstream != nil {

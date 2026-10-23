@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,7 +41,12 @@ type Webhook struct {
 	// emitted after that context is cancelled and must still go out.
 	ctx context.Context
 	sem chan struct{}
-	wg  sync.WaitGroup
+
+	// parent is observed only to notice daemon shutdown; it never
+	// cancels in-flight posts. cancelledAt records when that happened.
+	parent      context.Context
+	cancelledAt atomic.Pointer[time.Time]
+	closed      atomic.Bool
 
 	dropped atomic.Int64
 }
@@ -54,10 +58,11 @@ type Webhook struct {
 const DefaultWebhookConcurrency = 32
 
 // NewWebhook returns a Webhook sink with default concurrency limits.
-// parent is accepted for API compatibility but is intentionally not
-// used for cancellation: shutdown-time reports (emitted after the
-// daemon context is cancelled) must still be delivered. Call Flush
-// before exit to wait for in-flight posts.
+// parent is the daemon-lifetime context. Its cancellation does not
+// cancel posts: shutdown-time reports (emitted after it) must still be
+// delivered. After it cancels, a report that finds the in-flight cap
+// full waits for a slot up to ShutdownGrace past the cancel instead of
+// dropping. Call Flush before exit to wait for in-flight posts.
 // authHeader (e.g., "Bearer abc...") is sent verbatim if non-empty;
 // surrounding whitespace is trimmed.
 func NewWebhook(parent context.Context, url string, timeout time.Duration, hostname, authHeader string, log *slog.Logger) *Webhook {
@@ -67,47 +72,70 @@ func NewWebhook(parent context.Context, url string, timeout time.Duration, hostn
 // NewWebhookWithLimits exposes the concurrency cap so tests and tuned
 // production deployments can override it. maxInflight <= 0 falls back
 // to DefaultWebhookConcurrency.
-func NewWebhookWithLimits(_ context.Context, url string, timeout time.Duration, hostname, authHeader string, maxInflight int, log *slog.Logger) *Webhook {
+func NewWebhookWithLimits(parent context.Context, url string, timeout time.Duration, hostname, authHeader string, maxInflight int, log *slog.Logger) *Webhook {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 	if maxInflight <= 0 {
 		maxInflight = DefaultWebhookConcurrency
 	}
-	return &Webhook{
+	if parent == nil {
+		parent = context.Background()
+	}
+	w := &Webhook{
 		client:   &http.Client{Timeout: timeout},
 		url:      url,
 		hostname: hostname,
 		header:   strings.TrimSpace(authHeader),
 		log:      log,
 		ctx:      context.Background(),
+		parent:   parent,
 		sem:      make(chan struct{}, maxInflight),
 	}
+	context.AfterFunc(parent, func() {
+		t := time.Now()
+		w.cancelledAt.Store(&t)
+	})
+
+	return w
 }
 
-// Flush blocks until all in-flight posts finish or timeout elapses,
-// whichever comes first, and reports whether everything drained. Call it
-// once after the last report has been emitted. Posts are still bounded
-// individually by the HTTP client timeout.
-func (w *Webhook) Flush(timeout time.Duration) bool {
-	done := make(chan struct{})
+// ShutdownGrace bounds how long, after the parent context cancels, a
+// report may wait for an in-flight slot. It matches the Flush window
+// agent-ce uses.
+const ShutdownGrace = 5 * time.Second
 
-	go func() {
-		w.wg.Wait()
-		close(done)
-	}()
+// Flush stops accepting reports (later ones are dropped and counted),
+// then waits until every in-flight post has finished or timeout elapses,
+// and reports whether everything drained. Call it once after the last
+// report has been emitted. Posts are individually bounded by the HTTP
+// client timeout.
+func (w *Webhook) Flush(timeout time.Duration) bool {
+	w.closed.Store(true)
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
-	select {
-	case <-done:
-		return true
-	case <-timer.C:
-		w.log.Warn("webhook sink: flush timed out with posts still in flight", "timeout", timeout)
+	held := 0
 
-		return false
+	defer func() {
+		for ; held > 0; held-- {
+			<-w.sem
+		}
+	}()
+
+	for held < cap(w.sem) {
+		select {
+		case w.sem <- struct{}{}:
+			held++
+		case <-timer.C:
+			w.log.Warn("webhook sink: flush timed out with posts still in flight", "timeout", timeout)
+
+			return false
+		}
 	}
+
+	return true
 }
 
 // Dropped returns the count of webhook posts that failed to encode or
@@ -173,24 +201,54 @@ func (w *Webhook) ReportAdvisory(_ context.Context, a *advisory.Advisory) error 
 // dispatch acquires a slot in the in-flight semaphore and runs post on
 // a goroutine. When the cap is reached it drops the report rather than
 // queueing — better to lose a few records than to OOM the agent on a
-// stuck upstream.
+// stuck upstream — except after daemon shutdown began, when it waits for
+// a slot until ShutdownGrace past the cancel so final reports survive.
 func (w *Webhook) dispatch(body any) {
-	select {
-	case w.sem <- struct{}{}:
-	default:
+	if w.closed.Load() {
 		w.dropped.Add(1)
-		w.log.Warn("webhook sink: in-flight cap reached, dropping",
-			"cap", cap(w.sem))
+
 		return
 	}
 
-	w.wg.Add(1)
+	if !w.acquire() {
+		w.dropped.Add(1)
+		w.log.Warn("webhook sink: in-flight cap reached, dropping",
+			"cap", cap(w.sem))
+
+		return
+	}
 
 	go func() {
 		defer func() { <-w.sem }()
-		defer w.wg.Done()
 		w.post(body)
 	}()
+}
+
+func (w *Webhook) acquire() bool {
+	select {
+	case w.sem <- struct{}{}:
+		return true
+	default:
+	}
+
+	if w.parent.Err() == nil {
+		return false
+	}
+
+	deadline := time.Now().Add(ShutdownGrace)
+	if t := w.cancelledAt.Load(); t != nil {
+		deadline = t.Add(ShutdownGrace)
+	}
+
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+
+	select {
+	case w.sem <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 func (w *Webhook) post(body any) {

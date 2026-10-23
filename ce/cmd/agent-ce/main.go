@@ -240,7 +240,7 @@ func main() {
 	}
 }
 
-const webhookFlushTimeout = 5 * time.Second
+const webhookFlushTimeout = sinks.ShutdownGrace
 
 func parseLevel(v string) slog.Level {
 	switch strings.ToLower(v) {

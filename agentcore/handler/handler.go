@@ -1,6 +1,7 @@
 // Package handler processes container lifecycle events from the watcher,
-// pauses each container, fetches its policy, runs security checks, attaches
-// enforcement, and reports back. Edition-neutral: EE wires it with gRPC
+// freezes each container until enforcement is attached (see Freezer),
+// fetches its policy, runs security checks, attaches enforcement, and
+// reports back. Edition-neutral: EE wires it with gRPC
 // sinks, CE wires it with stdout/Prometheus/webhook sinks. The handler
 // itself never imports either edition's wire format.
 package handler
@@ -11,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"gitlab.com/leitwacht/leitwacht-agent/agentcore/advisory"
@@ -22,10 +24,11 @@ import (
 )
 
 const (
-	// handleStartTimeout bounds the pause-to-unpause window. If enforcement
-	// cannot be set up within this time (e.g., backend unreachable), the
-	// container is unpaused to avoid indefinite freezes that would trigger
-	// kubelet liveness probe failures or pod deadline expiry.
+	// handleStartTimeout bounds one HandleStart (policy lookup + attach).
+	// The freeze hold is bounded separately and independently of it (see
+	// Freezer): a container is never left frozen past
+	// max(FreezeTimeout, handleStartTimeout) + freezeHoldSlack, so a stuck
+	// handler cannot cause kubelet liveness failures or pod deadline expiry.
 	handleStartTimeout = 10 * time.Second
 )
 
@@ -105,15 +108,105 @@ type Handler struct {
 	Logger             *slog.Logger
 	DefaultAction      string
 	UnknownProjectMode UnknownProjectMode
+
+	// FreezeTimeout bounds how long HandleStart waits for the container's
+	// cgroup to report frozen. Zero means DefaultFreezeTimeout; negative
+	// disables the pre-attach freeze entirely (not recommended: the job
+	// then runs with unfiltered egress until attach completes).
+	FreezeTimeout time.Duration
+
+	// Freezer overrides the container freezer. Nil builds one lazily that
+	// uses the cgroup v2 freezer, falling back to the Watcher's pause API
+	// when the Watcher implements ContainerPauser.
+	Freezer *Freezer
+
+	freezerOnce      sync.Once
+	freezeWarnedOnce sync.Once
+	freezerResolved  *Freezer
 }
 
-// HandleStart processes a container start event: pauses the container to
-// prevent egress before enforcement is ready, fetches policy, runs security
-// checks, attaches enforcement, then unpauses.
+// freezer returns the configured or lazily built Freezer.
+func (h *Handler) freezer() *Freezer {
+	h.freezerOnce.Do(func() {
+		if h.Freezer != nil {
+			h.freezerResolved = h.Freezer
+
+			return
+		}
+
+		f := &Freezer{Logger: h.Logger}
+		if p, ok := h.Watcher.(ContainerPauser); ok {
+			f.Pauser = p
+		}
+
+		h.freezerResolved = f
+	})
+
+	return h.freezerResolved
+}
+
+// Shutdown releases every container still frozen. Call it before the
+// agent exits so no workload is left stopped.
+func (h *Handler) Shutdown() {
+	h.freezer().ThawAll()
+}
+
+// freezeBeforeAttach stops the container until enforcement is attached.
+// It returns a nil *Freeze (whose Thaw is a no-op) when no freeze is
+// needed or possible, and an error only when a freeze was attempted and
+// failed in a way the caller must act on. ErrFreezeUnavailable and
+// os.ErrNotExist (container already gone) are returned for the caller to
+// treat as "proceed unfrozen".
+func (h *Handler) freezeBeforeAttach(ctx context.Context, ev watcher.ContainerEvent) (*Freeze, error) {
+	if h.FreezeTimeout < 0 || ev.HasGVisor {
+		return nil, nil //nolint:nilnil // nil Freeze is a valid no-op handle
+	}
+
+	// K8s: the sandbox start event already attached egress at the pod
+	// cgroup and installed the DNS redirect before any container in the
+	// pod runs (Manager.AttachPodSandbox), so this container's first
+	// packet is filtered. Freezing would only add latency.
+	if h.Enforcer != nil && h.Enforcer.PodAttachedForPID(ev.PID) {
+		h.Logger.Debug("pod-level attach active, skipping pre-attach freeze", "container_id", truncID(ev.ContainerID))
+
+		return nil, nil //nolint:nilnil // nil Freeze is a valid no-op handle
+	}
+
+	var cgroupPath string
+
+	if h.Enforcer != nil && ev.PID > 0 {
+		if p, err := h.Enforcer.CgroupPathForPID(ev.PID); err == nil {
+			cgroupPath = enforcer.ScopeCgroup(p)
+		}
+	}
+
+	if cgroupPath == "" && ev.CgroupPath != "" {
+		cgroupPath = enforcer.ScopeCgroup(ev.CgroupPath)
+	}
+
+	z, err := h.freezer().Freeze(ctx, ev.ContainerID, cgroupPath, h.FreezeTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	return z, nil
+}
+
+// HandleStart processes a container start event: freezes the container so it
+// cannot egress before enforcement is ready, fetches policy, runs security
+// checks, attaches enforcement, then thaws it.
+//
+// Failure handling is fail-closed in block mode: if the freeze cannot be
+// confirmed or attach fails (other than the container having already
+// exited), the container is killed and an advisory with action "killed" is
+// sent. In audit mode the container is thawed and a "warned" advisory is
+// sent. The container is always thawed on return.
 //
 //nolint:funlen // orchestration handler with sequential security steps
 func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
-	// Bound the entire pause-to-unpause window to prevent indefinite container freezes.
+	// Bound policy lookup + attach. The freeze itself has its own hard
+	// limit (Freezer) so a wedged handler can never leave a container
+	// frozen.
 	ctx, cancel := context.WithTimeout(ctx, handleStartTimeout)
 	defer cancel()
 
@@ -122,6 +215,14 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 		"project", ev.ProjectPath,
 		"job_id", ev.JobID,
 	)
+
+	// Close the pre-attach window first: on Docker, Podman and plain
+	// containerd there is no pod sandbox, so without a freeze the job runs
+	// with unfiltered egress and no DNS redirect until policy lookup, eBPF
+	// load, nftables setup and cgroup attach finish. The deferred Thaw is
+	// the safety net for every early return below.
+	freeze, freezeErr := h.freezeBeforeAttach(ctx, ev)
+	defer freeze.Thaw()
 
 	// On K8s the build container's eBPF cgroup attach race is closed by
 	// the pod-sandbox attach path (HandlePodSandboxStart →
@@ -216,8 +317,10 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 	}
 
 	// Non-enrolled projects get DNS interception only — no security
-	// advisories, no container kills. Skip straight to attach.
+	// advisories, no container kills. Skip straight to attach. Nothing is
+	// enforced for them, so release the freeze first.
 	if passiveOnly {
+		freeze.Thaw()
 		h.attachSentinelOnly(ctx, ev, pol)
 
 		return
@@ -299,22 +402,101 @@ func (h *Handler) HandleStart(ctx context.Context, ev watcher.ContainerEvent) {
 			"warned")
 	}
 
-	_, attachErr := h.Enforcer.Attach(ctx, infoFromEvent(ev, pol), ev.PID, pol)
-	if attachErr != nil {
-		// Short-lived helper containers (e.g. GitLab Runner init containers) may exit
-		// before we can attach. Don't fire an advisory for these — the build container
-		// will start momentarily and attach successfully.
-		if errors.Is(attachErr, os.ErrNotExist) {
-			h.Logger.Debug("container exited before attach, skipping advisory", "container_id", truncID(ev.ContainerID))
-		} else {
-			h.Logger.Error("attach enforcement failed", "container_id", truncID(ev.ContainerID), "error", attachErr)
-			report(advisory.KindAttachFailure,
-				fmt.Sprintf("eBPF enforcement failed to attach: %s\n\n"+
-					"Fix: Ensure the host kernel supports eBPF (a maintained kernel current on its distro's security stream), the agent has CAP_SYS_ADMIN/CAP_BPF, "+
-					"and the container PID namespace is accessible. Check agent logs for details.", attachErr),
-				"warned")
-		}
+	// A freeze that was attempted and failed (timeout, write error) leaves
+	// the container in an unknown state with no confirmed window closure.
+	// "Unavailable" and "already gone" are not failures: there is nothing
+	// to hold, and attach below reports a vanished container itself.
+	if freezeErr != nil && !h.handleFreezeFailure(ctx, ev, pol, freezeErr, report) {
+		return
 	}
+
+	_, attachErr := h.Enforcer.Attach(ctx, infoFromEvent(ev, pol), ev.PID, pol)
+	if attachErr == nil {
+		freeze.Thaw()
+
+		return
+	}
+
+	// Short-lived helper containers (e.g. GitLab Runner init containers) may exit
+	// before we can attach. Don't fire an advisory for these — the build container
+	// will start momentarily and attach successfully.
+	if errors.Is(attachErr, os.ErrNotExist) {
+		h.Logger.Debug("container exited before attach, skipping advisory", "container_id", truncID(ev.ContainerID))
+
+		return
+	}
+
+	// A duplicate start event while the first attach is in flight: the
+	// first call owns the outcome (and the freeze).
+	if errors.Is(attachErr, enforcer.ErrAttachInProgress) {
+		h.Logger.Debug("attach already in progress, ignoring duplicate start", "container_id", truncID(ev.ContainerID))
+
+		return
+	}
+
+	h.Logger.Error("attach enforcement failed", "container_id", truncID(ev.ContainerID), "error", attachErr)
+
+	fix := "Fix: Ensure the host kernel supports eBPF (a maintained kernel current on its distro's security stream), the agent has CAP_SYS_ADMIN/CAP_BPF, " +
+		"and the container PID namespace is accessible. Check agent logs for details."
+
+	if errors.Is(attachErr, enforcer.ErrMaxConcurrent) {
+		fix = "Fix: Raise the maximum concurrent enforcement limit (LEITWACHT_CE_MAX_CONCURRENT) or reduce parallel jobs per node."
+	}
+
+	// Fail closed in block mode: a container that could not be put under
+	// enforcement must not run as if it were.
+	if pol.Action == policy.ActionBlock {
+		h.Logger.Error("enforcement not attached in block mode, killing container", "container_id", truncID(ev.ContainerID))
+		_ = h.Watcher.KillContainer(ctx, ev.ContainerID)
+
+		report(advisory.KindAttachFailure,
+			fmt.Sprintf("eBPF enforcement failed to attach — container killed (block mode): %s\n\n%s", attachErr, fix),
+			"killed")
+
+		return
+	}
+
+	report(advisory.KindAttachFailure,
+		fmt.Sprintf("eBPF enforcement failed to attach: %s\n\n%s", attachErr, fix),
+		"warned")
+}
+
+// handleFreezeFailure acts on a freeze error. It returns true when
+// HandleStart should continue to attach, false when the container was
+// dealt with (killed in block mode).
+func (h *Handler) handleFreezeFailure(
+	ctx context.Context, ev watcher.ContainerEvent, pol *policy.ResolvedPolicy,
+	freezeErr error, report func(advisory.Kind, string, string),
+) bool {
+	switch {
+	case errors.Is(freezeErr, os.ErrNotExist):
+		return true
+	case errors.Is(freezeErr, ErrFreezeUnavailable):
+		h.freezeWarnedOnce.Do(func() {
+			h.Logger.Warn("pre-attach freeze unavailable on this host; containers run unfiltered until attach completes",
+				"error", freezeErr)
+		})
+
+		return true
+	}
+
+	h.Logger.Error("pre-attach freeze failed", "container_id", truncID(ev.ContainerID), "error", freezeErr)
+
+	if pol.Action == policy.ActionBlock {
+		_ = h.Watcher.KillContainer(ctx, ev.ContainerID)
+
+		report(advisory.KindAttachFailure,
+			fmt.Sprintf("could not hold the container until enforcement attached — container killed (block mode): %s", freezeErr),
+			"killed")
+
+		return false
+	}
+
+	report(advisory.KindAttachFailure,
+		fmt.Sprintf("could not hold the container until enforcement attached; it may have run unfiltered briefly: %s", freezeErr),
+		"warned")
+
+	return true
 }
 
 // attachSentinelOnly attaches DNS interception with a no-rule audit-pass
@@ -377,7 +559,7 @@ func (h *Handler) HandlePodSandboxDie(_ context.Context, ev watcher.ContainerEve
 // HandleSiblingStart processes a sibling container start event (e.g., K8s
 // helper container). Sets up netns-level DNS infrastructure (proxy, nftables,
 // eBPF) so DNS queries are captured before the build container starts.
-// No pause, no policy fetch — runs in audit-all mode until the build container
+// No freeze, no policy fetch — runs in audit-all mode until the build container
 // joins and provides the real policy.
 func (h *Handler) HandleSiblingStart(_ context.Context, ev watcher.ContainerEvent) {
 	h.Logger.Info("sibling container start",

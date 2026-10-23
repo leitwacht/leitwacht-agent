@@ -258,6 +258,27 @@ func (w *Watcher) KillContainer(ctx context.Context, containerID string) error {
 	return nil
 }
 
+// PauseContainer freezes every process in the container via the runtime's
+// pause API. Fallback for hosts where the cgroup v2 freezer is not usable.
+func (w *Watcher) PauseContainer(ctx context.Context, containerID string) error {
+	err := w.client.ContainerPause(ctx, containerID)
+	if err != nil {
+		return fmt.Errorf("pause container %s: %w", truncID(containerID), err)
+	}
+
+	return nil
+}
+
+// UnpauseContainer reverses PauseContainer.
+func (w *Watcher) UnpauseContainer(ctx context.Context, containerID string) error {
+	err := w.client.ContainerUnpause(ctx, containerID)
+	if err != nil {
+		return fmt.Errorf("unpause container %s: %w", truncID(containerID), err)
+	}
+
+	return nil
+}
+
 // Close releases the Docker client connection.
 func (w *Watcher) Close() error {
 	return w.client.Close() //nolint:wrapcheck // pass through Docker client errors

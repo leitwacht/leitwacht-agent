@@ -487,6 +487,27 @@ func (w *ContainerdWatcher) KillContainer(ctx context.Context, containerID strin
 	return task.Kill(ctx, syscall.SIGKILL) //nolint:wrapcheck // pass through containerd errors
 }
 
+// PauseContainer freezes the container's task via containerd. Fallback for
+// hosts where the cgroup v2 freezer is not usable.
+func (w *ContainerdWatcher) PauseContainer(ctx context.Context, containerID string) error {
+	task, err := w.getTask(ctx, containerID)
+	if err != nil {
+		return err
+	}
+
+	return task.Pause(ctx) //nolint:wrapcheck // pass through containerd errors
+}
+
+// UnpauseContainer reverses PauseContainer.
+func (w *ContainerdWatcher) UnpauseContainer(ctx context.Context, containerID string) error {
+	task, err := w.getTask(ctx, containerID)
+	if err != nil {
+		return err
+	}
+
+	return task.Resume(ctx) //nolint:wrapcheck // pass through containerd errors
+}
+
 func (w *ContainerdWatcher) getTask(ctx context.Context, containerID string) (containerd.Task, error) {
 	container, err := w.client.LoadContainer(ctx, containerID)
 	if err != nil {

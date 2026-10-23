@@ -43,6 +43,12 @@ func containerScopeCgroup(cgroupPath string) string {
 	return cgroupPath
 }
 
+// ScopeCgroup is containerScopeCgroup for callers outside the package
+// (the handler's pre-attach freeze targets the same scope the egress
+// program attaches at, so every sub-cgroup the container creates is
+// covered).
+func ScopeCgroup(cgroupPath string) string { return containerScopeCgroup(cgroupPath) }
+
 var (
 	// ErrNetnsInodeZero is returned when the netns inode resolves to zero.
 	ErrNetnsInodeZero = errors.New("netns inode is zero")
@@ -314,6 +320,30 @@ func (m *Manager) Platform() Platform {
 // in block mode. CE wires this to kill the container; EE may quarantine.
 func (m *Manager) SetOnDNSViolation(fn func(cgroupID uint64, domain, action string)) {
 	m.onDNSViolation = fn
+}
+
+// CgroupPathForPID returns the cgroup v2 path of a process via the
+// platform (the kernel's view, not the runtime's spec).
+func (m *Manager) CgroupPathForPID(pid int) (string, error) {
+	return m.platform.GetCgroupPath(pid)
+}
+
+// PodAttachedForPID reports whether the pid's network namespace is
+// already covered by a pod-level egress attach (K8s sandbox path). Such
+// containers are enforced from their first packet, so the pre-attach
+// freeze is unnecessary for them.
+func (m *Manager) PodAttachedForPID(pid int) bool {
+	ino, err := m.platform.NetnsInode(pid)
+	if err != nil || ino == 0 {
+		return false
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	nctx := m.netnsContexts[ino]
+
+	return nctx != nil && nctx.podAttached
 }
 
 // ContainerIDForCgroup resolves a cgroup ID to a container ID by searching

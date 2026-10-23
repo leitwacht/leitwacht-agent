@@ -40,6 +40,7 @@ type Config struct {
 	MaxConcurrentEnf   int
 	EventBuffer        int           // size of the watcher's event channel; back-pressures containerd subscriptions when full
 	NetnsGrace         time.Duration // how long a netns context survives after its last container detaches
+	FreezeTimeout      time.Duration // pre-attach container freeze budget; 0 disables the freeze
 	BucketInterval     time.Duration
 
 	// Sinks.
@@ -203,6 +204,12 @@ func Load() (*Config, error) {
 	}
 	c.NetnsGrace = grace
 
+	freeze, err := envDuration("LEITWACHT_CE_FREEZE_TIMEOUT", 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	c.FreezeTimeout = freeze
+
 	wto, err := envDuration("LEITWACHT_CE_WEBHOOK_TIMEOUT", 5*time.Second)
 	if err != nil {
 		return nil, err
@@ -253,6 +260,9 @@ func (c *Config) Validate() error {
 	}
 	if c.NetnsGrace < 0 {
 		return fmt.Errorf("LEITWACHT_CE_NETNS_GRACE = %s (must be >= 0)", c.NetnsGrace)
+	}
+	if c.FreezeTimeout < 0 {
+		return fmt.Errorf("LEITWACHT_CE_FREEZE_TIMEOUT = %s (must be >= 0; 0 disables the pre-attach freeze)", c.FreezeTimeout)
 	}
 	if err := validateCIDRList(c.TrustedCIDRs); err != nil {
 		return fmt.Errorf("LEITWACHT_CE_TRUSTED_CIDRS: %w", err)

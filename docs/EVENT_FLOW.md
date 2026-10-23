@@ -201,9 +201,10 @@ mid-flush and the final bucket is lost. Either lower
 | `LEITWACHT_CE_EVENT_BUFFER`   | 64      | `event_channel_depth` pegged              | Memory pressure on tiny nodes |
 | `LEITWACHT_CE_MAX_CONCURRENT` | 64      | `ErrMaxConcurrent` in logs                | OOMKilled at scale (rare)    |
 | `LEITWACHT_CE_NETNS_GRACE`    | 30s     | "torn down after grace period" warnings   | nctx leaks; many `deferredTeardown` sleepers under churn |
+| `LEITWACHT_CE_FREEZE_TIMEOUT` | 5s      | "pre-attach freeze failed" in logs         | `0` disables the freeze (job runs unfiltered until attach completes) |
 | `LEITWACHT_CE_BUCKET_INTERVAL`| 5m      | Want fresher data in reports              | `DetachAll` shutdown wait too long for kubelet grace period |
 | `LEITWACHT_CE_DNS_UPSTREAM`   | (required) | n/a — no default, must be set explicitly | n/a |
-| `handleStartTimeout`          | 10s (constant) | Slow upstreams routinely time out  | n/a — bound exists to bound pause |
+| `handleStartTimeout`          | 10s (constant) | Slow upstreams routinely time out  | n/a — bounds policy lookup + attach; the freeze has its own hard limit |
 
 ## Why dispatch isn't fan-out
 
@@ -213,10 +214,13 @@ synchronous:
 1. **Ordering** — sandbox-then-container-then-die is invariant the
    eBPF cgroup-derivation logic depends on. A worker pool would
    require explicit per-pod serialisation.
-2. **Pause-window honesty** — `handleStartTimeout` bounds *the* pause
-   window. If 100 container starts arrive at once, processing them
+2. **Freeze-window honesty** — a container is frozen from the moment
+   its start event is *handled* until attach completes, bounded by a
+   hard limit. If 100 container starts arrive at once, processing them
    serially gives the operator a sharp signal (queue depth) instead of
-   100 simultaneously-paused containers.
+   100 simultaneously-frozen containers. Note the flip side: an event
+   waiting in the channel is not frozen yet, so a deep queue is also a
+   wider unfiltered window — alert on `event_channel_depth`.
 3. **Resource-exhaustion is observable** — the channel depth gauge
    *is* the load signal. Replace dispatch with a worker pool and the
    load signal becomes "average attach latency under contention",

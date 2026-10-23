@@ -160,6 +160,11 @@ func main() {
 		Logger:             log,
 		DefaultAction:      cfg.DefaultAction,
 		UnknownProjectMode: unknownMode,
+		FreezeTimeout:      cfg.FreezeTimeout,
+	}
+	if cfg.FreezeTimeout == 0 {
+		// Handler treats 0 as "default"; the operator's 0 means off.
+		h.FreezeTimeout = -1
 	}
 
 	wireCredwatchKill(mgr, w, multi, log)
@@ -489,6 +494,9 @@ func runEventLoop(
 		select {
 		case <-ctx.Done():
 			log.Info("shutting down, detaching enforcers")
+			// Release any container still held by the pre-attach freeze
+			// before enforcement goes away; never exit with a frozen job.
+			h.Shutdown()
 			mgr.StopCredwatch()
 			mgr.StopDNSPIDTracker()
 			mgr.StopProcMem()

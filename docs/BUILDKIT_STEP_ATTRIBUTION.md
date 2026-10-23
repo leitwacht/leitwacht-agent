@@ -24,7 +24,7 @@ instead of the current
 ## Background — why this matters
 
 Today the agent attaches eBPF egress filtering to buildkitd's cgroup
-and a per-job DNS proxy (see `agentcore/enforcer/buildkit.go`). That
+and a per-job DNS proxy (see `agentcore/enforcer/buildkit_egress_attach.go`). That
 correctly catches build-time egress and attributes it to the
 *GitLab job* whose `ReportViolations` is currently active. But it
 loses the structure *inside* the build:
@@ -111,10 +111,10 @@ shipping.
 ```
 agentcore/
 ├── enforcer/
-│   ├── buildkit.go              (existing — cgroup attach + DNS proxy)
+│   ├── buildkit_egress_attach.go (cgroup attach at the BuildKit cgroup parents, audit only)
 │   ├── buildkit_attribution.go  (NEW — Status subscriber + session registry)
-│   ├── buildkit_cgroup_join.go  (NEW — fanotify watcher + cmdline/environ tiebreaker)
-│   └── buildkit_test.go         (existing — extend)
+│   ├── buildkit_cgroup_join.go  (NEW — inotify watcher + argv/environ matching)
+│   └── buildkit_*_test.go
 └── violation/
     └── ...                      (emit BuildStep field on violation events)
 ```
@@ -209,11 +209,14 @@ proto version; run integration tests against real buildkitd in CI.
 ### Phase 2 — cgroup-to-vertex join (~1 week)
 
 - New file `agentcore/enforcer/buildkit_cgroup_join.go`.
-- fanotify on `/sys/fs/cgroup/.../buildkit/` (or
+- inotify on `/sys/fs/cgroup/.../buildkit/` (or
   `/sys/fs/cgroup/system.slice/buildkit-*.scope` under systemd).
-- On `FAN_CREATE`, read `cgroup.procs` → first PID → `/proc/<pid>/cmdline`.
-- Primary match: cmdline string vs `Vertex.name` substring of active
-  vertices.
+- On a directory create, read `cgroup.procs` → first PID → `/proc/<pid>/cmdline`.
+- Primary match: the process argv against the `RUN` command of each
+  active vertex. The match is exact on the whitespace-normalised
+  command (the `-c` argument for shell form, the joined argv for exec
+  form, with `RUN --mount=...`-style flags stripped from the vertex
+  name); a substring test is deliberately not used.
 - Tiebreaker: `/proc/<pid>/environ` vs session's FrontendAttrs.
 - Last-resort: kprobe on `runc execve` capturing bundle path.
 - Ambiguous attribution: emit with `ambiguous_vertices=[...]` rather
@@ -229,8 +232,9 @@ proto version; run integration tests against real buildkitd in CI.
 
 ### Phase 3 — wire attribution into the egress event path (~3 days)
 
-- In `agentcore/enforcer/buildkit.go`, where eBPF egress events are
-  enriched, look up the cgroup_id in the new buildkit registry.
+- In the ringbuf handler (`agentcore/enforcer/platform_linux.go`), where
+  eBPF egress events are enriched, look up the cgroup_id in the
+  buildkit registry (`LookupBuildKitBinding`).
 - If found, populate the `BuildStep` field on the outgoing Violation.
 - If not found (egress wasn't from a buildkit cgroup), leave unset —
   the field is optional.
@@ -269,6 +273,62 @@ review cycle.
 
 **Total estimate:** 4–5 weeks of focused work; 6–7 weeks accounting
 for parallel ops + customer-driven interrupts.
+
+## Operating behaviour and trust limits
+
+**The BuildKit egress attach is audit-only.** `BuildKitEgressAttach`
+always loads the egress program in audit mode with empty allow/deny
+maps: it observes and attributes, it never drops packets. The only
+enforcement in this subsystem is the cgroup kill described below.
+
+**Unbound events are reported, not dropped.** Egress from a watched
+BuildKit cgroup that the join layer has not bound to a session and
+vertex (no match yet, or none at all) is recorded with
+`build_unattributed: true` and no `build_*` identity. Consumers must
+not treat such rows as belonging to any build.
+
+**Kill policy is opt-in.** Cgroups are killed (`cgroup.kill`) only when
+the operator configured `requireCIMetadata` or at least one deny
+pattern. With either on:
+
+- a cgroup matched to an unauthorized session, or to a vertex matching a
+  deny pattern, is killed;
+- when several candidates match, the cgroup is killed if *any* candidate
+  is unauthorized or matches a deny pattern;
+- a cgroup that matches no authorized session by the end of the match
+  window (default 2s) is killed. Because matching is exact, RUN steps
+  whose command text BuildKit rewrites for display (for example
+  heredoc `RUN` bodies, or commands whose `ARG`/`ENV` references are
+  expanded in the vertex name) can fail to match and are killed under
+  an enforcing policy. With no policy configured a miss only leaves the
+  cgroup unbound.
+
+A session seen first through its Status stream (before its history
+record) is a placeholder; the joiner keeps retrying instead of acting on
+it until the history record supplies the session's attributes.
+
+**The CI attributes are self-asserted.** `LEITWACHT_CI_*` values arrive as
+build-args, which the build submitter controls. "Authorized" therefore
+means only that the required build-arg keys are present and non-empty,
+not that the build really belongs to the claimed project. Strong
+binding of a build to a CI job needs a signed CI identity token
+validated by the agent or server (future work). Likewise, nothing
+kernel-visible ties a runc cgroup to a particular BuildKit session; when
+several sessions run the same command the environ tiebreaker is
+best-effort and the remainder is reported as ambiguous.
+
+**Resilience.** The history subscriber backs off between reconnects and
+closes sessions absent from a reconnect replay; sessions that never
+complete are swept after `LEITWACHT_CE_BUILDKIT_MAX_SESSION_AGE`
+(default 6h). The inotify watcher blocks in `poll(2)` (no busy loop),
+rescans on queue overflow and re-establishes a lost watch. Bindings
+record their cgroup path and are re-verified against the cgroup inode on
+lookup, so a recycled inode never inherits a stale binding. The CE
+daemon restarts the joiner with backoff if it exits.
+
+**Logging.** Vertex names are Dockerfile text and can embed secrets, so
+the agent logs only the vertex digest and a short hash of the name
+(`vertex_name_hash`).
 
 ## What's explicitly out of scope for this branch
 

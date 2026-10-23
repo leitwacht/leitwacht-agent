@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -116,4 +117,132 @@ func TestWebhookCountsDroppedOnNon2xx(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Errorf("Dropped() = %d, want >=1 after 5xx response", sink.Dropped())
+}
+
+// TestWebhookDeliversAfterParentCancelAndFlush covers shutdown: the final
+// reports are emitted after the daemon context is cancelled and must still
+// reach the upstream; Flush waits for them.
+func TestWebhookDeliversAfterParentCancelAndFlush(t *testing.T) {
+	var got atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(150 * time.Millisecond) // still in flight when Flush starts
+		got.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	parent, cancel := context.WithCancel(context.Background())
+	sink := NewWebhook(parent, srv.URL, 2*time.Second, "node-1", "", slog.Default())
+
+	cancel()
+
+	for i := 0; i < 3; i++ {
+		sink.ReportAsync(parent, enforcer.ContainerInfo{ContainerID: "c1"}, &enforcer.EgressStats{}, false, time.Time{})
+	}
+
+	if !sink.Flush(3 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+
+	if n := got.Load(); n != 3 {
+		t.Fatalf("delivered %d posts after parent cancel, want 3 (dropped=%d)", n, sink.Dropped())
+	}
+}
+
+func TestWebhookFlushTimesOut(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+	}))
+
+	defer srv.Close()
+	defer close(release)
+
+	sink := NewWebhook(context.Background(), srv.URL, 5*time.Second, "node-1", "", slog.Default())
+	sink.ReportAsync(context.Background(), enforcer.ContainerInfo{}, nil, false, time.Time{})
+
+	if sink.Flush(50 * time.Millisecond) {
+		t.Fatal("Flush reported drained while a post was blocked")
+	}
+}
+
+// After the parent cancels, reports that find the cap full wait for a slot
+// instead of dropping.
+func TestWebhookWaitsForSlotAfterParentCancel(t *testing.T) {
+	var got atomic.Int64
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		got.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	parent, cancel := context.WithCancel(context.Background())
+	sink := NewWebhookWithLimits(parent, srv.URL, 2*time.Second, "n", "", 2, slog.Default())
+
+	cancel()
+	time.Sleep(20 * time.Millisecond) // let AfterFunc stamp the cancel time
+
+	for i := 0; i < 5; i++ {
+		sink.ReportAsync(parent, enforcer.ContainerInfo{}, nil, false, time.Time{})
+	}
+
+	if !sink.Flush(3 * time.Second) {
+		t.Fatal("Flush timed out")
+	}
+
+	if got.Load() != 5 || sink.Dropped() != 0 {
+		t.Fatalf("delivered=%d dropped=%d, want 5/0", got.Load(), sink.Dropped())
+	}
+}
+
+// Before cancel the cap still drops immediately.
+func TestWebhookDropsAtCapBeforeCancel(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { <-release }))
+
+	defer srv.Close()
+	defer close(release)
+
+	sink := NewWebhookWithLimits(context.Background(), srv.URL, 5*time.Second, "n", "", 1, slog.Default())
+	sink.ReportAsync(context.Background(), enforcer.ContainerInfo{}, nil, false, time.Time{})
+	sink.ReportAsync(context.Background(), enforcer.ContainerInfo{}, nil, false, time.Time{})
+
+	if sink.Dropped() != 1 {
+		t.Fatalf("dropped = %d, want 1", sink.Dropped())
+	}
+}
+
+// Dispatches racing or following Flush are dropped and counted, never panic.
+func TestWebhookDispatchAfterFlushCounted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	sink := NewWebhook(context.Background(), srv.URL, time.Second, "n", "", slog.Default())
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+			sink.ReportAsync(context.Background(), enforcer.ContainerInfo{}, nil, false, time.Time{})
+		}()
+	}
+
+	sink.Flush(time.Second)
+	wg.Wait()
+
+	before := sink.Dropped()
+
+	sink.ReportAsync(context.Background(), enforcer.ContainerInfo{}, nil, false, time.Time{})
+
+	if sink.Dropped() != before+1 {
+		t.Fatalf("post-flush report not counted: %d -> %d", before, sink.Dropped())
+	}
 }

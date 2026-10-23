@@ -27,7 +27,7 @@ scopes:
           pattern_type: wildcard
           action: allow
           ports: [443]
-        - pattern: "10.0.0.0/8"
+        - pattern: "10.0.0.1/32"
           pattern_type: cidr
           action: block
   - name: example/proj

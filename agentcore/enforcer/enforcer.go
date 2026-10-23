@@ -832,6 +832,14 @@ func collectIPRules(pol *policy.ResolvedPolicy, log *slog.Logger) (deny, allow [
 		}
 
 		for _, port := range ports {
+			// PackAllowKey truncates to uint16: 65979 would install as
+			// 443 and 65536 as 0 (any port). Skip rather than widen.
+			if port < 0 || port > 65535 {
+				log.Warn("skip ip rule port: out of range", "pattern", r.Pattern, "port", port)
+
+				continue
+			}
+
 			entry := ipRuleEntry{Key: ipRuleKey{IP: ip.String(), Port: port}, Prio: prio}
 
 			seen := seenAllow
@@ -854,6 +862,12 @@ func collectIPRules(pol *policy.ResolvedPolicy, log *slog.Logger) (deny, allow [
 	for _, dip := range pol.DenyIPs {
 		ip, ok := parseRuleIP(dip.IP, log)
 		if !ok || !ipv4Only(ip, dip.IP, log) {
+			continue
+		}
+
+		if dip.Port < 0 || dip.Port > 65535 {
+			log.Warn("skip deny ip: port out of range", "ip", dip.IP, "port", dip.Port)
+
 			continue
 		}
 

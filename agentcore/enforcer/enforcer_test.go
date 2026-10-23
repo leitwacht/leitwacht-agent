@@ -22,8 +22,11 @@ type fakePlatform struct {
 	bindErr          error
 	setupRedirectErr error
 	loadEBPFErr      error
-	netnsErr         error
-	attachCgroupErr  error
+	// failDenyEntry, when non-empty, makes AddDeniedIP fail for that
+	// "ip:port" entry.
+	failDenyEntry   string
+	netnsErr        error
+	attachCgroupErr error
 	// netnsByPID maps pid → netns inode. Tests use this to simulate
 	// pod-shared network namespaces. Pids missing from the map fall back
 	// to inode = uint64(pid), so each pid is its own netns by default.
@@ -150,6 +153,9 @@ func (h *fakeEBPFHandle) RemoveAllowedHost(ip net.IP, port int) error {
 
 func (h *fakeEBPFHandle) AddDeniedIP(ip net.IP, port int, prio uint32) error {
 	entry := fmt.Sprintf("%s:%d", ip, port)
+	if h.platform.failDenyEntry == entry {
+		return errors.New("fake: deny install failed") //nolint:err113 // test fake
+	}
 	h.platform.deniedIPs = append(removeEntry(h.platform.deniedIPs, entry), entry)
 	h.platform.recordPrio(entry, prio)
 	return nil
@@ -1485,5 +1491,57 @@ func TestAttachEnforcerRecordsScopeAndLeafCgroups(t *testing.T) {
 
 	if ids := (&procMemContainerState{CgroupID: 7}).allCgroupIDs(); len(ids) != 1 || ids[0] != 7 {
 		t.Fatalf("legacy single-id state: allCgroupIDs = %v", ids)
+	}
+}
+
+// TestBlockJoinerEnsuresSinkhole: on K8s the netns creator is PrepareNetns
+// with the audit placeholder, which tolerates a failed sinkhole seed. A
+// later block-mode joiner must re-seed it, or fail its attach when it cannot.
+func TestBlockJoinerEnsuresSinkhole(t *testing.T) {
+	sink := SinkholeIPv4 + ":0"
+	fp := &fakePlatform{
+		cgroupPath:    "/sys/fs/cgroup/test",
+		netnsByPID:    map[int]uint64{100: 6666, 101: 6666, 102: 6666, 103: 6666},
+		failDenyEntry: sink,
+	}
+	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr.NetnsGrace = 0
+
+	t.Cleanup(func() { mgr.DetachAll() })
+
+	ctx := context.Background()
+
+	// Audit placeholder creator tolerates the failed seed.
+	if err := mgr.PrepareNetns("helper0000000000", 100, "/sys/fs/cgroup/helper"); err != nil {
+		t.Fatalf("PrepareNetns must tolerate sinkhole failure in audit mode: %v", err)
+	}
+
+	if contains(fp.deniedIPs, sink) {
+		t.Fatal("sinkhole unexpectedly installed")
+	}
+
+	// Audit joiner proceeds.
+	if e, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "audit0000000000", ProjectPath: "p/x"}, 101, testPolicy("audit")); err != nil || e == nil {
+		t.Fatalf("audit attach should proceed: %v", err)
+	}
+
+	// Block joiner fails while the sinkhole cannot be installed.
+	if e, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "block0000000000", ProjectPath: "p/x"}, 102, testPolicy("block")); err == nil || e != nil {
+		t.Fatalf("block attach must fail without sinkhole, got e=%v err=%v", e, err)
+	}
+
+	if mgr.IsEnforced("block0000000000") {
+		t.Fatal("failed block attach left container enforced")
+	}
+
+	// Once installable, the block joiner re-seeds it and succeeds.
+	fp.failDenyEntry = ""
+
+	if e, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "block1111111111", ProjectPath: "p/x"}, 103, testPolicy("block")); err != nil || e == nil {
+		t.Fatalf("block attach should succeed after re-seed: %v", err)
+	}
+
+	if !contains(fp.deniedIPs, sink) {
+		t.Fatalf("sinkhole not re-seeded: %v", fp.deniedIPs)
 	}
 }

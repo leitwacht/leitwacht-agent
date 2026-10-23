@@ -541,6 +541,16 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 	m.mu.Lock()
 	ruleErr := m.addJoinerIPRules(nctx, info.ContainerID, pol)
 
+	// On K8s the netns is created by PrepareNetns with the audit
+	// placeholder, where a failed sinkhole seed is tolerated. A block-mode
+	// joiner must not run without it, so verify (re-seed) it here; failure
+	// fails the block-mode attach below like any other missed deny.
+	if pol.Action == policy.ActionBlock {
+		if sinkErr := m.ensureSinkholeDeny(nctx); sinkErr != nil && ruleErr == nil {
+			ruleErr = sinkErr
+		}
+	}
+
 	m.addNetnsMember(nctx, info.ContainerID, pol)
 
 	if !created {
@@ -1377,6 +1387,22 @@ func (m *Manager) seedSinkholeDeny(nctx *NetnsContext) error {
 	}
 
 	return nil
+}
+
+// ensureSinkholeDeny re-seeds the netns-owned sinkhole deny entry when it
+// is absent (e.g. the audit-mode creator tolerated a failed seed). Caller
+// must hold Manager.mu.
+func (m *Manager) ensureSinkholeDeny(nctx *NetnsContext) error {
+	sinkIP := net.ParseIP(SinkholeIPv4)
+	if sinkIP == nil {
+		return nil
+	}
+
+	if _, ok := nctx.denyOwners[ipRuleKey{IP: sinkIP.String(), Port: 0}][netnsOwner]; ok {
+		return nil
+	}
+
+	return m.seedSinkholeDeny(nctx)
 }
 
 //nolint:funlen // sequential setup + per-step timings, splitting obscures the rollback chain

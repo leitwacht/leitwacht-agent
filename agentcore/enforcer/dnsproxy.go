@@ -2,6 +2,8 @@
 package enforcer
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,6 +24,9 @@ var (
 	// ErrDockerDNSIDMismatch is returned when the Docker DNS upstream returns
 	// responses with mismatched IDs (stale packets from timed-out queries).
 	ErrDockerDNSIDMismatch = errors.New("docker dns: id mismatch after retries")
+	// ErrDNSQuestionMismatch is returned when an upstream reply does not
+	// echo the question that was asked.
+	ErrDNSQuestionMismatch = errors.New("dns reply question mismatch")
 )
 
 const (
@@ -31,6 +36,19 @@ const (
 	tcpReadTimeout  = 5 * time.Second
 	tcpWriteTimeout = 5 * time.Second
 	tcpMaxQueries   = 128
+
+	// maxInflightQueries bounds concurrently-processed queries per proxy.
+	// A job can fire packets as fast as it likes; beyond this the proxy
+	// answers SERVFAIL immediately instead of spawning unbounded work
+	// (goroutines, upstream sockets, log lines).
+	maxInflightQueries = 256
+
+	// maxUpstreamReads bounds how many non-matching datagrams one
+	// upstream exchange will skip before giving up.
+	maxUpstreamReads = 16
+
+	// upstreamFailLogInterval rate-limits the upstream-failure log line.
+	upstreamFailLogInterval = time.Second
 
 	// upstreamUDPSize is the UDP receive-buffer size for upstream
 	// responses. Without it the dns library defaults to MinMsgSize
@@ -103,6 +121,12 @@ type DNSProxyConfig struct {
 	// Nil means "no gating" (treated as ready) — preserves the prior
 	// behaviour for any caller that doesn't wire it.
 	EgressReady func() bool
+
+	// upstreamFailLast / upstreamFailSuppressed rate-limit the
+	// per-query upstream-failure log (unix nanos of the last emission,
+	// and how many lines were swallowed since).
+	upstreamFailLast       atomic.Int64
+	upstreamFailSuppressed atomic.Int64
 }
 
 // HandleDNSQuery processes a single DNS query under ordered-rule policy.
@@ -305,7 +329,7 @@ func forwardAndFilter(msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uin
 
 	resp, err := forwardQuery(msg, cfg)
 	if err != nil {
-		cfg.Logger.Error("upstream dns failed", "domain", qname, "error", err)
+		logUpstreamFailure(cfg, err)
 
 		return servfailResponse(msg), nil, false
 	}
@@ -315,9 +339,21 @@ func forwardAndFilter(msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uin
 		filtered []dns.RR
 	)
 
+	// Only A records owned by the queried name or by a name in its
+	// validated CNAME chain are trusted (returned and seeded). Anything
+	// else in the answer section is injected data, not an answer to this
+	// question.
+	chain := cnameChain(qname, resp.Answer)
+
 	for _, rr := range resp.Answer {
 		switch r := rr.(type) {
 		case *dns.A:
+			if !chain[canonicalName(r.Hdr.Name)] {
+				cfg.Logger.Debug("dropped out-of-chain A record")
+
+				continue
+			}
+
 			ips = append(ips, r.A.String())
 			capTTL(r.Header())
 
@@ -334,6 +370,57 @@ func forwardAndFilter(msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uin
 	resp.Answer = filtered
 
 	return resp, ips, true
+}
+
+// canonicalName lowercases a DNS name and strips the trailing root dot.
+func canonicalName(name string) string {
+	return strings.TrimSuffix(strings.ToLower(name), ".")
+}
+
+// cnameChain returns the set of owner names reachable from qname by
+// following CNAME records present in answers (qname itself included).
+func cnameChain(qname string, answers []dns.RR) map[string]bool {
+	chain := map[string]bool{canonicalName(qname): true}
+
+	for range len(answers) {
+		grew := false
+
+		for _, rr := range answers {
+			cn, ok := rr.(*dns.CNAME)
+			if !ok || !chain[canonicalName(cn.Hdr.Name)] {
+				continue
+			}
+
+			target := canonicalName(cn.Target)
+			if !chain[target] {
+				chain[target] = true
+				grew = true
+			}
+		}
+
+		if !grew {
+			break
+		}
+	}
+
+	return chain
+}
+
+// logUpstreamFailure logs an upstream failure at most once per
+// upstreamFailLogInterval, at Debug and without the queried name (which
+// is attacker-chosen), so a query flood cannot flood the log.
+func logUpstreamFailure(cfg *DNSProxyConfig, err error) {
+	now := time.Now().UnixNano()
+
+	last := cfg.upstreamFailLast.Load()
+	if now-last < int64(upstreamFailLogInterval) || !cfg.upstreamFailLast.CompareAndSwap(last, now) {
+		cfg.upstreamFailSuppressed.Add(1)
+
+		return
+	}
+
+	cfg.Logger.Debug("upstream dns failed", "error", err,
+		"suppressed", cfg.upstreamFailSuppressed.Swap(0))
 }
 
 // seedAllowMap adds the resolved IPs to the eBPF allow map on the given
@@ -380,13 +467,13 @@ func forwardQuery(msg *dns.Msg, cfg *DNSProxyConfig) (*dns.Msg, error) {
 
 	for _, upstream := range cfg.Upstreams {
 		resp, _, err := udpClient.Exchange(msg, upstream)
-		if err != nil {
+		if err != nil || !questionMatches(msg, resp) {
 			continue
 		}
 		// Retry over TCP if response was truncated.
 		if resp.Truncated {
 			tcpResp, _, tcpErr := tcpClient.Exchange(msg, upstream)
-			if tcpErr == nil {
+			if tcpErr == nil && questionMatches(msg, tcpResp) {
 				return tcpResp, nil
 			}
 			// Fall through to return the truncated UDP response.
@@ -395,12 +482,15 @@ func forwardQuery(msg *dns.Msg, cfg *DNSProxyConfig) (*dns.Msg, error) {
 		return resp, nil
 	}
 
-	return nil, fmt.Errorf("%w for %s", ErrAllUpstreamsFailed, msg.Question[0].Name)
+	return nil, fmt.Errorf("%w", ErrAllUpstreamsFailed)
 }
 
 // exchangeViaConn sends a DNS query over an existing UDP connection and reads
-// the response. Retries on ID mismatch to skip stale responses from prior
-// timed-out queries.
+// the response. The upstream socket lives in the job's netns, so the job can
+// race forged datagrams at it: the query goes out under a fresh random ID
+// (not the client's, which the job knows), and a reply is accepted only if it
+// carries that ID AND echoes the question. Non-matching datagrams are
+// skipped; the client's original ID is restored on the accepted reply.
 func exchangeViaConn(conn *net.UDPConn, msg *dns.Msg) (*dns.Msg, error) {
 	// UDPSize must be set or ReadMsg defaults to a 512-byte buffer and
 	// fails to parse larger upstream answers (see upstreamUDPSize).
@@ -411,23 +501,72 @@ func exchangeViaConn(conn *net.UDPConn, msg *dns.Msg) (*dns.Msg, error) {
 		return nil, fmt.Errorf("docker dns deadline: %w", deadlineErr)
 	}
 
-	writeErr := co.WriteMsg(msg)
+	upID, idErr := randomDNSID()
+	if idErr != nil {
+		return nil, fmt.Errorf("docker dns id: %w", idErr)
+	}
+
+	out := msg.Copy()
+	out.Id = upID
+
+	writeErr := co.WriteMsg(out)
 	if writeErr != nil {
 		return nil, fmt.Errorf("docker dns write: %w", writeErr)
 	}
 
-	for range 3 {
+	sawBadQuestion := false
+
+	for range maxUpstreamReads {
 		resp, readErr := co.ReadMsg()
 		if readErr != nil {
 			return nil, fmt.Errorf("docker dns read: %w", readErr)
 		}
 
-		if resp.Id == msg.Id {
-			return resp, nil
+		if resp.Id != upID {
+			continue
 		}
+
+		if !questionMatches(msg, resp) {
+			sawBadQuestion = true
+
+			continue
+		}
+
+		resp.Id = msg.Id
+
+		return resp, nil
+	}
+
+	if sawBadQuestion {
+		return nil, ErrDNSQuestionMismatch
 	}
 
 	return nil, ErrDockerDNSIDMismatch
+}
+
+// randomDNSID returns a cryptographically random 16-bit DNS message ID.
+func randomDNSID() (uint16, error) {
+	var b [2]byte
+
+	_, err := rand.Read(b[:])
+	if err != nil {
+		return 0, fmt.Errorf("read random: %w", err)
+	}
+
+	return binary.BigEndian.Uint16(b[:]), nil
+}
+
+// questionMatches reports whether resp echoes exactly the question of req
+// (name case-insensitively, type and class exactly).
+func questionMatches(req, resp *dns.Msg) bool {
+	if len(req.Question) != 1 || len(resp.Question) != 1 {
+		return false
+	}
+
+	rq, pq := req.Question[0], resp.Question[0]
+
+	return rq.Qtype == pq.Qtype && rq.Qclass == pq.Qclass &&
+		strings.EqualFold(rq.Name, pq.Name)
 }
 
 func capTTL(hdr *dns.RR_Header) {
@@ -555,6 +694,9 @@ type DNSProxy struct {
 	tcpListener net.Listener
 	wg          sync.WaitGroup
 
+	// sem bounds in-flight queries (see maxInflightQueries).
+	sem chan struct{}
+
 	// netnsCookie identifies the netns the proxy's bound sockets live
 	// in. Populated once in Start() via getsockopt(SO_NETNS_COOKIE) on
 	// udpConn and passed to LookupDNSPID for every query. Zero if the
@@ -567,7 +709,7 @@ type DNSProxy struct {
 
 // NewDNSProxy creates a proxy with the given config.
 func NewDNSProxy(cfg *DNSProxyConfig) *DNSProxy {
-	p := &DNSProxy{cfg: cfg}
+	p := &DNSProxy{cfg: cfg, sem: make(chan struct{}, maxInflightQueries)}
 	p.policy.Store(cfg.Policy)
 
 	return p
@@ -594,6 +736,16 @@ func (p *DNSProxy) Start(udpConn net.PacketConn, tcpListener net.Listener) {
 	p.netnsCookie = netnsCookieFromConn(udpConn, p.cfg.Logger)
 
 	handler := dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
+		select {
+		case p.sem <- struct{}{}:
+			defer func() { <-p.sem }()
+		default:
+			// Saturated: shed load rather than queue unbounded work.
+			_ = w.WriteMsg(servfailResponse(r))
+
+			return
+		}
+
 		var (
 			pid        uint32
 			comm       string

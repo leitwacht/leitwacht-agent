@@ -865,6 +865,12 @@ func collectIPRules(pol *policy.ResolvedPolicy, log *slog.Logger) (deny, allow [
 			continue
 		}
 
+		if dip.Port < 0 || dip.Port > 65535 {
+			log.Warn("skip deny ip: port out of range", "ip", dip.IP, "port", dip.Port)
+
+			continue
+		}
+
 		key := ipRuleKey{IP: ip.String(), Port: dip.Port}
 		if seenDeny[key] {
 			continue

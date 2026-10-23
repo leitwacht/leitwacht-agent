@@ -344,9 +344,23 @@ func seedAllowMap(cfg *DNSProxyConfig, ips []string, rulePorts []int, prio uint3
 		return
 	}
 
-	ports := rulePorts
-	if len(ports) == 0 {
+	ports := make([]int, 0, len(rulePorts))
+	for _, p := range rulePorts {
+		if p < 0 || p > 65535 { // PackAllowKey truncates to uint16
+			cfg.Logger.Warn("skip allow-map port: out of range", "port", p)
+
+			continue
+		}
+
+		ports = append(ports, p)
+	}
+
+	if len(rulePorts) == 0 {
 		ports = []int{443, 80}
+	}
+
+	if len(ports) == 0 {
+		return
 	}
 
 	for _, ipStr := range ips {

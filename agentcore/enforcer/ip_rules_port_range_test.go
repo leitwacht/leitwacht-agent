@@ -31,3 +31,13 @@ func TestCollectIPRulesSkipsOutOfRangePorts(t *testing.T) {
 		t.Fatalf("allow = %+v, want only ports 0 and 65535", allow)
 	}
 }
+
+func TestCollectIPRulesSkipsOutOfRangeDenyIPPorts(t *testing.T) {
+	pol := ipRulePolicy("block")
+	pol.DenyIPs = []policy.DenyIP{{IP: "192.0.2.1", Port: 65979}, {IP: "192.0.2.2", Port: 80}}
+
+	deny, _ := collectIPRules(pol, testLogger())
+	if len(deny) != 1 || deny[0].Key.Port != 80 {
+		t.Fatalf("deny = %+v, want only the in-range entry", deny)
+	}
+}

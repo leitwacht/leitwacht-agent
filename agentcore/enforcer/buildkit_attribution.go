@@ -85,6 +85,87 @@ type SessionRegistry struct {
 	// remove event would otherwise attribute a stranger's traffic to
 	// a stale binding. Nil disables the check.
 	statFn func(path string) (uint64, error)
+
+	// historyState records whether the history subscriber is feeding
+	// the registry: 0 = no watcher attached (unknown), 1 = connected,
+	// 2 = disconnected (registry is blind to new sessions).
+	historyState atomic.Int32
+}
+
+const (
+	historyUnknown int32 = iota
+	historyConnected
+	historyDisconnected
+)
+
+// SetHistoryConnected is called by the watcher: true once its stream
+// is established, false when the stream is down. While disconnected the
+// registry cannot see new sessions, so the joiner fails closed.
+func (r *SessionRegistry) SetHistoryConnected(connected bool) {
+	if connected {
+		r.historyState.Store(historyConnected)
+
+		return
+	}
+
+	r.historyState.Store(historyDisconnected)
+}
+
+// HistoryDisconnected reports whether a watcher is attached but its
+// stream is currently down.
+func (r *SessionRegistry) HistoryDisconnected() bool {
+	return r.historyState.Load() == historyDisconnected
+}
+
+// PolicyCandidates is the fail-closed view used when a cgroup matches
+// no vertex: every still-open session plus every pending RUN vertex.
+type PolicyCandidates struct {
+	// Risky is true when any open session is unauthorized or still a
+	// placeholder, or any pending vertex name matches a deny pattern.
+	Risky bool
+	// Vertices are all pending vertices of open sessions.
+	Vertices []PendingVertex
+}
+
+// PolicyCandidates snapshots the open sessions for the no-match path.
+func (r *SessionRegistry) PolicyCandidates() PolicyCandidates {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	var pc PolicyCandidates
+
+	for _, s := range r.sessions {
+		if s.Completed {
+			continue
+		}
+
+		if !s.Authorized || s.placeholder {
+			pc.Risky = true
+		}
+
+		for _, v := range s.Vertices {
+			if v.Completed || v.StartedAt.IsZero() {
+				continue
+			}
+
+			for _, p := range r.denyVertexPatterns {
+				if p.MatchString(v.Name) {
+					pc.Risky = true
+				}
+			}
+
+			pc.Vertices = append(pc.Vertices, PendingVertex{
+				SessionRef:    s.Ref,
+				VertexDigest:  v.Digest,
+				VertexName:    v.Name,
+				FrontendAttrs: cloneStringMap(s.FrontendAttrs),
+				Authorized:    s.Authorized,
+				Placeholder:   s.placeholder,
+			})
+		}
+	}
+
+	return pc
 }
 
 // defaultMaxSessionAge is the age after which a session still not
@@ -212,9 +293,9 @@ type SessionState struct {
 
 	Vertices map[string]*VertexState // keyed by digest
 
-	// registeredAt is the local time the registry first saw the
-	// session; drives the max-age sweep.
-	registeredAt time.Time
+	// lastActivity is the local time of the session's most recent
+	// registration or vertex update; drives the max-age sweep.
+	lastActivity time.Time
 
 	// placeholder is true for a session created from a Status event
 	// before its history STARTED record arrived. RegisterSession
@@ -305,6 +386,17 @@ func (r *SessionRegistry) EnforcementEnabled() bool {
 	defer r.mu.RUnlock()
 
 	return r.requireCIMetadata || len(r.denyVertexPatterns) > 0
+}
+
+// hasBindingForPath reports whether cgroupID already has a binding made
+// for exactly this cgroup path.
+func (r *SessionRegistry) hasBindingForPath(cgroupID uint64, cgroupPath string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	b, ok := r.cgroupIndex[cgroupID]
+
+	return ok && cgroupPath != "" && b.CgroupPath == cgroupPath
 }
 
 // LookupByCgroupID returns the binding for a cgroup, or false when
@@ -492,6 +584,15 @@ func (r *SessionRegistry) RegisterSession(ref string, startedAt time.Time, attrs
 	defer r.mu.Unlock()
 
 	if existing, exists := r.sessions[ref]; exists {
+		existing.lastActivity = time.Now()
+
+		if existing.Completed {
+			// A STARTED record for a session marked completed (lost or
+			// premature COMPLETE) reopens it.
+			existing.Completed = false
+			existing.CompletedAt = time.Time{}
+		}
+
 		if existing.placeholder {
 			existing.placeholder = false
 			existing.StartedAt = startedAt
@@ -508,7 +609,7 @@ func (r *SessionRegistry) RegisterSession(ref string, startedAt time.Time, attrs
 		FrontendAttrs: attrs,
 		Vertices:      make(map[string]*VertexState),
 		Authorized:    r.evaluateAuthorization(attrs),
-		registeredAt:  time.Now(),
+		lastActivity:  time.Now(),
 	}
 }
 
@@ -552,11 +653,13 @@ func (r *SessionRegistry) UpsertVertex(ref string, v VertexState) {
 			Ref:          ref,
 			Vertices:     make(map[string]*VertexState),
 			Authorized:   r.evaluateAuthorization(nil),
-			registeredAt: time.Now(),
+			lastActivity: time.Now(),
 			placeholder:  true,
 		}
 		r.sessions[ref] = s
 	}
+
+	s.lastActivity = time.Now()
 
 	existing, ok := s.Vertices[v.Digest]
 	if !ok {
@@ -606,7 +709,7 @@ func (r *SessionRegistry) Sweep(cutoff time.Time) int {
 
 	for ref, s := range r.sessions {
 		expired := s.Completed && s.CompletedAt.Before(cutoff)
-		aged := !s.Completed && !s.registeredAt.IsZero() && s.registeredAt.Before(ageCutoff)
+		aged := !s.Completed && !s.lastActivity.IsZero() && s.lastActivity.Before(ageCutoff)
 
 		if expired || aged {
 			delete(r.sessions, ref)
@@ -639,7 +742,7 @@ func (r *SessionRegistry) CloseSessionsNotIn(seen map[string]struct{}, cutoff ti
 			continue
 		}
 
-		if s.registeredAt.IsZero() || !s.registeredAt.Before(cutoff) {
+		if s.lastActivity.IsZero() || !s.lastActivity.Before(cutoff) {
 			continue
 		}
 
@@ -735,6 +838,7 @@ type historyConn struct {
 	mu       sync.Mutex
 	seen     map[string]struct{}
 	received atomic.Bool
+	start    time.Time
 }
 
 func newHistoryConn() *historyConn {
@@ -827,6 +931,10 @@ func NewAttributionWatcher(addr string, registry *SessionRegistry, logger *slog.
 func (w *AttributionWatcher) Run(ctx context.Context) error {
 	go w.sweepLoop(ctx)
 
+	// Until a stream is established the registry cannot see new
+	// sessions.
+	w.registry.SetHistoryConnected(false)
+
 	backoff := w.minBackoff
 
 	sleep := func() error {
@@ -862,13 +970,13 @@ func (w *AttributionWatcher) Run(ctx context.Context) error {
 		hc := newHistoryConn()
 		connCtx, cancelConn := context.WithCancel(ctx)
 		connStart := time.Now()
-
-		go w.closeUnreplayed(connCtx, hc, connStart)
+		hc.start = connStart
 
 		err = w.listenHistory(connCtx, client, hc)
 
 		cancelConn()
 		closeConn()
+		w.registry.SetHistoryConnected(false)
 
 		// Cancelled context propagates as ctx.Err; any other error
 		// triggers reconnect. listenHistory returns nil on a clean
@@ -878,7 +986,11 @@ func (w *AttributionWatcher) Run(ctx context.Context) error {
 			return ctx.Err()
 		}
 
-		if hc.received.Load() {
+		// A stream that delivered something, or simply stayed up longer
+		// than the maximum backoff (an idle ActiveOnly stream delivers
+		// nothing), was healthy: retry quickly.
+		healthy := streamWasHealthy(hc.received.Load(), time.Since(connStart), w.maxBackoff)
+		if healthy {
 			backoff = w.minBackoff
 		}
 
@@ -890,10 +1002,17 @@ func (w *AttributionWatcher) Run(ctx context.Context) error {
 			return sleepErr
 		}
 
-		if !hc.received.Load() {
+		if !healthy {
 			backoff = nextBackoff(backoff, w.maxBackoff)
 		}
 	}
+}
+
+// streamWasHealthy decides whether a finished history stream earns a
+// backoff reset: it delivered a message, or stayed up longer than the
+// maximum backoff (an idle ActiveOnly stream delivers nothing).
+func streamWasHealthy(received bool, lived, maxBackoff time.Duration) bool {
+	return received || lived > maxBackoff
 }
 
 // closeUnreplayed waits out the replay grace on a fresh connection and
@@ -958,6 +1077,19 @@ func (w *AttributionWatcher) listenHistory(ctx context.Context, client controlap
 	stream, err := client.ListenBuildHistory(ctx, &controlapi.BuildHistoryRequest{ActiveOnly: true})
 	if err != nil {
 		return fmt.Errorf("listen build history: %w", err)
+	}
+
+	// grpc.NewClient is lazy: a stream handle alone proves nothing. The
+	// header arrives only once the server has accepted the call, so
+	// only then is the registry's view live and the replay grace armed.
+	if _, err = stream.Header(); err != nil {
+		return fmt.Errorf("listen build history header: %w", err)
+	}
+
+	w.registry.SetHistoryConnected(true)
+
+	if hc != nil {
+		go w.closeUnreplayed(ctx, hc, hc.start)
 	}
 
 	for {

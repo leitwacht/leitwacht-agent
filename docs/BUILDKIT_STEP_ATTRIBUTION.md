@@ -295,13 +295,29 @@ pattern. With either on:
   deny pattern, is killed;
 - when several candidates match, the cgroup is killed if *any* candidate
   is unauthorized or matches a deny pattern;
-- a cgroup that matches no authorized session by the end of the match
-  window (default 2s) is killed. Because matching is exact, RUN steps
-  whose command text BuildKit rewrites for display (for example
-  heredoc `RUN` bodies, or commands whose `ARG`/`ENV` references are
-  expanded in the vertex name) can fail to match and are killed under
-  an enforcing policy. With no policy configured a miss only leaves the
-  cgroup unbound.
+- a cgroup that matches no vertex by the end of the match window
+  (default 2s) is judged against *every* open session instead of being
+  killed blindly. The candidate set is each pending `RUN` vertex of every
+  non-completed session. The cgroup is killed if any open session is
+  unauthorized or still a placeholder, if any pending vertex matches a
+  deny pattern, or if the history watcher is disconnected (the registry
+  cannot see new sessions). Otherwise it is bound as ambiguous over all
+  candidates, or left unbound when there are none. This keeps containers
+  that are not a `RUN` step, notably the `# syntax=` frontend gateway
+  container that runs under the same cgroup parent, from being killed
+  while every session is authorized, yet still kills them as soon as one
+  unauthorized session could own them. With no policy configured a miss
+  only leaves the cgroup unbound.
+
+Matching tolerates the legitimate forms where the vertex text and the
+process argv differ: exec-form `RUN ["npm","ci"]` (compared
+element-wise), heredoc bodies (summary against the script's first line),
+`$VAR` / `${VAR}` in the shell command (expanded in the vertex name, so
+treated as wildcards), and the shell replacing itself with the last
+command (`pip install` runs as `python3 /usr/local/bin/pip install`).
+Each widening can only over-match, which produces an ambiguous candidate
+set that the checks above treat fail-closed. A cgroup already bound is
+not re-judged when a rescan re-reports it.
 
 A session seen first through its Status stream (before its history
 record) is a placeholder; the joiner keeps retrying instead of acting on
@@ -318,9 +334,11 @@ several sessions run the same command the environ tiebreaker is
 best-effort and the remainder is reported as ambiguous.
 
 **Resilience.** The history subscriber backs off between reconnects and
-closes sessions absent from a reconnect replay; sessions that never
-complete are swept after `LEITWACHT_CE_BUILDKIT_MAX_SESSION_AGE`
-(default 6h). The inotify watcher blocks in `poll(2)` (no busy loop),
+closes sessions absent from a reconnect replay (the grace starts only
+once the stream is established, and a later STARTED record reopens a
+session); sessions with no activity are swept after
+`LEITWACHT_CE_BUILDKIT_MAX_SESSION_AGE` (default 6h, measured from the
+last registration or vertex update). The inotify watcher blocks in `poll(2)` (no busy loop),
 rescans on queue overflow and re-establishes a lost watch. Bindings
 record their cgroup path and are re-verified against the cgroup inode on
 lookup, so a recycled inode never inherits a stale binding. The CE

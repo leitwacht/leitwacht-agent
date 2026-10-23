@@ -34,6 +34,7 @@ const (
 	procMemMapKnownContainers     = "known_containers"
 	procMemMapPathBuf             = "path_buf"
 	procMemMapProcMemEvents       = "proc_mem_events"
+	procMemMapReserveFailures     = "reserve_failures"
 	procMemProgProcMemFileOpen    = "proc_mem_file_open"
 	procMemVarProcMemEventBtfHint = "__proc_mem_event_btf_hint"
 )

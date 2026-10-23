@@ -41,9 +41,14 @@ const (
 	credwatchMapCredwatchEvents       = "credwatch_events"
 	credwatchMapKnownContainers       = "known_containers"
 	credwatchMapPathBuf               = "path_buf"
+	credwatchMapReserveFailures       = "reserve_failures"
+	credwatchMapWatchedDirs           = "watched_dirs"
 	credwatchMapWatchedFilenames      = "watched_filenames"
+	credwatchMapWatchedPairs          = "watched_pairs"
 	credwatchMapWatchedSuffixes       = "watched_suffixes"
 	credwatchProgCredwatchFileOpen    = "credwatch_file_open"
+	credwatchProgCredwatchPathLink    = "credwatch_path_link"
+	credwatchProgCredwatchPathRename  = "credwatch_path_rename"
 	credwatchVarCredwatchEventBtfHint = "__credwatch_event_btf_hint"
 )
 

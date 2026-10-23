@@ -47,6 +47,7 @@ const (
 	dnspidMapProcessInfo       = "process_info"
 	dnspidProgDnsPidBprm       = "dns_pid_bprm"
 	dnspidProgDnsPidExec       = "dns_pid_exec"
+	dnspidProgDnsPidExit       = "dns_pid_exit"
 	dnspidProgDnsPidSendmsg    = "dns_pid_sendmsg"
 	dnspidProgDnsPidTcpConnect = "dns_pid_tcp_connect"
 )

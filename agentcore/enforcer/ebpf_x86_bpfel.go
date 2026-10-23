@@ -56,6 +56,7 @@ const (
 	ebpfMapDeniedIps        = "denied_ips"
 	ebpfMapDropDedup        = "drop_dedup"
 	ebpfMapDropEvents       = "drop_events"
+	ebpfMapReserveFailures  = "reserve_failures"
 	ebpfMapSockOwners       = "sock_owners"
 	ebpfMapStats            = "stats"
 	ebpfMapTrustedNets      = "trusted_nets"

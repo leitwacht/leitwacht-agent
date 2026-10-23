@@ -285,3 +285,34 @@ This means a domain-only rule set still catches IP-bypass attempts
 without any extra `deny_ips` configuration. See
 `agentcore/enforcer/integration_test.go::TestIntegrationBareIPBlocked`
 for the regression covering this case end-to-end.
+
+### DNS interception: what the job can and cannot bypass
+
+Port-53 traffic leaving the job's netns is redirected (nftables, `nat
+output`) to the agent's proxy on `127.0.0.1:15353`. In Docker mode the
+proxy forwards to Docker's embedded resolver (`127.0.0.11`) from a
+socket stamped with the agent's `SO_MARK`.
+
+- **Direct queries to the embedded resolver.** Docker's resolver also
+  listens on a random high port on `127.0.0.11`, and the egress program
+  allows loopback, so a job could query it there without touching the
+  proxy. A `filter output` chain (`docker_dns_guard`, after the NAT
+  chain) drops any unmarked packet to `127.0.0.11`, all ports, UDP and
+  TCP. Ordinary port-53 lookups are redirected before that chain and
+  are unaffected. There is no IPv6 variant: Docker does not expose an
+  IPv6 embedded resolver by default and the datapath is IPv4-only.
+- **Forged upstream replies.** The upstream socket lives in the job's
+  netns. Queries go out with a fresh random DNS ID, the reply must
+  echo that ID and the exact question, and only `A` records owned by
+  the queried name or its CNAME chain are returned and seeded into the
+  allow map. The client's original ID is restored on the reply.
+- **`CAP_NET_ADMIN` is unenforceable.** A container with
+  `CAP_NET_ADMIN` can set `SO_MARK` itself (skipping the redirect and
+  the guard above) or rewrite the nftables rules. The agent cannot stop
+  that; it logs a warning at attach when the container's effective
+  capabilities include it. Do not grant it to monitored workloads.
+- **Load shedding.** Each proxy handles at most 256 queries at once and
+  answers `SERVFAIL` beyond that. DNS evidence is capped per bucket
+  (resolved IPs per entry, entries per container); blocked/denied
+  entries have reserved headroom, and drops are counted
+  (`resolved_ips_dropped`, and the report's `overflow_count`).

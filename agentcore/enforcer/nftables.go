@@ -100,12 +100,79 @@ func setupDNSRedirect(conn *nftables.Conn) error {
 		Exprs: dnsRedirectExprs(unix.IPPROTO_TCP),
 	})
 
+	addEmbeddedResolverGuard(conn, table)
+
 	err := conn.Flush()
 	if err != nil {
 		return fmt.Errorf("nftables flush: %w", err)
 	}
 
 	return nil
+}
+
+// dockerResolverIP is Docker's embedded resolver address. It listens on a
+// random high port inside every container netns (the well-known :53 is a
+// DNAT the job's own resolver traverses), and the loopback allow in the
+// egress program would otherwise let a job query it directly, bypassing the
+// proxy.
+var dockerResolverIP = []byte{127, 0, 0, 11}
+
+// addEmbeddedResolverGuard drops any locally-generated packet destined to
+// 127.0.0.11 that does not carry agentMark.
+//
+// The chain sits at the default filter priority, AFTER the dns_redirect NAT
+// chain (dstnat, -100). Ordinary port-53 lookups to 127.0.0.11 have already
+// been rewritten to 127.0.0.1:15353 by then and no longer match; the proxy's
+// own upstream socket is SO_MARKed with agentMark and is accepted. What
+// remains (any other port) is a direct, unproxied query and is dropped.
+// Placing it before NAT would drop the redirectable port-53 lookups too.
+//
+// Docker does not expose an IPv6 embedded resolver by default and the egress
+// path is IPv4-only, so there is no ip6 equivalent. A container holding
+// CAP_NET_ADMIN can still set SO_MARK itself and bypass this (and the
+// redirect); see docs/EVENT_FLOW.md.
+func addEmbeddedResolverGuard(conn *nftables.Conn, table *nftables.Table) {
+	policyAccept := nftables.ChainPolicyAccept
+
+	chain := conn.AddChain(&nftables.Chain{
+		Name:     "docker_dns_guard",
+		Table:    table,
+		Type:     nftables.ChainTypeFilter,
+		Hooknum:  nftables.ChainHookOutput,
+		Priority: nftables.ChainPriorityFilter,
+		Policy:   &policyAccept,
+	})
+
+	conn.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{
+			// Marked traffic (the proxy's upstream) is allowed.
+			&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+			&expr.Cmp{
+				Op:       expr.CmpOpEq,
+				Register: 1,
+				Data:     binary.NativeEndian.AppendUint32(nil, agentMark),
+			},
+			&expr.Verdict{Kind: expr.VerdictReturn},
+		},
+	})
+
+	conn.AddRule(&nftables.Rule{
+		Table: table,
+		Chain: chain,
+		Exprs: []expr.Any{
+			// ip daddr 127.0.0.11 (any protocol, any port) -> drop.
+			&expr.Payload{
+				DestRegister: 1,
+				Base:         expr.PayloadBaseNetworkHeader,
+				Offset:       16, // IPv4 destination address
+				Len:          4,
+			},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: dockerResolverIP},
+			&expr.Verdict{Kind: expr.VerdictDrop},
+		},
+	})
 }
 
 // removeDNSRedirect removes the leitwacht nftables table.

@@ -117,6 +117,10 @@ func (r *SessionRegistry) HistoryDisconnected() bool {
 	return r.historyState.Load() == historyDisconnected
 }
 
+// placeholderRiskWindow is how long a placeholder session counts as
+// risky in its own right.
+const placeholderRiskWindow = 30 * time.Second
+
 // PolicyCandidates is the fail-closed view used when a cgroup matches
 // no vertex: every still-open session plus every pending RUN vertex.
 type PolicyCandidates struct {
@@ -139,7 +143,12 @@ func (r *SessionRegistry) PolicyCandidates() PolicyCandidates {
 			continue
 		}
 
-		if !s.Authorized || s.placeholder {
+		// A fresh placeholder has no real authorization decision yet. An
+		// old one is orphaned (its history record is not coming), so it
+		// falls back to the normal check on empty attributes instead of
+		// holding every build in kill mode until the age sweep.
+		freshPlaceholder := s.placeholder && time.Since(s.lastActivity) < placeholderRiskWindow
+		if !s.Authorized || freshPlaceholder {
 			pc.Risky = true
 		}
 

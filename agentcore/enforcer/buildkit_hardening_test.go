@@ -450,7 +450,7 @@ func TestCgroupJoiner_LegitimateRunFormsBindToTheirVertex(t *testing.T) {
 		{"exec form", `[s 1/1] RUN ["npm","ci"]`, "npm\x00ci\x00"},
 		{"exec form with resolved path", `[s 1/1] RUN ["npm", "ci"]`, "/usr/bin/npm\x00ci\x00"},
 		{"expanded ARG in vertex name", "[s 1/1] RUN echo hello-1.2", "/bin/sh\x00-c\x00echo hello-$VERSION\x00"},
-		{"heredoc", "[s 1/1] RUN <<EOF\nset -e\nmake\nEOF", "/bin/sh\x00-c\x00set -e\nmake\n\x00"},
+		{"heredoc", "[s 1/1] RUN <<EOF (set -e...)", "/bin/sh\x00-c\x00set -e\nmake\n\x00"},
 		{"exec-last-command optimisation", "[s 1/1] RUN pip install requests", "python3\x00/usr/local/bin/pip\x00install\x00requests\x00"},
 	}
 
@@ -785,11 +785,11 @@ func TestArgvMatchesRunLoose(t *testing.T) {
 		{"exec json mismatch", []string{"npm", "install"}, `["npm","ci"]`, false},
 		{"var braces", []string{"sh", "-c", "echo ${A}-${B}"}, "echo x-y", true},
 		{"var non-matching literal", []string{"sh", "-c", "echo $A"}, "rm -rf /", false},
-		{"heredoc summary", []string{"sh", "-c", "set -e\nmake all\n"}, "<<EOF\nset -e\nmake all\nEOF", true},
+		{"heredoc summary", []string{"sh", "-c", "set -e\nmake all\n"}, "<<EOF (set -e...)", true},
 		{"heredoc bare tag matches nothing", []string{"sh", "-c", "make\n"}, "<<EOF", false},
-		{"heredoc summary must equal first line", []string{"sh", "-c", "set -e && curl x\n"}, "<<EOF\nset -e\nEOF", false},
-		{"heredoc truncated summary is a prefix", []string{"sh", "-c", "set -e && make all\n"}, "<<EOF\nset -e && ma...", true},
-		{"heredoc different script", []string{"sh", "-c", "curl x | sh\n"}, "<<EOF\nset -e\nmake all\nEOF", false},
+		{"heredoc summary must equal first line", []string{"sh", "-c", "set -e && curl x\n"}, "<<EOF (set -e)", false},
+		{"heredoc truncated summary is a prefix", []string{"sh", "-c", "set -e && make all\n"}, "<<EOF (set -e && ma...)", true},
+		{"heredoc different script", []string{"sh", "-c", "curl x | sh\n"}, "<<EOF (set -e...)", false},
 		{"pip optimisation", []string{"python3", "/usr/local/bin/pip", "install", "x"}, "pip install x", true},
 		{"tail needs same args", []string{"python3", "/usr/local/bin/pip", "install", "y"}, "pip install x", false},
 		{"compound command not tail-matched", []string{"sh", "-c", "a && b"}, "b", false},
@@ -833,5 +833,25 @@ func TestAttributionWatcher_EnforcingCapsMaxBackoff(t *testing.T) {
 
 	if got := w.effectiveMaxBackoff(); got != enforcingMaxBackoff {
 		t.Fatalf("policy on: max backoff = %s, want %s", got, enforcingMaxBackoff)
+	}
+}
+
+func TestPolicyCandidates_StalePlaceholderNotRisky(t *testing.T) {
+	t.Parallel()
+
+	r := NewSessionRegistry(time.Minute)
+	r.SetBuildVertexDenyPatterns([]*regexp.Regexp{regexp.MustCompile(`never-matches`)})
+	r.UpsertVertex("orphan", VertexState{Digest: "d", Name: "RUN x", StartedAt: time.Unix(1, 0)})
+
+	if !r.PolicyCandidates().Risky {
+		t.Fatal("fresh placeholder must be risky")
+	}
+
+	r.mu.Lock()
+	r.sessions["orphan"].lastActivity = time.Now().Add(-time.Minute)
+	r.mu.Unlock()
+
+	if r.PolicyCandidates().Risky {
+		t.Fatal("orphaned placeholder must not keep the registry in kill mode")
 	}
 }

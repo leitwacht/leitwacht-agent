@@ -806,12 +806,17 @@ func execFormMatches(argv, elems []string) bool {
 
 var heredocTagRE = regexp.MustCompile(`^<<-?\s*["']?[A-Za-z_][A-Za-z0-9_]*["']?\s*`)
 
-// heredocMatches compares the heredoc summary in the vertex name (its
-// first body line) with the script's first line. Equality is required;
+// heredocMatches compares the heredoc summary in the vertex name (the
+// script's first line, wrapped in parentheses) with the script's first line. Equality is required;
 // a prefix is accepted only when the summary was truncated with "...".
 // A bare "<<EOF" with no summary matches nothing.
 func heredocMatches(script, runCmd string) bool {
 	head := firstNonEmptyLine(heredocTagRE.ReplaceAllString(runCmd, ""))
+	// BuildKit renders the summary as "<<EOF (<first line>...)".
+	if strings.HasPrefix(head, "(") && strings.HasSuffix(head, ")") {
+		head = strings.TrimSpace(head[1 : len(head)-1])
+	}
+
 	truncated := strings.HasSuffix(head, "...")
 	head = strings.TrimSpace(strings.TrimSuffix(head, "..."))
 

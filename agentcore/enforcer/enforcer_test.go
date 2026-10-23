@@ -130,7 +130,8 @@ func (h *fakeEBPFHandle) AddAllowedIP(ip net.IP, ports []int, _ uint32) error {
 
 func (h *fakeEBPFHandle) AddAllowedHost(ip net.IP, port int, prio uint32) error {
 	entry := fmt.Sprintf("%s:%d", ip, port)
-	h.platform.allowedHosts = append(h.platform.allowedHosts, entry)
+	// Map semantics: Put overwrites the key's value, it does not add a row.
+	h.platform.allowedHosts = append(removeEntry(h.platform.allowedHosts, entry), entry)
 	h.platform.recordPrio(entry, prio)
 	return nil
 }
@@ -147,7 +148,7 @@ func (h *fakeEBPFHandle) RemoveAllowedHost(ip net.IP, port int) error {
 
 func (h *fakeEBPFHandle) AddDeniedIP(ip net.IP, port int, prio uint32) error {
 	entry := fmt.Sprintf("%s:%d", ip, port)
-	h.platform.deniedIPs = append(h.platform.deniedIPs, entry)
+	h.platform.deniedIPs = append(removeEntry(h.platform.deniedIPs, entry), entry)
 	h.platform.recordPrio(entry, prio)
 	return nil
 }
@@ -358,13 +359,14 @@ func TestAttachMaxConcurrency(t *testing.T) {
 		t.Fatalf("first attach: %v", err)
 	}
 
-	// Second attach skipped (max concurrency = 1).
+	// Second attach is refused (max concurrency = 1) with an error, so a
+	// block-mode caller can fail closed instead of running unenforced.
 	e, err := mgr.Attach(ctx, ContainerInfo{ContainerID: "container-two2"}, 2, pol)
-	if err != nil {
-		t.Fatalf("second attach should not error: %v", err)
+	if !errors.Is(err, ErrMaxConcurrent) {
+		t.Fatalf("second attach error = %v, want ErrMaxConcurrent", err)
 	}
 	if e != nil {
-		t.Error("second attach should return nil (max concurrency)")
+		t.Error("second attach should return a nil enforcer (max concurrency)")
 	}
 }
 
@@ -383,13 +385,16 @@ func TestAttachDuplicateContainerSkipped(t *testing.T) {
 		t.Fatalf("first attach: %v", err)
 	}
 
-	// Second attach with same containerID is skipped (no leak).
+	first := mgr.enforcers[info.ContainerID]
+
+	// Second attach with same containerID returns the existing handle
+	// explicitly (no leak, no second enforcer).
 	e, err := mgr.Attach(ctx, info, 1, pol)
 	if err != nil {
 		t.Fatalf("duplicate should not error: %v", err)
 	}
-	if e != nil {
-		t.Error("duplicate should return nil")
+	if e == nil || e != first {
+		t.Errorf("duplicate should return the existing enforcer, got %p want %p", e, first)
 	}
 	if mgr.Count() != 1 {
 		t.Errorf("count = %d, want 1 (not 2)", mgr.Count())

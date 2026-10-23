@@ -48,6 +48,10 @@ var (
 	ErrNetnsInodeZero = errors.New("netns inode is zero")
 	// ErrMaxConcurrent is returned when the max concurrent enforcement limit is reached.
 	ErrMaxConcurrent = errors.New("max concurrent enforcement reached")
+	// ErrAttachInProgress is returned when a second Attach for the same
+	// container arrives while the first is still running. The first call
+	// owns the outcome; callers must not treat this as an attach failure.
+	ErrAttachInProgress = errors.New("attach already in progress for container")
 )
 
 // ReportFunc is the callback type for periodic bucket flush reports.
@@ -99,6 +103,19 @@ type NetnsContext struct {
 	// Protected by Manager.mu (same as refcount).
 	joinerDeny  map[string][]ipRuleKey // containerID -> entries
 	joinerAllow map[string][]ipRuleKey // containerID -> entries
+
+	// members lists the attached containers' policies in attach order;
+	// the effective DNS proxy policy and eBPF mode are the strictest of
+	// them (reconcileNetnsPolicy). Protected by Manager.mu.
+	members []netnsMember
+
+	// denyOwners / allowOwners refcount each map key across the
+	// containers sharing the netns (key -> owner -> priority). Two
+	// containers with an identical rule own the same key; the map value
+	// is the minimum priority across owners and the key is deleted only
+	// when the last owner leaves. Protected by Manager.mu.
+	denyOwners  ipOwners
+	allowOwners ipOwners
 
 	// projectInfo stores CI metadata from the first container that provides it
 	// (e.g., init-permissions). Siblings without CI_PROJECT_PATH inherit this
@@ -398,23 +415,35 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 
 	m.mu.Lock()
 
+	// A duplicate start event for a container that is already enforced is
+	// harmless: report the existing handle. A duplicate that arrives
+	// while the first Attach is still in flight has no handle yet and is
+	// reported as ErrAttachInProgress. Both are checked before the
+	// capacity limit so a re-delivered event never reads as "full".
+	if existing, exists := m.enforcers[info.ContainerID]; exists {
+		m.mu.Unlock()
+		m.logger.Warn("container already enforced, ignoring duplicate attach",
+			"container_id", truncID(info.ContainerID),
+		)
+
+		if existing == nil {
+			return nil, ErrAttachInProgress
+		}
+
+		return existing, nil
+	}
+
+	// Fail closed at capacity: returning (nil, nil) here used to leave
+	// the container running with no enforcement and no signal to the
+	// caller, which only logged on error.
 	if len(m.enforcers) >= m.maxConc {
 		m.mu.Unlock()
-		m.logger.Warn("max concurrent enforcement reached, skipping",
+		m.logger.Error("max concurrent enforcement reached, container not enforced",
 			"container_id", truncID(info.ContainerID),
 			"max", m.maxConc,
 		)
 
-		return nil, nil //nolint:nilnil // nil,nil signals "skip, no error"
-	}
-
-	if _, exists := m.enforcers[info.ContainerID]; exists {
-		m.mu.Unlock()
-		m.logger.Warn("container already enforced, skipping duplicate",
-			"container_id", truncID(info.ContainerID),
-		)
-
-		return nil, nil //nolint:nilnil // nil,nil signals "skip, no error"
+		return nil, fmt.Errorf("%w (%d)", ErrMaxConcurrent, m.maxConc)
 	}
 
 	m.enforcers[info.ContainerID] = nil
@@ -444,44 +473,30 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 	// reverse them. The sinkhole entry is netns-lifetime and was seeded
 	// once during initNetnsContext.
 	m.mu.Lock()
-	m.addJoinerIPRules(nctx, info.ContainerID, pol)
-	m.mu.Unlock()
+	ruleErr := m.addJoinerIPRules(nctx, info.ContainerID, pol)
+
+	m.addNetnsMember(nctx, info.ContainerID, pol)
 
 	if !created {
-		// Joiner-only: swap DNS proxy policy and flip eBPF mode if
-		// needed. Creator already installed both during initNetnsContext.
-		m.applyJoinerPolicy(info, nctx, pol)
+		// Joiner-only: reconcile the DNS proxy policy and eBPF mode
+		// against every attached member. Creator already installed both
+		// during initNetnsContext.
+		m.reconcileNetnsPolicy(nctx)
+	}
+	m.mu.Unlock()
+
+	// In block mode a deny that did not reach the datapath is a permitted
+	// destination the operator asked to block: fail the attach so the
+	// caller can refuse to run the container. Audit mode only observes.
+	if ruleErr != nil && pol.Action == policy.ActionBlock {
+		m.rollbackFailedAttach(info.ContainerID, nctx, created, netnsIno, releaseSlot)
+
+		return nil, ruleErr
 	}
 
 	e, attachErr := m.attachEnforcer(info, pid, pol, nctx)
 	if attachErr != nil {
-		releaseSlot()
-
-		// Reverse the IP rules installed above. Detach can't do it for
-		// us: releaseSlot has already dropped this container from
-		// m.enforcers, so Detach returns early and never reaches
-		// removeJoinerIPRules. Without this the entries outlive a
-		// container that was never enforced — and on the joiner path
-		// the netns survives, so a *sibling* would inherit this
-		// container's allow rules.
-		m.mu.Lock()
-		m.removeJoinerIPRules(nctx, info.ContainerID)
-		m.mu.Unlock()
-
-		// Creator owns the netns context: failed attachEnforcer means
-		// no other container is using it yet, so tear it down rather
-		// than leaving an orphan. Joiners share the context with at
-		// least one already-attached sibling, so leaving it alone is
-		// correct (the existing sibling keeps using it).
-		if created {
-			m.mu.Lock()
-			if netnsIno != 0 {
-				delete(m.netnsContexts, netnsIno)
-			}
-			m.mu.Unlock()
-
-			m.teardownNetnsContext(nctx)
-		}
+		m.rollbackFailedAttach(info.ContainerID, nctx, created, netnsIno, releaseSlot)
 
 		return nil, attachErr
 	}
@@ -491,34 +506,128 @@ func (m *Manager) Attach(_ context.Context, info ContainerInfo, pid int, pol *po
 	return e, nil
 }
 
-// applyJoinerPolicy reconciles a NetnsContext that was already
-// initialised by an earlier (audit-all) creator with the joiner's real
-// policy: swap the DNS proxy policy and flip eBPF mode if the action
-// differs. Deny-IP installation happens earlier in Attach (under
-// Manager.mu) so this function does not touch the deny map itself.
-func (m *Manager) applyJoinerPolicy(info ContainerInfo, nctx *NetnsContext, pol *policy.ResolvedPolicy) {
-	if nctx.dnsProxy != nil {
-		nctx.dnsProxy.UpdatePolicy(pol)
+// rollbackFailedAttach undoes a partially completed Attach: frees the
+// concurrency slot and reverses the IP rules installed for this
+// container. Detach can't do the latter — releaseSlot has already dropped
+// the container from m.enforcers, so Detach returns early and never
+// reaches removeJoinerIPRules. Without this the entries outlive a
+// container that was never enforced, and on the joiner path (the netns
+// survives) a sibling would inherit its allow rules.
+//
+// The creator owns the netns context: a failure means no other container
+// is using it yet, so tear it down rather than leaving an orphan.
+// Joiners share the context with at least one already-attached sibling,
+// so it is left alone.
+func (m *Manager) rollbackFailedAttach(
+	containerID string, nctx *NetnsContext, created bool, netnsIno uint64, releaseSlot func(),
+) {
+	releaseSlot()
+
+	m.mu.Lock()
+	m.removeJoinerIPRules(nctx, containerID)
+
+	if m.removeNetnsMember(nctx, containerID) && !created {
+		m.reconcileNetnsPolicy(nctx)
 	}
 
-	joinerAudit := pol.Action == policy.ActionAudit
-	if joinerAudit == nctx.auditMode.Load() {
+	if created && netnsIno != 0 {
+		delete(m.netnsContexts, netnsIno)
+	}
+	m.mu.Unlock()
+
+	if created {
+		m.teardownNetnsContext(nctx)
+	}
+}
+
+// netnsMember is one attached container's policy, in attach order.
+type netnsMember struct {
+	id  string
+	pol *policy.ResolvedPolicy
+}
+
+// policyStrictness ranks a member policy: 2 enforcing (block), 1 audit
+// with at least one rule, 0 passive (audit, no rules — helper and
+// non-enrolled sentinels).
+func policyStrictness(pol *policy.ResolvedPolicy) int {
+	switch {
+	case pol.Action != policy.ActionAudit:
+		return 2
+	case len(pol.RulesForJob("")) > 0 || len(pol.DenyIPs) > 0:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// addNetnsMember records a container's policy on the shared context.
+// Caller must hold Manager.mu.
+func (m *Manager) addNetnsMember(nctx *NetnsContext, containerID string, pol *policy.ResolvedPolicy) {
+	m.removeNetnsMember(nctx, containerID)
+	nctx.members = append(nctx.members, netnsMember{id: containerID, pol: pol})
+}
+
+// removeNetnsMember drops a container's policy from the shared context
+// and reports whether it was present. Caller must hold Manager.mu.
+func (m *Manager) removeNetnsMember(nctx *NetnsContext, containerID string) bool {
+	for i, mem := range nctx.members {
+		if mem.id == containerID {
+			nctx.members = append(nctx.members[:i], nctx.members[i+1:]...)
+
+			return true
+		}
+	}
+
+	return false
+}
+
+// reconcileNetnsPolicy points the shared DNS proxy and eBPF mode at the
+// strictest member policy. The datapath and proxy hold one mode per
+// netns, so the effective policy must never be weaker than any member
+// still attached: a passive or audit joiner can no longer flip an
+// enforcing pod to audit, and when the enforcing member leaves the
+// remaining members' policy takes over. Among equally strict members the
+// most recent joiner wins, which preserves the "real policy replaces the
+// helper's audit-all placeholder" behaviour. No-op with no members (the
+// context is on its way out). Caller must hold Manager.mu.
+func (m *Manager) reconcileNetnsPolicy(nctx *NetnsContext) {
+	var best *policy.ResolvedPolicy
+
+	bestRank := -1
+
+	for _, mem := range nctx.members {
+		if r := policyStrictness(mem.pol); r >= bestRank {
+			best, bestRank = mem.pol, r
+		}
+	}
+
+	if best == nil {
 		return
 	}
 
-	modeErr := nctx.ebpf.SetMode(joinerAudit)
+	if nctx.dnsProxy != nil {
+		nctx.dnsProxy.UpdatePolicy(best)
+	}
+
+	wantAudit := best.Action == policy.ActionAudit
+	if wantAudit == nctx.auditMode.Load() {
+		return
+	}
+
+	modeErr := nctx.ebpf.SetMode(wantAudit)
 	if modeErr != nil {
-		m.logger.Error("update ebpf mode on sibling join", "error", modeErr)
+		m.logger.Error("update ebpf mode on netns membership change", "error", modeErr)
 
 		return
 	}
 
 	// Store only after SetMode succeeds: the kernel and the ringbuf
 	// reader's view must not disagree on what mode is in effect.
-	nctx.auditMode.Store(joinerAudit)
-	m.logger.Info("ebpf mode updated on sibling join",
-		"container_id", truncID(info.ContainerID),
-		"audit", joinerAudit,
+	nctx.auditMode.Store(wantAudit)
+	m.logger.Info("ebpf mode updated on netns membership change",
+		"netns_inode", nctx.inode,
+		"audit", wantAudit,
+		"members", len(nctx.members),
 	)
 }
 
@@ -575,12 +684,20 @@ func (m *Manager) PrepareNetns(containerID string, pid int, cgroupPath string) e
 		return fmt.Errorf("init netns context: %w", err)
 	}
 
+	m.mu.Lock()
+	m.addNetnsMember(nctx, containerID, auditPol)
+	m.mu.Unlock()
+
 	e, attachErr := m.attachEnforcer(
 		ContainerInfo{ContainerID: containerID, CgroupPath: cgroupPath},
 		pid, auditPol, nctx,
 	)
 	if attachErr != nil {
 		releaseSlot()
+
+		m.mu.Lock()
+		m.removeNetnsMember(nctx, containerID)
+		m.mu.Unlock()
 
 		if created {
 			m.mu.Lock()
@@ -868,13 +985,113 @@ func collectIPRules(pol *policy.ResolvedPolicy, log *slog.Logger) (deny, allow [
 	return deny, allow
 }
 
+// netnsOwner is the pseudo-owner id under which netns-lifetime entries
+// (the DNS sinkhole) are registered in the ownership tables. No real
+// container id can collide with it.
+const netnsOwner = "\x00netns"
+
+// ipOwners tracks, per map key, which owners (container ids, or
+// netnsOwner) asked for the entry and at what priority. The datapath
+// holds one value per key, so with several owners the value installed
+// is the minimum priority across them, and the key is deleted only
+// when the last owner leaves. Protected by Manager.mu.
+type ipOwners map[ipRuleKey]map[string]uint32
+
+// minPrio returns the best (lowest) priority across owners.
+func minPrio(owners map[string]uint32) uint32 {
+	first := true
+
+	var best uint32
+
+	for _, p := range owners {
+		if first || p < best {
+			best = p
+			first = false
+		}
+	}
+
+	return best
+}
+
+// ownedPut registers (owner, prio) for key and writes min(prio) across
+// all owners via put. If the write fails the registration is rolled
+// back so the table never claims an install that did not happen.
+func (o ipOwners) ownedPut(key ipRuleKey, owner string, prio uint32, put func(prio uint32) error) error {
+	owners := o[key]
+	created := owners == nil
+
+	if created {
+		owners = make(map[string]uint32)
+		o[key] = owners
+	}
+
+	prev, hadPrev := owners[owner]
+	owners[owner] = prio
+
+	err := put(minPrio(owners))
+	if err == nil {
+		return nil
+	}
+
+	switch {
+	case hadPrev:
+		owners[owner] = prev
+	case created:
+		delete(o, key)
+	default:
+		delete(owners, owner)
+	}
+
+	return err
+}
+
+// ownedRemove drops owner from key. The entry is deleted from the map
+// only when no owner remains; otherwise the new minimum priority is
+// written back so a departing owner's better priority does not linger.
+func (o ipOwners) ownedRemove(key ipRuleKey, owner string, put func(prio uint32) error, del func() error) error {
+	owners := o[key]
+	if owners == nil {
+		return nil
+	}
+
+	oldMin := minPrio(owners)
+
+	delete(owners, owner)
+
+	if len(owners) == 0 {
+		delete(o, key)
+
+		return del()
+	}
+
+	if newMin := minPrio(owners); newMin != oldMin {
+		return put(newMin)
+	}
+
+	return nil
+}
+
+// ErrIPRuleInstall is returned by addJoinerIPRules when a deny entry
+// could not be written to the datapath.
+var ErrIPRuleInstall = errors.New("install ip deny rule")
+
 // addJoinerIPRules installs a joiner's IP allow and deny entries and
 // records ownership so they can be reversed at Detach. Caller must hold
 // Manager.mu (same lock as nctx.refcount / joinerDeny / joinerAllow).
 //
-// The sinkhole IP is seeded once per netns by seedSinkholeDeny — it is
-// not owned by any joiner and survives joiner detach.
-func (m *Manager) addJoinerIPRules(nctx *NetnsContext, containerID string, pol *policy.ResolvedPolicy) {
+// Entries are reference-counted per key across containers sharing the
+// netns: two containers contributing the same key both own it, the
+// lowest priority wins, and the entry survives until the last owner
+// detaches.
+//
+// A failed deny install is returned: a deny that is not in the map is
+// a silently permitted destination. A failed allow install is only
+// logged, because its failure mode is a spurious drop.
+//
+// The sinkhole IP is seeded once per netns by seedSinkholeDeny under
+// the netnsOwner id — it is not owned by any joiner and survives
+// joiner detach.
+func (m *Manager) addJoinerIPRules(nctx *NetnsContext, containerID string, pol *policy.ResolvedPolicy) error {
 	if nctx.joinerDeny == nil {
 		nctx.joinerDeny = make(map[string][]ipRuleKey)
 	}
@@ -883,7 +1100,17 @@ func (m *Manager) addJoinerIPRules(nctx *NetnsContext, containerID string, pol *
 		nctx.joinerAllow = make(map[string][]ipRuleKey)
 	}
 
+	if nctx.denyOwners == nil {
+		nctx.denyOwners = make(ipOwners)
+	}
+
+	if nctx.allowOwners == nil {
+		nctx.allowOwners = make(ipOwners)
+	}
+
 	denyEntries, allowEntries := collectIPRules(pol, m.logger)
+
+	var denyErr error
 
 	addedDeny := nctx.joinerDeny[containerID][:0]
 
@@ -893,8 +1120,15 @@ func (m *Manager) addJoinerIPRules(nctx *NetnsContext, containerID string, pol *
 			continue
 		}
 
-		if err := nctx.ebpf.AddDeniedIP(ip, e.Key.Port, e.Prio); err != nil {
+		err := nctx.denyOwners.ownedPut(e.Key, containerID, e.Prio, func(prio uint32) error {
+			return nctx.ebpf.AddDeniedIP(ip, e.Key.Port, prio)
+		})
+		if err != nil {
 			m.logger.Warn("add joiner deny", "container", containerID, "ip", e.Key.IP, "port", e.Key.Port, "error", err)
+
+			if denyErr == nil {
+				denyErr = fmt.Errorf("%w %s:%d: %w", ErrIPRuleInstall, e.Key.IP, e.Key.Port, err)
+			}
 
 			continue
 		}
@@ -916,7 +1150,10 @@ func (m *Manager) addJoinerIPRules(nctx *NetnsContext, containerID string, pol *
 		// the map is bounded and non-evicting, so the only realistic
 		// cause is exhaustion, and the symptom is a destination the
 		// operator explicitly permitted getting dropped.
-		if err := nctx.ebpf.AddAllowedHost(ip, e.Key.Port, e.Prio); err != nil {
+		err := nctx.allowOwners.ownedPut(e.Key, containerID, e.Prio, func(prio uint32) error {
+			return nctx.ebpf.AddAllowedHost(ip, e.Key.Port, prio)
+		})
+		if err != nil {
 			m.logger.Error("add joiner ip allow", "container", containerID, "ip", e.Key.IP, "port", e.Key.Port, "error", err)
 
 			continue
@@ -926,11 +1163,15 @@ func (m *Manager) addJoinerIPRules(nctx *NetnsContext, containerID string, pol *
 	}
 
 	nctx.joinerAllow[containerID] = addedAllow
+
+	return denyErr
 }
 
 // removeJoinerIPRules reverses addJoinerIPRules. Idempotent: called on
 // Detach for every container, including those that never added any
-// entries. Caller must hold Manager.mu.
+// entries. A key shared with another container stays in the map (with
+// the remaining owners' best priority); only the last owner's removal
+// deletes it. Caller must hold Manager.mu.
 func (m *Manager) removeJoinerIPRules(nctx *NetnsContext, containerID string) {
 	for _, k := range nctx.joinerDeny[containerID] {
 		ip := net.ParseIP(k.IP)
@@ -938,7 +1179,11 @@ func (m *Manager) removeJoinerIPRules(nctx *NetnsContext, containerID string) {
 			continue
 		}
 
-		if err := nctx.ebpf.RemoveDeniedIP(ip, k.Port); err != nil {
+		err := nctx.denyOwners.ownedRemove(k, containerID,
+			func(prio uint32) error { return nctx.ebpf.AddDeniedIP(ip, k.Port, prio) },
+			func() error { return nctx.ebpf.RemoveDeniedIP(ip, k.Port) },
+		)
+		if err != nil {
 			m.logger.Warn("remove joiner deny", "container", containerID, "ip", k.IP, "port", k.Port, "error", err)
 		}
 	}
@@ -951,7 +1196,11 @@ func (m *Manager) removeJoinerIPRules(nctx *NetnsContext, containerID string) {
 			continue
 		}
 
-		if err := nctx.ebpf.RemoveAllowedHost(ip, k.Port); err != nil {
+		err := nctx.allowOwners.ownedRemove(k, containerID,
+			func(prio uint32) error { return nctx.ebpf.AddAllowedHost(ip, k.Port, prio) },
+			func() error { return nctx.ebpf.RemoveAllowedHost(ip, k.Port) },
+		)
+		if err != nil {
 			m.logger.Warn("remove joiner ip allow", "container", containerID, "ip", k.IP, "port", k.Port, "error", err)
 		}
 	}
@@ -962,15 +1211,25 @@ func (m *Manager) removeJoinerIPRules(nctx *NetnsContext, containerID string) {
 // seedSinkholeDeny installs the always-present sinkhole IP into a
 // freshly-loaded eBPF map. The sinkhole (192.0.2.1) is where the DNS
 // proxy points blocked A responses; connect attempts to it get dropped
-// and tagged as sinkhole_hit. Owned by the netns lifetime, not by any
-// joiner — survives sibling detach.
-func (m *Manager) seedSinkholeDeny(handle EBPFHandle) {
+// and tagged as sinkhole_hit. Owned by the netns lifetime (netnsOwner),
+// not by any joiner — survives sibling detach, and a joiner rule for
+// the same key can neither lower nor delete it.
+func (m *Manager) seedSinkholeDeny(nctx *NetnsContext) {
 	sinkIP := net.ParseIP(SinkholeIPv4)
 	if sinkIP == nil {
 		return
 	}
 
-	if err := handle.AddDeniedIP(sinkIP, 0, policy.SystemRulePriority); err != nil {
+	if nctx.denyOwners == nil {
+		nctx.denyOwners = make(ipOwners)
+	}
+
+	key := ipRuleKey{IP: sinkIP.String(), Port: 0}
+
+	err := nctx.denyOwners.ownedPut(key, netnsOwner, policy.SystemRulePriority, func(prio uint32) error {
+		return nctx.ebpf.AddDeniedIP(sinkIP, 0, prio)
+	})
+	if err != nil {
 		m.logger.Warn("seed sinkhole deny", "error", err)
 	}
 }
@@ -1002,7 +1261,7 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 	// joiner-owned. Joiner-specific deny IPs (including the creator's
 	// own) are installed separately via addJoinerIPRules so Detach can
 	// reverse them.
-	m.seedSinkholeDeny(ebpfHandle)
+	m.seedSinkholeDeny(nctx)
 
 	// Step 2: Bind sockets inside the container netns.
 	stepStart = time.Now()
@@ -1587,6 +1846,13 @@ func (m *Manager) Detach(containerID string) *DetachResult {
 	// under m.mu (same lock that guards joinerDeny). The sinkhole entry
 	// is owned by the netns lifetime and survives.
 	m.removeJoinerIPRules(nctx, containerID)
+
+	// Recompute the strictest-member policy so a departing enforcing
+	// member does not leave its siblings under its mode (or a departing
+	// audit member leave them weaker than the survivors require).
+	if m.removeNetnsMember(nctx, containerID) {
+		m.reconcileNetnsPolicy(nctx)
+	}
 
 	// When refcount hits 0, don't tear down immediately — sibling containers
 	// (e.g., build after init-permissions) may join within seconds. Keep the

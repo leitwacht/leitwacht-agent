@@ -1,6 +1,9 @@
 package enforcer
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // CredwatchEvent is the Go-side representation of a BPF credential file access detection event.
 type CredwatchEvent struct {
@@ -123,4 +126,44 @@ func (s *credwatchContainerState) allCgroupIDs() []uint64 {
 	}
 
 	return []uint64{s.CgroupID}
+}
+
+// credwatchOverlap names a report-only suffix that ends with a distinct
+// watched suffix.
+type credwatchOverlap struct {
+	ReportOnly string
+	Watched    string
+}
+
+// reportOnlyWatchedOverlaps finds report-only suffixes that end with a
+// different, still-active watched suffix (e.g. report-only
+// "/.aws/credentials" vs watched "/credentials"). Opens follow the
+// longest suffix (report-only: allowed), but rename/link of the file
+// resolve through the name-only watched key and are denied, which is
+// rarely what the operator meant.
+func reportOnlyWatchedOverlaps(watched, reportOnly, excluded []string) []credwatchOverlap {
+	skip := make(map[string]struct{}, len(excluded)+len(reportOnly))
+	for _, p := range excluded {
+		skip[p] = struct{}{}
+	}
+
+	for _, p := range reportOnly {
+		skip[p] = struct{}{}
+	}
+
+	var out []credwatchOverlap
+
+	for _, r := range reportOnly {
+		for _, w := range watched {
+			if _, s := skip[w]; s || w == r {
+				continue
+			}
+
+			if strings.HasSuffix(r, w) {
+				out = append(out, credwatchOverlap{ReportOnly: r, Watched: w})
+			}
+		}
+	}
+
+	return out
 }

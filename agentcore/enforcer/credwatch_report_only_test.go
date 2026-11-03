@@ -165,3 +165,22 @@ func TestBuildWatchClassesNoDowngradeReverseOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestReportOnlyWatchedOverlaps(t *testing.T) {
+	got := reportOnlyWatchedOverlaps(
+		[]string{"/credentials", "/.docker/config.json", "/other", "/gone"},
+		[]string{"/.aws/credentials", "/.docker/config.json", "/.npmrc"},
+		[]string{"/gone"})
+	if len(got) != 1 || got[0].ReportOnly != "/.aws/credentials" || got[0].Watched != "/credentials" {
+		t.Fatalf("overlaps = %+v", got)
+	}
+
+	if got = reportOnlyWatchedOverlaps([]string{"/.aws/credentials"}, []string{"/.npmrc"}, nil); len(got) != 0 {
+		t.Fatalf("unexpected overlaps %+v", got)
+	}
+
+	// Watched suffix excluded or itself report-only: no warning.
+	if got = reportOnlyWatchedOverlaps([]string{"/credentials"}, []string{"/.aws/credentials"}, []string{"/credentials"}); len(got) != 0 {
+		t.Fatalf("excluded watched must not warn: %+v", got)
+	}
+}

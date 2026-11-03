@@ -487,6 +487,11 @@ func (m *Manager) StartCredwatch() error {
 		return fmt.Errorf("populate credwatch path maps: %w", err)
 	}
 
+	for _, o := range reportOnlyWatchedOverlaps(m.credwatchCfg.WatchedPaths, m.credwatchCfg.ReportOnlyPaths, m.credwatchCfg.ExcludedPaths) {
+		m.logger.Warn("credwatch: report-only suffix ends with a watched suffix: opens are allowed (longest suffix wins) but rename/link are denied",
+			"report_only", o.ReportOnly, "watched", o.Watched)
+	}
+
 	stop, err := startCredwatchReader(objs, m.logger, m.handleCredwatchBPFEvent)
 	if err != nil {
 		lsm.Close()

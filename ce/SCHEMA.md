@@ -106,7 +106,10 @@ Override with `LEITWACHT_CE_CREDWATCH_PATHS` (watched),
 of path suffixes and an unset variable keeps the default. A suffix listed
 as report-only is not watched even if it also appears in the watched list
 (and an excluded suffix is neither). When two different suffixes match
-one path, the longest (most specific) one decides.
+one path, the longest (most specific) one decides. A report-only suffix
+that ends with a watched one (e.g. report-only `/.aws/credentials`, watched
+`/credentials`) has its opens allowed but its rename/link denied; the agent
+logs a startup warning for it.
 `off` mode and the `leitwacht.io/allow-cred-read` label still suppress
 events entirely.
 

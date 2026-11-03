@@ -8,11 +8,17 @@ import (
 // CredwatchEvent is the Go-side representation of a BPF credential file access detection event.
 type CredwatchEvent struct {
 	ContainerID string
-	CgroupID    uint64
-	PID         uint32
-	Comm        string
-	Path        string
-	TimestampNs int64
+	// CgroupID is the cgroup of the task that triggered the event (its
+	// leaf cgroup). ContainerCgroupID is the registered container
+	// cgroup the task belongs to; it differs from CgroupID when the
+	// task sits in a descendant cgroup (e.g. one a privileged job
+	// created). Trust decisions should key on ContainerCgroupID.
+	CgroupID          uint64
+	ContainerCgroupID uint64
+	PID               uint32
+	Comm              string
+	Path              string
+	TimestampNs       int64
 	// Reason says which hook produced the event: "open",
 	// "rename", "link" or "dpath_fail" (open of a watched name whose full
 	// path could not be resolved).
@@ -50,7 +56,7 @@ type CredwatchConfig struct {
 	ExcludedPaths []string
 }
 
-// credwatchEventBPF matches the BPF struct credwatch_event (packed, 165 bytes).
+// credwatchEventBPF matches the BPF struct credwatch_event (packed, 173 bytes).
 type credwatchEventBPF struct {
 	CgroupID    uint64
 	PID         uint32
@@ -58,6 +64,9 @@ type credwatchEventBPF struct {
 	Path        [128]byte
 	TimestampNs uint64
 	Kind        uint8
+	// ContainerCgroupID is appended in ABI v2: the registered container
+	// cgroup matched by the LSM (leaf or ancestor).
+	ContainerCgroupID uint64
 }
 
 // credwatchContainerState tracks cgroup ID for a container in the credwatch LSM.
@@ -79,7 +88,7 @@ const (
 )
 
 // credwatchEventSize is the expected packed size of struct credwatch_event in BPF bytecode.
-const credwatchEventSize = 165
+const credwatchEventSize = 173
 
 // credwatch_event.kind values (CW_KIND_* in credwatch.c).
 const (

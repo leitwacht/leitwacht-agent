@@ -5,11 +5,15 @@ import "time"
 // ProcMemEvent is the Go-side representation of a BPF /proc/*/mem read detection event.
 type ProcMemEvent struct {
 	ContainerID string
-	CgroupID    uint64
-	PID         uint32
-	Comm        string
-	Path        string
-	TimestampNs int64
+	// CgroupID is the triggering task's own (leaf) cgroup;
+	// ContainerCgroupID is the registered container cgroup it belongs
+	// to (differs for tasks in descendant cgroups).
+	CgroupID          uint64
+	ContainerCgroupID uint64
+	PID               uint32
+	Comm              string
+	Path              string
+	TimestampNs       int64
 	// ObserveOnly mirrors the per-container FLAG_OBSERVE_ONLY bit the
 	// BPF program was configured with. When true, the BPF program
 	// emitted this event but DID NOT deny the open — the userspace
@@ -22,13 +26,16 @@ type ProcMemConfig struct {
 	Enabled bool
 }
 
-// procMemEventBPF matches the BPF struct proc_mem_event (packed, 100 bytes).
+// procMemEventBPF matches the BPF struct proc_mem_event (packed, 108 bytes).
 type procMemEventBPF struct {
 	CgroupID    uint64
 	PID         uint32
 	Comm        [16]byte
 	Path        [64]byte
 	TimestampNs uint64
+	// ContainerCgroupID is appended in ABI v2: the registered container
+	// cgroup matched by the LSM (leaf or ancestor).
+	ContainerCgroupID uint64
 }
 
 // procMemContainerState tracks cgroup ID for a container in the proc_mem LSM.
@@ -50,7 +57,7 @@ const (
 )
 
 // procMemEventSize is the expected packed size of struct proc_mem_event in BPF bytecode.
-const procMemEventSize = 100
+const procMemEventSize = 108
 
 // allCgroupIDs returns every cgroup id registered for the container.
 func (s *procMemContainerState) allCgroupIDs() []uint64 {

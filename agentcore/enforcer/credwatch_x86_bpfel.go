@@ -19,13 +19,14 @@ type credwatchCgroupProcConfig struct {
 }
 
 type credwatchCredwatchEvent struct {
-	_           structs.HostLayout
-	CgroupId    uint64
-	Pid         uint32
-	Comm        [16]int8
-	Path        [128]int8
-	TimestampNs uint64
-	Kind        uint8
+	_                 structs.HostLayout
+	CgroupId          uint64
+	Pid               uint32
+	Comm              [16]int8
+	Path              [128]int8
+	TimestampNs       uint64
+	Kind              uint8
+	ContainerCgroupId uint64
 }
 
 type credwatchPairKey struct {

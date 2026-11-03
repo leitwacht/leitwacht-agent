@@ -100,7 +100,7 @@ func startProcMemReader(objs *procMemObjects, logger *slog.Logger, onEvent func(
 			logger.Debug("proc_mem ringbuf event", "raw_len", len(raw))
 
 			// Parse the packed struct directly from raw bytes.
-			// Layout: cgroup_id(8) + pid(4) + comm(16) + path(64) + timestamp_ns(8) = 100
+			// Layout: cgroup_id(8) + pid(4) + comm(16) + path(64) + timestamp_ns(8) + container_cgroup_id(8) = 108
 			if len(raw) < procMemEventSize {
 				logger.Warn("proc_mem event too short", "len", len(raw))
 
@@ -111,6 +111,8 @@ func startProcMemReader(objs *procMemObjects, logger *slog.Logger, onEvent func(
 				CgroupID:    binary.LittleEndian.Uint64(raw[0:8]),
 				PID:         binary.LittleEndian.Uint32(raw[8:12]),
 				TimestampNs: binary.LittleEndian.Uint64(raw[92:100]),
+
+				ContainerCgroupID: binary.LittleEndian.Uint64(raw[100:108]),
 			}
 			copy(evt.Comm[:], raw[12:28])
 			copy(evt.Path[:], raw[28:92])
@@ -313,7 +315,12 @@ func (m *Manager) DetachProcMem(containerID string) {
 // handleProcMemBPFEvent is called by the ring buffer reader for each event.
 func (m *Manager) handleProcMemBPFEvent(evt procMemEventBPF) {
 	m.mu.Lock()
-	containerID := m.procMemCgroupMap[evt.CgroupID]
+	// Attribute by the matched container cgroup first (see credwatch).
+	containerID := m.procMemCgroupMap[evt.ContainerCgroupID]
+	if containerID == "" {
+		containerID = m.procMemCgroupMap[evt.CgroupID]
+	}
+
 	observeOnly := false
 	if state := m.procMemContainers[containerID]; state != nil {
 		observeOnly = state.ObserveOnly
@@ -329,11 +336,13 @@ func (m *Manager) handleProcMemBPFEvent(evt procMemEventBPF) {
 	event := ProcMemEvent{
 		ContainerID: containerID,
 		CgroupID:    evt.CgroupID,
-		PID:         evt.PID,
-		Comm:        nullTerminated(evt.Comm[:]),
-		Path:        nullTerminated(evt.Path[:]),
-		TimestampNs: monotonicToWallNs(int64(evt.TimestampNs), nowMonoNs, nowWallNs), //nolint:gosec // monotonic ns fits int64
-		ObserveOnly: observeOnly,
+
+		ContainerCgroupID: evt.ContainerCgroupID,
+		PID:               evt.PID,
+		Comm:              nullTerminated(evt.Comm[:]),
+		Path:              nullTerminated(evt.Path[:]),
+		TimestampNs:       monotonicToWallNs(int64(evt.TimestampNs), nowMonoNs, nowWallNs), //nolint:gosec // monotonic ns fits int64
+		ObserveOnly:       observeOnly,
 	}
 
 	m.logger.Warn("proc_mem read detected",

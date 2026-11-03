@@ -19,12 +19,13 @@ type procMemCgroupProcConfig struct {
 }
 
 type procMemProcMemEvent struct {
-	_           structs.HostLayout
-	CgroupId    uint64
-	Pid         uint32
-	Comm        [16]int8
-	Path        [64]int8
-	TimestampNs uint64
+	_                 structs.HostLayout
+	CgroupId          uint64
+	Pid               uint32
+	Comm              [16]int8
+	Path              [64]int8
+	TimestampNs       uint64
+	ContainerCgroupId uint64
 }
 
 // Names of all BPF objects in the ELF.

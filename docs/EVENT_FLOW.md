@@ -403,6 +403,28 @@ the second operand of `RENAME_EXCHANGE`) and for directories named after
 the immediate parent of a watched suffix (`.ssh`, `.aws`, `.kube`, ...).
 Each event carries a reason: `open`, `rename`, `link` or `dpath_fail`.
 
+Descendant cgroups. The LSM programs (`credwatch`, `proc_mem`) look up
+the task's own cgroup id in `known_containers` first; on a miss they walk
+the task's ancestors with `bpf_get_current_ancestor_cgroup_id` (absolute
+levels 0..15, stopping at the task's own level) and take the first
+registered container, root-most first. A process that `mkdir`s a child
+cgroup under a monitored container and moves itself in (privileged or
+dind jobs, any writable cgroupfs) is therefore still enforced, with the
+matched container's flags (enforce / observe-only / exempt). The bound is
+on the absolute level of the registered container, not on how deep a
+workload nests below it. A container registered at level 16 or deeper is
+matched exactly only. The helper needs kernel 5.7 (the release that
+introduced BPF LSM), so no new kernel requirement. Events carry both ids:
+`cgroup_id` (the task's own cgroup, `CredwatchEvent.CgroupID` /
+`ProcMemEvent.CgroupID`) and `container_cgroup_id` (the registered
+container, `ContainerCgroupID`), appended to the ring-buffer structs
+(credwatch 165 to 173 bytes, proc_mem 100 to 108). Userspace attributes
+`ContainerID` through `container_cgroup_id`. Consumers that make trust
+decisions by cgroup should use `ContainerCgroupID`. The socket-owner
+(`sock_attr`) and DNS pid-attribution programs still match the exact
+cgroup: they only add process attribution to egress/DNS events and are
+not a detection or enforcement path.
+
 Residual gaps:
 
 - Generic parent directories (`.config`, `secrets`, `rancher`, `etc`,

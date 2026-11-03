@@ -27,6 +27,9 @@ struct proc_mem_event {
     char  comm[16];
     char  path[64];
     __u64 timestamp_ns;
+    /* Appended (ABI v2, 108 bytes): registered container cgroup id; differs
+     * from cgroup_id (the task's leaf) for a task in a descendant cgroup. */
+    __u64 container_cgroup_id;
 } __attribute__((packed));
 
 /* Cgroup IDs of monitored containers — pre-filter to skip host processes.
@@ -38,6 +41,64 @@ struct {
     __type(key, __u64);                       /* cgroup_id */
     __type(value, struct cgroup_proc_config);
 } known_containers SEC(".maps");
+
+/* Maximum absolute cgroup level (root = 0) at which a registered
+ * container cgroup is matched as an ANCESTOR of the current task's
+ * cgroup. The exact (leaf) lookup is always tried first and has no
+ * depth limit; the ancestor walk exists so that a process which mkdirs
+ * a child cgroup and moves itself into it (privileged / dind jobs, or
+ * anything with a writable cgroupfs) stays covered.
+ *
+ * The bound is on the ABSOLUTE level of the registered container, not
+ * on how deep the attacker nests: ancestors are probed by absolute level
+ * 0..N-1 and the probe stops at the task's own level, so no amount of
+ * nesting below the container escapes. 16 covers systemd slices, a
+ * kubelet-in-container (KIND) layout and a nested runtime on top of it.
+ * A container registered deeper than this still gets exact matching.
+ *
+ * Cost: the loop runs only when the leaf lookup misses, performs at most
+ * one helper call + one hash lookup per level up to the task's level,
+ * and is a flat unrolled loop of 16 small iterations: it does not touch
+ * the suffix scan, so it adds a fixed, small amount to the verifier's
+ * instruction budget. */
+#define MAX_ANCESTOR_LEVEL 16
+
+/* find_container resolves the registered container cgroup that the
+ * current task belongs to. leaf is bpf_get_current_cgroup_id(); on
+ * success *match is the container's cgroup id (== leaf for an exact
+ * match, an ancestor id otherwise) and the container's config is
+ * returned. The leaf is tried first, then ancestors from the root
+ * downwards; the first registered one wins (the outermost, i.e. the
+ * enclosing job container, when containers are nested). Requires bpf_get_current_ancestor_cgroup_id (5.7, same release
+ * that introduced BPF LSM, so no new kernel requirement). */
+static __always_inline struct cgroup_proc_config *find_container(__u64 leaf, __u64 *match)
+{
+    struct cgroup_proc_config *cfg = bpf_map_lookup_elem(&known_containers, &leaf);
+
+    if (cfg) {
+        *match = leaf;
+        return cfg;
+    }
+
+#pragma unroll
+    for (int lvl = 0; lvl < MAX_ANCESTOR_LEVEL; lvl++) {
+        __u64 anc = bpf_get_current_ancestor_cgroup_id(lvl);
+
+        /* 0: lvl is deeper than the task's cgroup. == leaf: reached the
+         * task's own level (already looked up). Either way no more
+         * strict ancestors remain. */
+        if (anc == 0 || anc == leaf)
+            break;
+
+        cfg = bpf_map_lookup_elem(&known_containers, &anc);
+        if (cfg) {
+            *match = anc;
+            return cfg;
+        }
+    }
+
+    return 0;
+}
 
 /* Per-CPU scratch buffer for bpf_d_path output. Stack memory does not
  * allow variable-offset reads; per-CPU array map values do. */
@@ -100,7 +161,8 @@ int BPF_PROG(proc_mem_file_open, struct file *file)
 {
     /* 1. Cgroup pre-filter — skip non-container processes */
     __u64 cgroup_id = bpf_get_current_cgroup_id();
-    struct cgroup_proc_config *cfg = bpf_map_lookup_elem(&known_containers, &cgroup_id);
+    __u64 container_id;
+    struct cgroup_proc_config *cfg = find_container(cgroup_id, &container_id);
     if (!cfg)
         return 0;
 
@@ -137,6 +199,7 @@ int BPF_PROG(proc_mem_file_open, struct file *file)
     evt = bpf_ringbuf_reserve(&proc_mem_events, sizeof(*evt), 0);
     if (evt) {
         evt->cgroup_id = cgroup_id;
+        evt->container_cgroup_id = container_id;
         evt->pid = bpf_get_current_pid_tgid() >> 32;
         evt->timestamp_ns = bpf_ktime_get_ns();
         bpf_get_current_comm(&evt->comm, sizeof(evt->comm));

@@ -205,7 +205,7 @@ func startCredwatchReader(objs *credwatchObjects, logger *slog.Logger, onEvent f
 			logger.Debug("credwatch ringbuf event", "raw_len", len(raw))
 
 			// Parse the packed struct directly from raw bytes.
-			// Layout: cgroup_id(8) + pid(4) + comm(16) + path(128) + timestamp_ns(8) + kind(1) = 165
+			// Layout: cgroup_id(8) + pid(4) + comm(16) + path(128) + timestamp_ns(8) + kind(1) + container_cgroup_id(8) = 173
 			if len(raw) < credwatchEventSize {
 				logger.Warn("credwatch event too short", "len", len(raw))
 
@@ -217,6 +217,8 @@ func startCredwatchReader(objs *credwatchObjects, logger *slog.Logger, onEvent f
 				PID:         binary.LittleEndian.Uint32(raw[8:12]),
 				TimestampNs: binary.LittleEndian.Uint64(raw[156:164]),
 				Kind:        raw[164],
+
+				ContainerCgroupID: binary.LittleEndian.Uint64(raw[165:173]),
 			}
 			copy(evt.Comm[:], raw[12:28])
 			copy(evt.Path[:], raw[28:156])
@@ -638,7 +640,13 @@ func (m *Manager) DetachCredwatch(containerID string) {
 // handleCredwatchBPFEvent is called by the ring buffer reader for each event.
 func (m *Manager) handleCredwatchBPFEvent(evt credwatchEventBPF) {
 	m.mu.Lock()
-	containerID := m.credwatchCgroupToContainer[evt.CgroupID]
+	// Attribute by the matched container cgroup first: the task may sit
+	// in a descendant cgroup that is not itself registered.
+	containerID := m.credwatchCgroupToContainer[evt.ContainerCgroupID]
+	if containerID == "" {
+		containerID = m.credwatchCgroupToContainer[evt.CgroupID]
+	}
+
 	observeOnly := false
 	if state := m.credwatchContainers[containerID]; state != nil {
 		observeOnly = state.ObserveOnly
@@ -654,13 +662,15 @@ func (m *Manager) handleCredwatchBPFEvent(evt credwatchEventBPF) {
 	event := CredwatchEvent{
 		ContainerID: containerID,
 		CgroupID:    evt.CgroupID,
-		PID:         evt.PID,
-		Comm:        nullTerminated(evt.Comm[:]),
-		Path:        nullTerminated(evt.Path[:]),
-		TimestampNs: monotonicToWallNs(int64(evt.TimestampNs), nowMonoNs, nowWallNs), //nolint:gosec // monotonic ns fits int64
-		Reason:      credwatchReason(evt.Kind),
-		ObserveOnly: observeOnly,
-		ReportOnly:  credwatchKindReportOnlyFlag(evt.Kind),
+
+		ContainerCgroupID: evt.ContainerCgroupID,
+		PID:               evt.PID,
+		Comm:              nullTerminated(evt.Comm[:]),
+		Path:              nullTerminated(evt.Path[:]),
+		TimestampNs:       monotonicToWallNs(int64(evt.TimestampNs), nowMonoNs, nowWallNs), //nolint:gosec // monotonic ns fits int64
+		Reason:            credwatchReason(evt.Kind),
+		ObserveOnly:       observeOnly,
+		ReportOnly:        credwatchKindReportOnlyFlag(evt.Kind),
 	}
 	// Defence in depth: a consumer that only knows ObserveOnly (and
 	// kills otherwise) must not kill on a report-only event. Consumers

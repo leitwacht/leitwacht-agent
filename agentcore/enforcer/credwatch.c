@@ -74,6 +74,11 @@ struct credwatch_event {
     char  path[128];
     __u64 timestamp_ns;
     __u8  kind;                               /* CW_KIND_* */
+    /* Appended (ABI v2, 173 bytes): cgroup id of the registered container
+     * the task belongs to. cgroup_id above stays the task's own (leaf)
+     * cgroup; the two differ when the task sits in a descendant cgroup of
+     * the container. */
+    __u64 container_cgroup_id;
 } __attribute__((packed));
 
 /* (parent directory name, file name) of a watched suffix, e.g.
@@ -95,6 +100,64 @@ struct {
     __type(key, __u64);                       /* cgroup_id */
     __type(value, struct cgroup_proc_config);
 } known_containers SEC(".maps");
+
+/* Maximum absolute cgroup level (root = 0) at which a registered
+ * container cgroup is matched as an ANCESTOR of the current task's
+ * cgroup. The exact (leaf) lookup is always tried first and has no
+ * depth limit; the ancestor walk exists so that a process which mkdirs
+ * a child cgroup and moves itself into it (privileged / dind jobs, or
+ * anything with a writable cgroupfs) stays covered.
+ *
+ * The bound is on the ABSOLUTE level of the registered container, not
+ * on how deep the attacker nests: ancestors are probed by absolute level
+ * 0..N-1 and the probe stops at the task's own level, so no amount of
+ * nesting below the container escapes. 16 covers systemd slices, a
+ * kubelet-in-container (KIND) layout and a nested runtime on top of it.
+ * A container registered deeper than this still gets exact matching.
+ *
+ * Cost: the loop runs only when the leaf lookup misses, performs at most
+ * one helper call + one hash lookup per level up to the task's level,
+ * and is a flat unrolled loop of 16 small iterations: it does not touch
+ * the suffix scan, so it adds a fixed, small amount to the verifier's
+ * instruction budget. */
+#define MAX_ANCESTOR_LEVEL 16
+
+/* find_container resolves the registered container cgroup that the
+ * current task belongs to. leaf is bpf_get_current_cgroup_id(); on
+ * success *match is the container's cgroup id (== leaf for an exact
+ * match, an ancestor id otherwise) and the container's config is
+ * returned. The leaf is tried first, then ancestors from the root
+ * downwards; the first registered one wins (the outermost, i.e. the
+ * enclosing job container, when containers are nested). Requires bpf_get_current_ancestor_cgroup_id (5.7, same release
+ * that introduced BPF LSM, so no new kernel requirement). */
+static __always_inline struct cgroup_proc_config *find_container(__u64 leaf, __u64 *match)
+{
+    struct cgroup_proc_config *cfg = bpf_map_lookup_elem(&known_containers, &leaf);
+
+    if (cfg) {
+        *match = leaf;
+        return cfg;
+    }
+
+#pragma unroll
+    for (int lvl = 0; lvl < MAX_ANCESTOR_LEVEL; lvl++) {
+        __u64 anc = bpf_get_current_ancestor_cgroup_id(lvl);
+
+        /* 0: lvl is deeper than the task's cgroup. == leaf: reached the
+         * task's own level (already looked up). Either way no more
+         * strict ancestors remain. */
+        if (anc == 0 || anc == leaf)
+            break;
+
+        cfg = bpf_map_lookup_elem(&known_containers, &anc);
+        if (cfg) {
+            *match = anc;
+            return cfg;
+        }
+    }
+
+    return 0;
+}
 
 /* Watched filename strings — dentry name (last path component) pre-filter.
  * Populated by userspace from the filename portion of each watched suffix.
@@ -282,7 +345,8 @@ static __always_inline __u8 pair_class(const struct pair_key *k)
 /* emit_credwatch publishes one event. src is copied into the 128-byte
  * path field; n (a compile-time constant after inlining) is how many
  * bytes. */
-static __always_inline void emit_credwatch(__u64 cgroup_id, __u8 kind, __u8 cls,
+static __always_inline void emit_credwatch(__u64 cgroup_id, __u64 container_id,
+                                           __u8 kind, __u8 cls,
                                            const void *src, __u32 n)
 {
     struct credwatch_event *evt;
@@ -299,6 +363,7 @@ static __always_inline void emit_credwatch(__u64 cgroup_id, __u8 kind, __u8 cls,
 
     __builtin_memset(evt, 0, sizeof(*evt));
     evt->cgroup_id = cgroup_id;
+    evt->container_cgroup_id = container_id;
     evt->pid = bpf_get_current_pid_tgid() >> 32;
     evt->timestamp_ns = bpf_ktime_get_ns();
     evt->kind = cls == CW_CLASS_REPORT_ONLY ? (kind | CW_KIND_REPORT_ONLY) : kind;
@@ -307,13 +372,15 @@ static __always_inline void emit_credwatch(__u64 cgroup_id, __u8 kind, __u8 cls,
     bpf_ringbuf_submit(evt, 0);
 }
 
-/* watched_container applies the cgroup pre-filter and the
- * allow_credwatch exemption. Returns the config for a container that
- * must be enforced, or NULL. */
-static __always_inline struct cgroup_proc_config *watched_container(__u64 *cgroup_id)
+/* watched_container applies the cgroup pre-filter (the task's cgroup or
+ * any ancestor is a registered container) and the allow_credwatch
+ * exemption of the MATCHED container. Returns that container's config,
+ * or NULL. */
+static __always_inline struct cgroup_proc_config *watched_container(__u64 *cgroup_id,
+                                                                    __u64 *container_id)
 {
     *cgroup_id = bpf_get_current_cgroup_id();
-    struct cgroup_proc_config *cfg = bpf_map_lookup_elem(&known_containers, cgroup_id);
+    struct cgroup_proc_config *cfg = find_container(*cgroup_id, container_id);
     if (!cfg)
         return 0;
     if (cfg->flags & FLAG_ALLOW_CREDWATCH)
@@ -334,8 +401,8 @@ static __always_inline int verdict(struct cgroup_proc_config *cfg, __u8 cls)
 SEC("lsm/file_open")
 int BPF_PROG(credwatch_file_open, struct file *file)
 {
-    __u64 cgroup_id;
-    struct cgroup_proc_config *cfg = watched_container(&cgroup_id);
+    __u64 cgroup_id, container_id;
+    struct cgroup_proc_config *cfg = watched_container(&cgroup_id, &container_id);
     if (!cfg)
         return 0;
 
@@ -383,7 +450,7 @@ int BPF_PROG(credwatch_file_open, struct file *file)
         if (!pcls)
             return 0;
 
-        emit_credwatch(cgroup_id, CW_KIND_DPATH_FAIL, pcls, pk.name, 64);
+        emit_credwatch(cgroup_id, container_id, CW_KIND_DPATH_FAIL, pcls, pk.name, 64);
 
         return verdict(cfg, pcls);
     }
@@ -402,7 +469,7 @@ int BPF_PROG(credwatch_file_open, struct file *file)
     if (tail > PATH_BUF_LEN - 128)
         tail = PATH_BUF_LEN - 128;
 
-    emit_credwatch(cgroup_id, CW_KIND_OPEN, cls, buf + tail, 128);
+    emit_credwatch(cgroup_id, container_id, CW_KIND_OPEN, cls, buf + tail, 128);
 
     return verdict(cfg, cls);
 }
@@ -419,8 +486,8 @@ int BPF_PROG(credwatch_file_open, struct file *file)
  *     "rancher/k3s", ...). */
 static __always_inline int dentry_verdict(struct dentry *d, __u8 kind)
 {
-    __u64 cgroup_id;
-    struct cgroup_proc_config *cfg = watched_container(&cgroup_id);
+    __u64 cgroup_id, container_id;
+    struct cgroup_proc_config *cfg = watched_container(&cgroup_id, &container_id);
     if (!cfg)
         return 0;
 
@@ -450,7 +517,7 @@ static __always_inline int dentry_verdict(struct dentry *d, __u8 kind)
     if (!cls)
         return 0;
 
-    emit_credwatch(cgroup_id, kind, cls, pk.name, 64);
+    emit_credwatch(cgroup_id, container_id, kind, cls, pk.name, 64);
 
     return verdict(cfg, cls);
 }

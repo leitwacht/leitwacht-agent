@@ -238,7 +238,7 @@ func TestDefenseInDepth_DNSKill(t *testing.T) {
 	}
 	blockCfg := &DNSProxyConfig{
 		Policy:         blockPol,
-		Upstreams:      []string{"1.1.1.1:53"},
+		Upstreams:      []string{testUnroutableUpstream},
 		LookupRecorder: func(_ uint64) *ViolationRecorder { return blockRec },
 		Logger:         slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
 		AddToAllowMap:  func(_ net.IP, _ []int, _ uint32) error { return nil },
@@ -274,7 +274,7 @@ func TestDefenseInDepth_DNSKill(t *testing.T) {
 	}
 	auditCfg := &DNSProxyConfig{
 		Policy:         auditPol,
-		Upstreams:      []string{"1.1.1.1:53"},
+		Upstreams:      []string{testUnroutableUpstream},
 		LookupRecorder: func(_ uint64) *ViolationRecorder { return auditRec },
 		Logger:         slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
 		AddToAllowMap:  func(_ net.IP, _ []int, _ uint32) error { return nil },
@@ -313,7 +313,7 @@ func TestDefenseInDepth_AllThreeKillPoints(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	// Set up Manager with all three subsystems
-	mgr := NewManager(logger, 32, []string{"1.1.1.1:53"}, nil, &LinuxPlatform{Logger: logger},
+	mgr := NewManager(logger, 32, []string{testUnroutableUpstream}, nil, &LinuxPlatform{Logger: logger},
 		CredwatchConfig{
 			Enabled:      true,
 			WatchedPaths: []string{"/.testcred/secret"},

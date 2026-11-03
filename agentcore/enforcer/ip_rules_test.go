@@ -197,7 +197,7 @@ func TestJoinerIPRulesReversedOnFailedAttach(t *testing.T) {
 		attachCgroupErr: errors.New("synthetic attach failure"),
 	}
 
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr := NewManager(testLogger(), 32, []string{testUnroutableUpstream}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0
 
 	defer mgr.DetachAll()
@@ -223,7 +223,7 @@ func TestJoinerIPAllowReversedOnDetach(t *testing.T) {
 		netnsByPID: map[int]uint64{100: 4242},
 	}
 
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr := NewManager(testLogger(), 32, []string{testUnroutableUpstream}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0
 
 	defer mgr.DetachAll()
@@ -260,7 +260,7 @@ func sharedNetnsManager(t *testing.T) (*Manager, *fakePlatform) {
 		netnsByPID: map[int]uint64{100: 4242, 101: 4242},
 	}
 
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr := NewManager(testLogger(), 32, []string{testUnroutableUpstream}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0
 
 	t.Cleanup(func() { mgr.DetachAll() })
@@ -415,7 +415,7 @@ func (h *failDenyHandle) AddDeniedIP(ip net.IP, port int, prio uint32) error {
 // must refuse the attach; audit mode only observes and proceeds.
 func TestDenyInstallFailureFailsBlockAttach(t *testing.T) {
 	fp := &failDenyPlatform{&fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr := NewManager(testLogger(), 32, []string{testUnroutableUpstream}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0
 
 	defer mgr.DetachAll()
@@ -504,7 +504,7 @@ func TestStrictestMemberPolicyWins(t *testing.T) {
 // consume, the enforcement limit.
 func TestPassiveSentinelExemptFromConcurrencyLimit(t *testing.T) {
 	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
-	mgr := NewManager(testLogger(), 1, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr := NewManager(testLogger(), 1, []string{testUnroutableUpstream}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0
 
 	defer mgr.DetachAll()
@@ -571,7 +571,7 @@ func TestPolicyChangeFlushesDNSAllows(t *testing.T) {
 // blocked DNS answers point at an address the datapath doesn't drop.
 func TestSinkholeSeedFailureFailsBlockCreator(t *testing.T) {
 	fp := &sinkholeFailPlatform{&fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr := NewManager(testLogger(), 32, []string{testUnroutableUpstream}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0
 
 	defer mgr.DetachAll()

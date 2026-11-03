@@ -468,7 +468,7 @@ func TestDNSCache_SkipsSinkholeIP(t *testing.T) {
 // container, run the callback asynchronously, and only once per container.
 func TestManager_DNSViolationWiredAndDeduped(t *testing.T) {
 	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr := NewManager(testLogger(), 32, []string{testUnroutableUpstream}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0
 
 	defer mgr.DetachAll()
@@ -577,7 +577,7 @@ func attachedBlockManager(t *testing.T) (*Manager, *Enforcer, func(uint64, strin
 	t.Helper()
 
 	fp := &fakePlatform{cgroupPath: "/sys/fs/cgroup/test"}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr := NewManager(testLogger(), 32, []string{testUnroutableUpstream}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0
 
 	t.Cleanup(func() { mgr.DetachAll() })
@@ -606,7 +606,7 @@ func TestManager_DNSViolationOnlyKillsBlockModeContainer(t *testing.T) {
 		cgroupPath: "/sys/fs/cgroup/test",
 		netnsByPID: map[int]uint64{100: 7777, 101: 7777},
 	}
-	mgr := NewManager(testLogger(), 32, []string{"1.1.1.1:53"}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
+	mgr := NewManager(testLogger(), 32, []string{testUnroutableUpstream}, nil, fp, CredwatchConfig{}, ProcMemConfig{})
 	mgr.NetnsGrace = 0
 
 	t.Cleanup(func() { mgr.DetachAll() })

@@ -33,13 +33,51 @@ func testDNSConfig(action string, rules []policy.Rule) (*DNSProxyConfig, *policy
 
 	cfg := &DNSProxyConfig{
 		Policy:         pol,
-		Upstreams:      []string{"1.1.1.1:53"},
+		Upstreams:      []string{testUnroutableUpstream},
 		LookupRecorder: func(_ uint64) *ViolationRecorder { return rec },
 		Logger:         slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
 		AddToAllowMap:  func(_ net.IP, _ []int, _ uint32) error { return nil },
 	}
 
 	return cfg, pol, rec
+}
+
+// fakeUpstreamIP is the A record the in-process fakeUpstream answers with.
+const fakeUpstreamIP = "198.51.100.7"
+
+// testUnroutableUpstream is an RFC 5737 TEST-NET-1 address: tests that
+// forward must wire fakeUpstream (withFakeUpstream) rather than silently
+// depending on the internet.
+const testUnroutableUpstream = "192.0.2.53:53"
+
+// withFakeUpstream points cfg at an in-process DNS server answering every
+// A query with a fixed documentation address.
+func withFakeUpstream(t *testing.T, cfg *DNSProxyConfig) {
+	t.Helper()
+
+	up := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
+		return []*dns.Msg{replyTo(q, q.Id, aRR(strings.TrimSuffix(q.Question[0].Name, "."), fakeUpstreamIP))}
+	})
+	cfg.DockerUDPDial = up.dialUDP
+	cfg.DockerTCPDial = up.dialTCP
+}
+
+// assertForwardedA fails unless resp is a NOERROR answer carrying the
+// fake upstream's A record (proves forwarding, not SERVFAIL).
+func assertForwardedA(t *testing.T, resp *dns.Msg) {
+	t.Helper()
+
+	if resp.Rcode != dns.RcodeSuccess {
+		t.Fatalf("rcode = %d, want NOERROR", resp.Rcode)
+	}
+
+	for _, rr := range resp.Answer {
+		if a, ok := rr.(*dns.A); ok && a.A.String() == fakeUpstreamIP {
+			return
+		}
+	}
+
+	t.Fatalf("answer %v lacks fake upstream A %s", resp.Answer, fakeUpstreamIP)
 }
 
 func allowFQDN(pattern string, ports ...int) policy.Rule {
@@ -325,6 +363,7 @@ func TestHandleDNSQuery_AllowedDomainForwarded(t *testing.T) {
 	var addedIPs []string
 
 	cfg, pol, rec := testDNSConfig("block", []policy.Rule{allowFQDN("example.com", 443)})
+	withFakeUpstream(t, cfg)
 	cfg.AddToAllowMap = func(ip net.IP, _ []int, _ uint32) error {
 		addedIPs = append(addedIPs, ip.String())
 
@@ -334,14 +373,16 @@ func TestHandleDNSQuery_AllowedDomainForwarded(t *testing.T) {
 	msg := makeQuery("example.com", dns.TypeA)
 	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
-	// Response depends on live DNS resolution (may fail in CI).
-	if resp.Rcode == dns.RcodeNameError {
-		t.Fatal("allowed domain should not return NXDOMAIN")
+	assertForwardedA(t, resp)
+
+	if len(addedIPs) != 1 || addedIPs[0] != fakeUpstreamIP {
+		t.Fatalf("addedIPs = %v, want [%s]", addedIPs, fakeUpstreamIP)
 	}
 }
 
 func TestHandleDNSQuery_AuditModeForwardsEverything(t *testing.T) {
 	cfg, pol, rec := testDNSConfig("audit", []policy.Rule{allowFQDN("pypi.org", 443)})
+	withFakeUpstream(t, cfg)
 
 	msg := makeQuery(testEvilDomain, dns.TypeA)
 	_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
@@ -360,13 +401,12 @@ func TestHandleDNSQuery_AuditModeForwardsEverything(t *testing.T) {
 
 func TestHandleDNSQuery_WildcardAllowSingleLabel(t *testing.T) {
 	cfg, pol, rec := testDNSConfig("block", []policy.Rule{allowFQDN("*.example.com", 443)})
+	withFakeUpstream(t, cfg)
 
 	msg := makeQuery("sub.example.com", dns.TypeA)
 	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
-	if resp.Rcode == dns.RcodeNameError {
-		t.Fatal("wildcard-matched domain should not return NXDOMAIN")
-	}
+	assertForwardedA(t, resp)
 }
 
 func TestHandleDNSQuery_WildcardAllowRejectsMultiLabel(t *testing.T) {
@@ -408,6 +448,7 @@ func TestHandleDNSQuery_ClusterLocalAllowlisted(t *testing.T) {
 	cfg, pol, rec := testDNSConfig("block", []policy.Rule{
 		allowFQDN("my-api.staging.svc.cluster.local", 443),
 	})
+	withFakeUpstream(t, cfg)
 
 	msg := makeQuery("my-api.staging.svc.cluster.local", dns.TypeA)
 	_ = HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
@@ -449,6 +490,7 @@ func TestHandleDNSQuery_FirstMatch_AllowBeforeDenyWildcard(t *testing.T) {
 		allowFQDN("foo.example.com", 443),
 		denyFQDN("*.example.com", policy.DenyResolutionSinkhole),
 	})
+	withFakeUpstream(t, cfg)
 
 	msg := makeQuery("foo.example.com", dns.TypeA)
 	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
@@ -603,11 +645,13 @@ func TestDNSProxy_UpdatePolicy(t *testing.T) {
 	rec := NewViolationRecorder(nil)
 	cfg := &DNSProxyConfig{
 		Policy:         auditPol,
-		Upstreams:      []string{"1.1.1.1:53"},
+		Upstreams:      []string{testUnroutableUpstream},
 		LookupRecorder: func(_ uint64) *ViolationRecorder { return rec },
 		Logger:         slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError})),
 		AddToAllowMap:  func(_ net.IP, _ []int, _ uint32) error { return nil },
 	}
+
+	withFakeUpstream(t, cfg)
 
 	proxy := NewDNSProxy(cfg)
 
@@ -615,9 +659,7 @@ func TestDNSProxy_UpdatePolicy(t *testing.T) {
 	pol := proxy.policy.Load()
 	resp := HandleDNSQuery(msg, cfg, pol, rec, 0, "", "", "", 0)
 
-	if resp.Rcode == dns.RcodeNameError {
-		t.Fatal("audit-all mode should not return NXDOMAIN")
-	}
+	assertForwardedA(t, resp)
 
 	violations, _ := rec.Snapshot()
 	if len(violations) != 0 {
@@ -731,7 +773,7 @@ func TestHandleDNSQuery_OnDNSViolation_AuditMode(t *testing.T) {
 	})
 
 	up := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
-		return []*dns.Msg{replyTo(q, q.Id, aRR(strings.TrimSuffix(q.Question[0].Name, "."), "198.51.100.7"))}
+		return []*dns.Msg{replyTo(q, q.Id, aRR(strings.TrimSuffix(q.Question[0].Name, "."), fakeUpstreamIP))}
 	})
 	cfg.DockerUDPDial = up.dialUDP
 	cfg.DockerTCPDial = up.dialTCP

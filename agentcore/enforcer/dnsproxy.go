@@ -125,6 +125,26 @@ type DNSProxyConfig struct {
 	// behaviour for any caller that doesn't wire it.
 	EgressReady func() bool
 
+	// SearchListFor returns the resolver search list (resolv.conf "search"
+	// or "domain", snapshotted once at attach) of the container owning
+	// cgroupID; cgroupID 0 means "unattributed" and falls back to the
+	// netns's first snapshot. Nil, or an empty result, disables expansion
+	// suppression.
+	SearchListFor func(cgroupID uint64) []string
+
+	// ClusterDomain is the Kubernetes cluster domain (default
+	// "cluster.local"). Only search suffixes at or under it may be confirmed
+	// against the upstream. Configuration, never derived from the search list.
+	ClusterDomain string
+
+	// ExpansionSuppression selects how search-list expansions of
+	// public-looking domains are treated: "structural" (default, also the
+	// empty string) asks the cluster DNS and, if a
+	// cluster-domain expansion does not exist (NXDOMAIN, no answers), returns
+	// a synthesized NXDOMAIN without recording an event or calling
+	// OnDNSViolation; "off" treats them like any other query.
+	ExpansionSuppression string
+
 	// upstreamFailLast / upstreamFailSuppressed rate-limit the
 	// per-query upstream-failure log (unix nanos of the last emission,
 	// and how many lines were swallowed since).
@@ -189,6 +209,38 @@ func HandleDNSQuery(
 	rules := pol.RulesForJob("")
 
 	match, matchIdx, matched := matchFirstRule(qname, rules)
+
+	// Search-list expansions of public-looking domains. Under the cluster
+	// domain: ask the cluster DNS and, only if it answers NXDOMAIN with no
+	// answer records (a synthesized NXDOMAIN is returned, never the upstream
+	// message), treat the query as resolver noise: no event, no kill. Any
+	// other answer, or an upstream failure, takes the normal path (fail
+	// toward visibility). Outside the cluster domain (node suffixes, or ones
+	// injected into resolv.conf) nothing is ever forwarded for
+	// classification and the event is never suppressed: see the block-mode
+	// no-match path below. An explicit allow rule skips all of this.
+	var (
+		pre     *preForward
+		outside bool
+	)
+
+	if !(matched && match.Action == policy.ActionAllow) {
+		switch cfg.expansionClassFor(cgroupID, qname) {
+		case expCluster:
+			resp, ips, _, ok := forwardAndFilterResolved(msg, cfg, qname, qtype)
+			if ok && resp.Rcode == dns.RcodeNameError && len(resp.Answer) == 0 {
+				cfg.Logger.Debug("dns search-list expansion suppressed", "domain", qname)
+
+				return nxdomainResponse(msg)
+			}
+
+			pre = &preForward{resp: resp, ips: ips, ok: ok}
+		case expOutside:
+			outside = true
+		case expNone:
+		}
+	}
+
 	if matched {
 		if match.Action == policy.ActionDeny {
 			// Audit mode observes only: a deny match must not alter name
@@ -200,7 +252,7 @@ func HandleDNSQuery(
 			if pol.Action == policy.ActionAudit {
 				cfg.Logger.Debug("dns would deny (audit)", "domain", qname, "pattern", match.Pattern, "resolution", match.Resolution)
 
-				return forwardAndObserve(msg, cfg, qname, qtype, recorder, pid, comm, parentComm, binaryPath)
+				return forwardAndObserve(msg, cfg, qname, qtype, recorder, pid, comm, parentComm, binaryPath, pre)
 			}
 
 			return handleDenyRule(msg, cfg, qname, qtype, match, recorder, pid, comm, parentComm, binaryPath, cgroupID)
@@ -212,20 +264,35 @@ func HandleDNSQuery(
 	isAudit := pol.Action == policy.ActionAudit
 
 	if !isAudit {
-		if recorder != nil {
-			recorder.RecordDNS(qname, dns.TypeToString[qtype], "dns_blocked", sinkholeIPsIfA(qtype), pid, comm, parentComm, binaryPath)
+		// An expansion outside the cluster domain gets a local NXDOMAIN (no
+		// forward) instead of the sinkhole, so the resolver goes on to the
+		// real name. The event is the same as for any other no-match name in
+		// block mode; the CE kill is not (see below).
+		var ips []string
+		if !outside {
+			ips = sinkholeIPsIfA(qtype)
 		}
 
-		cfg.Logger.Debug("dns blocked", "domain", qname)
+		if recorder != nil {
+			recorder.RecordDNS(qname, dns.TypeToString[qtype], "dns_blocked", ips, pid, comm, parentComm, binaryPath)
+		}
 
-		if cfg.OnDNSViolation != nil {
+		cfg.Logger.Debug("dns blocked", "domain", qname, "expansion_outside_cluster", outside)
+
+		// Nothing is forwarded for an outside-cluster expansion, so there is
+		// nothing to contain: record it, but do not kill.
+		if cfg.OnDNSViolation != nil && !outside {
 			cfg.OnDNSViolation(cgroupID, qname, "dns_blocked")
+		}
+
+		if outside {
+			return nxdomainResponse(msg)
 		}
 
 		return sinkholeResponse(msg)
 	}
 
-	return forwardAndObserve(msg, cfg, qname, qtype, recorder, pid, comm, parentComm, binaryPath)
+	return forwardAndObserve(msg, cfg, qname, qtype, recorder, pid, comm, parentComm, binaryPath, pre)
 }
 
 // matchFirstRule walks rules top to bottom and returns the first fqdn
@@ -316,14 +383,35 @@ func handleAllowRule(
 	return resp
 }
 
+// preForward is an upstream answer already obtained while classifying a
+// resolver-noise candidate, reusable by the audit forwarding path.
+type preForward struct {
+	resp *dns.Msg
+	ips  []string
+	ok   bool
+}
+
 // forwardAndObserve handles the audit-mode no-match path: forward, strip
 // AAAA, record as dns_observed (no allow-map seed — there's no policy
 // saying these IPs should be reachable, they're just under observation).
 func forwardAndObserve(
 	msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uint16,
 	recorder *ViolationRecorder, pid uint32, comm, parentComm, binaryPath string,
+	pre *preForward,
 ) *dns.Msg {
-	resp, ips, ok := forwardAndFilter(msg, cfg, qname, qtype)
+	var (
+		resp *dns.Msg
+		ips  []string
+		ok   bool
+	)
+
+	if pre != nil {
+		// The classification query already asked the upstream: reuse it.
+		resp, ips, ok = pre.resp, pre.ips, pre.ok
+	} else {
+		resp, ips, ok = forwardAndFilter(msg, cfg, qname, qtype)
+	}
+
 	if !ok {
 		return resp
 	}
@@ -341,14 +429,25 @@ func forwardAndObserve(
 // returns the filtered response plus the A-record IPs seen. Returns
 // ok=false (and a SERVFAIL response) if the upstream failed.
 func forwardAndFilter(msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uint16) (*dns.Msg, []string, bool) {
+	resp, ips, _, ok := forwardAndFilterResolved(msg, cfg, qname, qtype)
+
+	return resp, ips, ok
+}
+
+// forwardAndFilterResolved is forwardAndFilter plus whether the upstream
+// answered NOERROR with at least one answer record of any type (decided
+// before the AAAA strip).
+func forwardAndFilterResolved(msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uint16) (*dns.Msg, []string, bool, bool) {
 	_ = qtype // reserved for future qtype-specific handling (e.g., HTTPS/SVCB)
 
 	resp, err := forwardQuery(msg, cfg)
 	if err != nil {
 		logUpstreamFailure(cfg, err)
 
-		return servfailResponse(msg), nil, false
+		return servfailResponse(msg), nil, false, false
 	}
+
+	resolved := resp.Rcode == dns.RcodeSuccess && len(resp.Answer) > 0
 
 	var (
 		ips      []string
@@ -385,7 +484,7 @@ func forwardAndFilter(msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uin
 
 	resp.Answer = filtered
 
-	return resp, ips, true
+	return resp, ips, resolved, true
 }
 
 // canonicalName lowercases a DNS name and strips the trailing root dot.

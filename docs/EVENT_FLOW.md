@@ -262,10 +262,23 @@ Two things sit outside the ordering by design:
   ordering can reach them. IPv6 metadata addresses (for example
   `fd00:ec2::254`) need no entry of their own: in block mode all
   non-loopback IPv6 is dropped.
-- **Trusted CIDRs** (`TRUSTED_CIDRS`, the Docker bridge / pod
-  network) hold no position in any rule list, so they are consulted
-  only after every rule has missed. An explicit deny rule still
-  overrides node-level trust.
+- **Trusted CIDRs** (`TRUSTED_CIDRS`) hold no position in any rule
+  list, so they are consulted only after every rule has missed.
+  Traffic to a trusted range is allowed and not recorded. A deny rule
+  for a single address (`/32`) still overrides trust; a deny rule for a
+  wider prefix is not currently enforced in the datapath, so it does
+  not override trust (prefix enforcement is planned).
+  The setting exists for Docker/Podman executors, where service and
+  helper containers sit on bridge networks with their own addresses.
+  **On Kubernetes, do not put pod or service CIDRs here:** block mode
+  already drops cluster-internal addresses by default, and trusting
+  those ranges would make that default (and any DNS deny for
+  `*.cluster.local`) ineffective. Kubernetes job pods need no trusted
+  ranges, because DNS is intercepted in the pod's own netns. In block
+  mode, jobs that need in-cluster services (GitLab, cache, registry)
+  need explicit allow rules above the seeded `*.cluster.local` deny. A
+  `clusterCIDRs` setting that only warns when `trustedCIDRs` overlaps
+  the cluster ranges is planned.
 
 **Known exposure — link-local.** Apart from the endpoints listed
 above, the rest of `169.254.0.0/16` is allowed before any policy is
@@ -441,3 +454,82 @@ Possible future hardening (operator decision, not implemented): carry
 the job's block/audit intent to the pod at sandbox time (pod annotations
 exposed to the init container through the downward API) and withhold the
 attached signal until the netns is enforcing for a block-mode job.
+
+## DNS search-list expansions
+
+A resolver with a search list (for example the Kubernetes default
+`ndots:5`) tries `name.<suffix>` for each suffix before the bare name.
+On the wire these are indistinguishable from deliberate queries for the
+fully qualified name, so the DNS proxy classifies them structurally,
+per query, with no buffering and no timers.
+
+- At attach, the agent reads the container's own `/etc/resolv.conf`
+  once (through `/proc/<pid>/root`, confined to the container root,
+  regular non-FUSE files only, 4 KiB cap) and keeps the `search` /
+  `domain` list per cgroup. It is never re-read, but the read can be
+  raced: containers of a pod share one resolv.conf, so a root sidecar
+  can edit it before the agent reads. The list is therefore treated as
+  untrusted for the decision that matters (below). No readable list
+  means no suppression.
+- A query is an expansion if it equals `B.S` at a label boundary with S
+  in that list. It is a **candidate** if at least one `B` is a
+  public-looking domain: at least two labels, and its effective TLD is
+  an entry of the Public Suffix List (ICANN or private entries, so
+  `*.appspot.com` counts), with `B` itself below that suffix. Names are
+  matched in lowercase ASCII/punycode form.
+- The **cluster domain** (`cluster.local` by default; configuration,
+  never derived from the search list) decides what may be suppressed.
+  - Suffix S at or under the cluster domain: the proxy forwards the
+    query to the cluster DNS, which answers it authoritatively. Only
+    NXDOMAIN with no answer records is noise: the client gets a
+    synthesized NXDOMAIN (never the upstream message, which could carry
+    a CNAME chain), with no event and no CE kill. Anything else is a
+    real name and takes the normal path: NOERROR with answers, NODATA
+    (for example AAAA for an existing service), NXDOMAIN with a CNAME
+    chain, SERVFAIL, or an upstream failure. The normal path is rule
+    matching, recording, CE kill, sinkhole in block mode, and
+    forwarding in audit mode (the answer already obtained is reused, so
+    the upstream is asked once). In block mode a deny match wins; the
+    classification answer is never returned to the client. That keeps
+    `db.dev.svc.cluster.local` (service `db` in a namespace named like a
+    TLD) working and visible.
+  - Suffix S outside the cluster domain (a node search suffix such as
+    GKE's `c.<project>.internal` / `google.internal`, EKS's
+    `<region>.compute.internal` or `ec2.internal`, or one injected into
+    resolv.conf): never forwarded for classification, and the event is
+    never suppressed. Block mode answers a local NXDOMAIN (not the
+    sinkhole, so the resolver goes on to the real name) and records the
+    normal `dns_blocked` event, but does **not** call the CE kill
+    callback: nothing is forwarded, so there is nothing to contain, and
+    a node search suffix must not kill an ordinary job. Audit mode takes
+    the normal path: forward and record as for any query. A deny rule
+    that matches still applies as usual, including the CE kill, and so
+    do non-public bases.
+  An explicit allow rule that names the query skips all of this.
+- Cost: one extra upstream round trip per cluster-domain candidate,
+  normally answered from CoreDNS's cache. Cluster-domain names are
+  answered authoritatively and never leave the cluster, provided
+  `DNS_UPSTREAM` lists only cluster resolvers (`forwardQuery` falls
+  through to later upstreams if CoreDNS fails). A suffix that
+  an attacker adds to resolv.conf is outside the cluster domain, so it
+  stays visible and is never forwarded.
+- Residual: NXDOMAIN probes for names that do not exist under
+  cluster-domain suffixes in namespaces named like a TLD are silent;
+  nothing is reached, and any hit that resolves is still recorded.
+- With `ndots:2` (see the runner patch), two-dot internal partial names
+  such as `svc.ns.svc` go out as written first and may reach CoreDNS's
+  external forwarder before the search list is tried.
+- Anything else is handled as before. Single-label bases (`redis`) and
+  bases whose last label is not a public suffix (`web-0.db`, `svc.ns`,
+  `foo.local`) are never candidates: they are matched against rules,
+  recorded, and in CE block mode kill the container immediately, as for
+  any denied name, with no upstream round trip for classification.
+- `DNSProxyConfig.ExpansionSuppression` (CE
+  `LEITWACHT_CE_DNS_EXPANSION_SUPPRESSION`, EE
+  `LEITWACHT_DNS_EXPANSION_SUPPRESSION`, helm
+  `dnsExpansionSuppression` / `agent.dnsExpansionSuppression`) is
+  `structural` (default) or `off` (no classification at all; quote
+  `"off"` in YAML values, an unquoted `off` is a boolean).
+  `DNSProxyConfig.ClusterDomain` (CE `LEITWACHT_CE_CLUSTER_DOMAIN`, EE
+  `LEITWACHT_CLUSTER_DOMAIN`, helm `clusterDomain` /
+  `agent.clusterDomain`) sets the cluster domain.

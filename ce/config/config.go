@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gitlab.com/leitwacht/leitwacht-agent/agentcore/clusterdomain"
 )
 
 // Config is the resolved CE daemon settings.
@@ -32,17 +34,25 @@ type Config struct {
 	UnknownProjectMode string // "enforce" (default — apply DefaultAction) | "pass" (passive-only, no checks)
 	DNSUpstream        string
 	TrustedCIDRs       string
-	CredwatchEnabled   bool
-	CredwatchPaths     string // comma-separated path suffixes to watch
-	CredwatchExclude   string // comma-separated path suffixes to exclude
-	ProcMemEnabled     bool
-	RecordEnvNames     bool // when true, attach env-var NAMES (never values) to each Violation report
-	MaxConcurrentEnf   int
-	EventBuffer        int           // size of the watcher's event channel; back-pressures containerd subscriptions when full
-	NetnsGrace         time.Duration // how long a netns context survives after its last container detaches
-	FreezeTimeout      time.Duration // pre-attach container freeze budget; 0 disables the freeze
-	FreezeStateDir     string        // where freeze markers are persisted for crash recovery; empty = built-in default
-	BucketInterval     time.Duration
+	// DNSExpansionSuppression: "structural" (default) drops the event for
+	// search-list expansions of public-looking domains under ClusterDomain
+	// that the cluster DNS confirms do not exist; "off" treats them like any
+	// other query.
+	DNSExpansionSuppression string
+	// ClusterDomain is the Kubernetes cluster domain (never derived from the
+	// container's search list).
+	ClusterDomain    string
+	CredwatchEnabled bool
+	CredwatchPaths   string // comma-separated path suffixes to watch
+	CredwatchExclude string // comma-separated path suffixes to exclude
+	ProcMemEnabled   bool
+	RecordEnvNames   bool // when true, attach env-var NAMES (never values) to each Violation report
+	MaxConcurrentEnf int
+	EventBuffer      int           // size of the watcher's event channel; back-pressures containerd subscriptions when full
+	NetnsGrace       time.Duration // how long a netns context survives after its last container detaches
+	FreezeTimeout    time.Duration // pre-attach container freeze budget; 0 disables the freeze
+	FreezeStateDir   string        // where freeze markers are persisted for crash recovery; empty = built-in default
+	BucketInterval   time.Duration
 
 	// Sinks.
 	StdoutEnabled  bool
@@ -146,6 +156,8 @@ func Load() (*Config, error) {
 		// bare metal.
 		DNSUpstream:                os.Getenv("LEITWACHT_CE_DNS_UPSTREAM"),
 		TrustedCIDRs:               os.Getenv("LEITWACHT_CE_TRUSTED_CIDRS"),
+		DNSExpansionSuppression:    envOr("LEITWACHT_CE_DNS_EXPANSION_SUPPRESSION", "structural"),
+		ClusterDomain:              envOr("LEITWACHT_CE_CLUSTER_DOMAIN", "cluster.local"),
 		CredwatchPaths:             envOr("LEITWACHT_CE_CREDWATCH_PATHS", defaultCredwatchPaths),
 		CredwatchExclude:           envOr("LEITWACHT_CE_CREDWATCH_EXCLUDE", defaultCredwatchExclude),
 		PromAddr:                   envOr("LEITWACHT_CE_PROM_ADDR", ":9090"),
@@ -279,6 +291,16 @@ func (c *Config) Validate() error {
 	}
 	if c.FreezeTimeout < 0 {
 		return fmt.Errorf("LEITWACHT_CE_FREEZE_TIMEOUT = %s (must be >= 0; 0 disables the pre-attach freeze)", c.FreezeTimeout)
+	}
+	cd, err := clusterdomain.Normalize(c.ClusterDomain)
+	if err != nil {
+		return fmt.Errorf("LEITWACHT_CE_CLUSTER_DOMAIN: %w", err)
+	}
+
+	c.ClusterDomain = cd
+
+	if c.DNSExpansionSuppression != "structural" && c.DNSExpansionSuppression != "off" {
+		return fmt.Errorf("LEITWACHT_CE_DNS_EXPANSION_SUPPRESSION = %q (must be \"structural\" or \"off\")", c.DNSExpansionSuppression)
 	}
 	if err := validateCIDRList(c.TrustedCIDRs); err != nil {
 		return fmt.Errorf("LEITWACHT_CE_TRUSTED_CIDRS: %w", err)

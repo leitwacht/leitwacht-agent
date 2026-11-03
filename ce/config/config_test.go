@@ -32,3 +32,51 @@ func TestLoadCanonicalisesActionEnums(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadDNSExpansionSuppression(t *testing.T) {
+	t.Setenv("LEITWACHT_CE_DNS_UPSTREAM", "10.0.0.2:53")
+
+	c, err := Load()
+	if err != nil || c.DNSExpansionSuppression != "structural" {
+		t.Fatalf("default = %q, err %v; want structural", c.DNSExpansionSuppression, err)
+	}
+
+	t.Setenv("LEITWACHT_CE_DNS_EXPANSION_SUPPRESSION", "off")
+
+	if c, err = Load(); err != nil || c.DNSExpansionSuppression != "off" {
+		t.Fatalf("off = %q, err %v", c.DNSExpansionSuppression, err)
+	}
+
+	t.Setenv("LEITWACHT_CE_DNS_EXPANSION_SUPPRESSION", "sometimes")
+
+	if _, err = Load(); err == nil {
+		t.Fatal("invalid value must be rejected")
+	}
+}
+
+func TestLoadClusterDomain(t *testing.T) {
+	t.Setenv("LEITWACHT_CE_DNS_UPSTREAM", "10.0.0.2:53")
+
+	c, err := Load()
+	if err != nil || c.ClusterDomain != "cluster.local" {
+		t.Fatalf("default = %q, err %v", c.ClusterDomain, err)
+	}
+
+	t.Setenv("LEITWACHT_CE_CLUSTER_DOMAIN", "k8s.example")
+
+	if c, err = Load(); err != nil || c.ClusterDomain != "k8s.example" {
+		t.Fatalf("custom = %q, err %v", c.ClusterDomain, err)
+	}
+
+	t.Setenv("LEITWACHT_CE_CLUSTER_DOMAIN", " K8s.Example. ")
+
+	if c, err = Load(); err != nil || c.ClusterDomain != "k8s.example" {
+		t.Fatalf("normalised = %q, err %v", c.ClusterDomain, err)
+	}
+
+	t.Setenv("LEITWACHT_CE_CLUSTER_DOMAIN", "bad_domain..x")
+
+	if _, err = Load(); err == nil {
+		t.Fatal("invalid cluster domain must be rejected at startup")
+	}
+}

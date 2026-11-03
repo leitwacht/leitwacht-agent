@@ -101,7 +101,14 @@ type NetnsContext struct {
 
 	refcount        int                           // protected by Manager.mu
 	cgroupRecorders map[uint64]*ViolationRecorder // cgroup_id -> per-container recorder
-	pids            map[string]int                // containerID -> pid, for primaryPID update
+	// searchLists holds each container's resolv.conf search list, read once
+	// at attach (never re-read: a job rewriting the file must not widen the
+	// suppression set), keyed by every cgroup ID the DNS PID tracker may
+	// report for it. searchFirst is the first non-empty snapshot, used for
+	// unattributed (cgroup 0) queries. Both protected by mu.
+	searchLists map[uint64][]string
+	searchFirst []string
+	pids        map[string]int // containerID -> pid, for primaryPID update
 
 	// joinerDeny / joinerAllow track which deny- and static-allow-map
 	// entries each joiner contributed so Detach can reverse them.
@@ -178,6 +185,52 @@ type NetnsContext struct {
 	dnsContainerInfo atomic.Pointer[ContainerInfo]
 }
 
+// searchListFor returns the search list snapshotted for cgroupID, or the
+// netns's first snapshot when the query is unattributed (cgroup 0). An
+// unknown non-zero cgroup yields nil (no suppression).
+func (nctx *NetnsContext) searchListFor(cgroupID uint64) []string {
+	nctx.mu.RLock()
+	defer nctx.mu.RUnlock()
+
+	if cgroupID == 0 {
+		return nctx.searchFirst
+	}
+
+	return nctx.searchLists[cgroupID]
+}
+
+// registerSearchList snapshots the container's resolv.conf search list once
+// and records it under each cgroup ID. A missing or search-less file leaves
+// the container with no list (nothing is suppressed); logged once.
+func (m *Manager) registerSearchList(nctx *NetnsContext, cgroupIDs []uint64, pid int) {
+	root := m.procRoot
+	if root == "" {
+		root = "/proc"
+	}
+
+	list := readSearchList(root, pid)
+	if len(list) == 0 {
+		m.logger.Info("no resolver search list for container; DNS search-expansion suppression disabled", "pid", pid)
+
+		return
+	}
+
+	nctx.mu.Lock()
+	defer nctx.mu.Unlock()
+
+	if nctx.searchLists == nil {
+		nctx.searchLists = make(map[uint64][]string)
+	}
+
+	for _, id := range cgroupIDs {
+		nctx.searchLists[id] = list
+	}
+
+	if nctx.searchFirst == nil {
+		nctx.searchFirst = list
+	}
+}
+
 // lookupDNSRecorder returns the shared DNS recorder for DNS proxy queries.
 // All DNS activity across sibling containers lands in one recorder, ensuring
 // the build container's report includes helper DNS lookups (e.g., git clone).
@@ -244,6 +297,15 @@ type Enforcer struct {
 // Manager tracks all active enforcers across containers.
 type Manager struct {
 	mu sync.Mutex
+	// procRoot overrides "/proc" when reading a container's resolv.conf
+	// (tests only).
+	procRoot string
+	// ExpansionSuppression is "structural" (default when empty) or "off";
+	// see DNSProxyConfig.ExpansionSuppression. Set before the first Attach.
+	ExpansionSuppression string
+	// ClusterDomain is the Kubernetes cluster domain ("cluster.local" when
+	// empty); see DNSProxyConfig.ClusterDomain.
+	ClusterDomain string
 	// containerID → Enforcer (nil sentinel during in-flight Attach).
 	enforcers map[string]*Enforcer
 	// passive marks containerIDs in enforcers that were admitted as passive
@@ -1501,7 +1563,10 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 		// Gate the `attached` reply on egress being linked (set by
 		// attachPodLink for K8s pods, attachEnforcer for non-pod). Closes
 		// the race where the signal fires before AttachCgroup.
-		EgressReady: nctx.egressAttached.Load,
+		EgressReady:          nctx.egressAttached.Load,
+		SearchListFor:        nctx.searchListFor,
+		ExpansionSuppression: m.ExpansionSuppression,
+		ClusterDomain:        m.ClusterDomain,
 		OnDNSViolation: func(cgroupID uint64, domain, action string) {
 			m.handleDNSViolation(nctx, cgroupID, domain, action)
 		},
@@ -1711,6 +1776,8 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 		sockAttrCgroupIDs: sockAttrCgroupIDs,
 		dnsPIDCgroupIDs:   dnsPIDCgroupIDs,
 	}
+
+	m.registerSearchList(nctx, append([]uint64{cgID}, dnsPIDCgroupIDs...), pid)
 
 	// attach_path: ground-truth signal for "are we doing single pod-level
 	// attach in K8s?" Three buckets:
@@ -2177,6 +2244,15 @@ func (m *Manager) Detach(containerID string) *DetachResult {
 	nctx.mu.Lock()
 	delete(nctx.cgroupRecorders, e.cgroupID)
 	delete(nctx.pids, containerID)
+	delete(nctx.searchLists, e.cgroupID)
+
+	for _, id := range e.dnsPIDCgroupIDs {
+		delete(nctx.searchLists, id)
+	}
+
+	if len(nctx.searchLists) == 0 {
+		nctx.searchFirst = nil
+	}
 	nctx.mu.Unlock()
 
 	// Remove cgroups from DNS PID tracker (scope + any leaf

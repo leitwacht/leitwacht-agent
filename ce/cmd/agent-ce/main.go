@@ -294,6 +294,8 @@ func newEnforcer(cfg *config.Config, log *slog.Logger) (*enforcer.Manager, enfor
 	mgr.IsDocker = cfg.ContainerRuntime == "docker"
 	mgr.AgentVersion = version.Version
 	mgr.BucketInterval = cfg.BucketInterval
+	mgr.ExpansionSuppression = cfg.DNSExpansionSuppression
+	mgr.ClusterDomain = cfg.ClusterDomain
 
 	// When opted in via LEITWACHT_CE_RECORD_ENV_NAMES, attach env-var
 	// NAMES (never values) of the offending PID to each violation

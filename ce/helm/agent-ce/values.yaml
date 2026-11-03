@@ -73,9 +73,24 @@ unknownProject: enforce
 # A `helm install` without this set will fail at agent startup.
 dnsUpstream: ""
 
-# Trusted CIDRs that bypass enforcement (e.g., cluster pod / service nets).
-# Example: ["10.0.0.0/8", "192.168.0.0/16"]
+# Trusted CIDRs that bypass enforcement and are not recorded. Intended for
+# Docker/Podman executors, where service and helper containers sit on bridge
+# networks. On Kubernetes leave this empty: do not list pod or service CIDRs,
+# because block mode already drops cluster-internal addresses by default.
+# Example: ["172.17.0.0/16"]
 trustedCIDRs: []
+
+# DNS search-list expansion suppression. "structural" (default): a query that
+# is a search-list expansion of a public-looking domain under the cluster
+# domain (for example registry.example.org.<ns>.svc.cluster.local) is checked
+# against the cluster DNS; if it answers NXDOMAIN with no answers, the event is
+# dropped and the resolver goes on to the real name. Anything else, and every
+# expansion outside the cluster domain, is handled and recorded normally.
+# Quote "off" to disable (an unquoted off is a YAML boolean, also accepted).
+dnsExpansionSuppression: structural
+
+# Kubernetes cluster domain. Never derived from the container's search list.
+clusterDomain: cluster.local
 
 # Credwatch: BPF LSM hook that detects credential file access
 # (/.ssh/id_rsa, /.aws/credentials, etc.) inside monitored containers.

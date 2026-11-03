@@ -90,6 +90,10 @@ spec:
             {{- end }}
             - name: LEITWACHT_CE_PROC_MEM_ENABLED
               value: {{ .Values.procMem.enabled | quote }}
+            - name: LEITWACHT_CE_DNS_EXPANSION_SUPPRESSION
+              value: {{ if kindIs "bool" .Values.dnsExpansionSuppression }}{{ ternary "structural" "off" .Values.dnsExpansionSuppression | quote }}{{ else }}{{ .Values.dnsExpansionSuppression | default "structural" | quote }}{{ end }}
+            - name: LEITWACHT_CE_CLUSTER_DOMAIN
+              value: {{ .Values.clusterDomain | default "cluster.local" | quote }}
             - name: LEITWACHT_CE_RECORD_ENV_NAMES
               value: {{ .Values.recordEnvNames | default false | quote }}
             - name: LEITWACHT_CE_STDOUT_ENABLED

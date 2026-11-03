@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -18,7 +19,9 @@ import (
 	"github.com/containerd/containerd/v2/core/events"
 	"github.com/containerd/errdefs"
 	"github.com/containerd/typeurl/v2"
+	specs "github.com/opencontainers/runtime-spec/specs-go"
 
+	"gitlab.com/leitwacht/leitwacht-agent/agentcore/cgrouppath"
 	"gitlab.com/leitwacht/leitwacht-agent/agentcore/internal/idutil"
 )
 
@@ -276,10 +279,7 @@ func (w *ContainerdWatcher) handleTaskStart(ctx context.Context, containerID str
 	}
 
 	// Extract cgroup path from OCI spec (avoids cgroup namespace issues).
-	var cgroupPath string
-	if spec.Linux != nil && spec.Linux.CgroupsPath != "" {
-		cgroupPath = "/sys/fs/cgroup" + spec.Linux.CgroupsPath
-	}
+	cgroupPath := w.resolveCgroupsPath(containerID, spec.Linux)
 
 	event := extractContainerEvent(
 		"start",
@@ -402,10 +402,7 @@ func (w *ContainerdWatcher) RecoverRunning(ctx context.Context) ([]ContainerEven
 			mounts = append(mounts, m.Source)
 		}
 
-		var cgroupPath string
-		if spec.Linux != nil && spec.Linux.CgroupsPath != "" {
-			cgroupPath = "/sys/fs/cgroup" + spec.Linux.CgroupsPath
-		}
+		cgroupPath := w.resolveCgroupsPath(c.ID(), spec.Linux)
 
 		event := extractContainerEvent(
 			"start",
@@ -531,10 +528,7 @@ func (w *ContainerdWatcher) handleSandboxStart(
 		return
 	}
 
-	var cgroupPath string
-	if spec.Linux != nil && spec.Linux.CgroupsPath != "" {
-		cgroupPath = "/sys/fs/cgroup" + spec.Linux.CgroupsPath
-	}
+	cgroupPath := w.resolveCgroupsPath(containerID, spec.Linux)
 
 	podUID := info.Labels["io.kubernetes.pod.uid"]
 	w.rememberSandbox(containerID, podUID)
@@ -586,10 +580,7 @@ func (w *ContainerdWatcher) recoverSandbox(
 		return ContainerEvent{}, false
 	}
 
-	var cgroupPath string
-	if spec.Linux != nil && spec.Linux.CgroupsPath != "" {
-		cgroupPath = "/sys/fs/cgroup" + spec.Linux.CgroupsPath
-	}
+	cgroupPath := w.resolveCgroupsPath(c.ID(), spec.Linux)
 
 	podUID := info.Labels["io.kubernetes.pod.uid"]
 	w.rememberSandbox(c.ID(), podUID)
@@ -656,4 +647,38 @@ var truncID = idutil.Trunc
 // from enforcement and, after a crash, from recovery.
 func taskLive(s containerd.ProcessStatus) bool {
 	return s == containerd.Running || s == containerd.Paused || s == containerd.Pausing
+}
+
+// resolveCgroupsPath turns the OCI spec's linux.cgroupsPath (cgroupfs absolute
+// or systemd "slice:prefix:name" notation) into a filesystem path under the
+// cgroup mount. It returns "" when the spec has none, the value cannot be
+// resolved, or the resolved directory does not exist (for example forms this
+// agent does not model, such as rootless user-manager units). An empty
+// CgroupPath is not fatal: the enforcer then derives the cgroup from the
+// task PID via /proc/<pid>/cgroup.
+func (w *ContainerdWatcher) resolveCgroupsPath(containerID string, linux *specs.Linux) string {
+	return resolveCgroupsPathAt(w.logger, cgrouppath.DefaultMount, containerID, linux)
+}
+
+func resolveCgroupsPathAt(logger *slog.Logger, mount, containerID string, linux *specs.Linux) string {
+	if linux == nil || linux.CgroupsPath == "" {
+		return ""
+	}
+
+	p, err := cgrouppath.Resolve(mount, linux.CgroupsPath)
+	if err != nil {
+		logger.Warn("resolve cgroupsPath", "container_id", truncID(containerID), "error", err)
+
+		return ""
+	}
+
+	_, statErr := os.Stat(p)
+	if statErr != nil {
+		logger.Warn("resolved cgroup path not usable; falling back to PID lookup",
+			"container_id", truncID(containerID), "cgroup_path", p, "error", statErr)
+
+		return ""
+	}
+
+	return p
 }

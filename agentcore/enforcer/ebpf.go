@@ -100,7 +100,43 @@ func getCgroupPath(pid int) (string, error) {
 		return "", fmt.Errorf("%w: %q", errCgroupBadID, cgroupRelPath)
 	}
 
-	return findCgroupByID("/sys/fs/cgroup/kubepods", containerID)
+	return findCgroupByIDIn(podCgroupRoots("/sys/fs/cgroup"), containerID)
+}
+
+// maxCgroupWalkDepth bounds the search below each root. The deepest real
+// layout is kubelet.slice/kubelet-kubepods.slice/<qos>.slice/<pod>.slice/<scope>
+// (5 levels), so 6 leaves headroom without walking arbitrary trees.
+const maxCgroupWalkDepth = 6
+
+// podCgroupRoots lists the kubelet cgroup roots to search: the cgroupfs
+// driver's kubepods and the systemd driver's kubepods.slice, with or without
+// a kubelet.slice parent.
+func podCgroupRoots(mount string) []string {
+	return []string{
+		filepath.Join(mount, "kubepods"),
+		filepath.Join(mount, "kubepods.slice"),
+		filepath.Join(mount, "kubelet.slice"),
+	}
+}
+
+// findCgroupByIDIn tries each root in order and returns the first match.
+func findCgroupByIDIn(roots []string, containerID string) (string, error) {
+	var lastErr error
+
+	for _, root := range roots {
+		p, err := findCgroupByID(root, containerID)
+		if err == nil {
+			return p, nil
+		}
+
+		lastErr = err
+	}
+
+	if lastErr == nil {
+		lastErr = fmt.Errorf("%w: %s", errCgroupNotFound, truncID(containerID))
+	}
+
+	return "", lastErr
 }
 
 // findCgroupByID searches the cgroup tree for a directory matching the container ID.
@@ -110,6 +146,13 @@ func findCgroupByID(root, containerID string) (string, error) {
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return filepath.SkipDir
+		}
+
+		if d.IsDir() {
+			rel, relErr := filepath.Rel(root, path)
+			if relErr == nil && rel != "." && strings.Count(rel, string(filepath.Separator)) >= maxCgroupWalkDepth {
+				return filepath.SkipDir
+			}
 		}
 
 		if d.IsDir() && d.Name() == containerID {

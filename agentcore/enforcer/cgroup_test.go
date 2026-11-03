@@ -98,3 +98,47 @@ func TestFindCgroupByID_MissingRoot(t *testing.T) {
 		t.Fatal("expected error for missing root")
 	}
 }
+
+func TestFindCgroupByIDIn_SystemdRoots(t *testing.T) {
+	t.Parallel()
+
+	for _, top := range []string{
+		"kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod0a1b2c3d_1111_2222_3333_444455556666.slice",
+		"kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-besteffort.slice/kubelet-kubepods-besteffort-pod0a1b2c3d_1111_2222_3333_444455556666.slice",
+	} {
+		mount := t.TempDir()
+		scope := "cri-containerd-abc123.scope"
+
+		if err := os.MkdirAll(filepath.Join(mount, top, scope), 0o750); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := findCgroupByIDIn(podCgroupRoots(mount), scope)
+		if err != nil {
+			t.Fatalf("%s: %v", top, err)
+		}
+
+		if got != filepath.Join(mount, top, scope) {
+			t.Fatalf("got %q", got)
+		}
+	}
+}
+
+func TestFindCgroupByIDIn_NotFoundAndDepthBound(t *testing.T) {
+	t.Parallel()
+
+	mount := t.TempDir()
+	deep := filepath.Join(mount, "kubepods.slice", "a", "b", "c", "d", "e", "f", "g", "target")
+
+	if err := os.MkdirAll(deep, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := findCgroupByIDIn(podCgroupRoots(mount), "target"); err == nil {
+		t.Fatal("expected depth bound to hide a too-deep match")
+	}
+
+	if _, err := findCgroupByIDIn(podCgroupRoots(mount), "missing"); err == nil {
+		t.Fatal("expected not found")
+	}
+}

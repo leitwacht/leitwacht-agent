@@ -242,7 +242,7 @@ func (h *Handler) containerScope(ev watcher.ContainerEvent) string {
 		}
 	}
 
-	// containerd may report a systemd-style "slice:prefix:name" here, and
+	// The watcher already resolved any systemd "slice:prefix:name" notation;
 	// anything outside the cgroup mount is not a path we may write to.
 	if strings.HasPrefix(ev.CgroupPath, cgroupMount+"/") {
 		return enforcer.ScopeCgroup(ev.CgroupPath)

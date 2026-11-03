@@ -42,8 +42,9 @@ var podUIDPattern = regexp.MustCompile(
 //	cgroupfs:
 //	  …/kubepods/<qos>/pod<UID>/<container-id>
 //
-// Inputs are expected to be absolute paths as supplied by the runtime
-// (containerd's `spec.Linux.CgroupsPath` prepended with `/sys/fs/cgroup`).
+// Inputs are expected to be absolute filesystem paths under the cgroup
+// mount, as produced by cgrouppath.Resolve from the runtime's cgroupsPath
+// (which handles both cgroupfs and systemd "slice:prefix:name" notation).
 // Cgroup-namespaced relative forms with leading `..` segments do not reach
 // this function — they would only appear when reading `/proc/<pid>/cgroup`
 // from the agent's own namespace, which is not how the enforcer obtains

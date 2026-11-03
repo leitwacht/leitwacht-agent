@@ -228,8 +228,13 @@ func (b *BuildKitEgressAttach) Close() error {
 	var firstErr error
 
 	b.closeOnce.Do(func() {
-		b.cancel()
+		// Stop the ringbuf reader first: stopRing owns its own derived
+		// context (it does not depend on ours) and returns only once the
+		// reader goroutine has exited, so every event it already pulled is
+		// in the recorder. Only then cancel the flusher's context, whose
+		// final flush therefore sees those late events.
 		b.stopRing()
+		b.cancel()
 		<-b.flusherDone
 
 		for _, l := range b.links {

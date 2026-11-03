@@ -198,3 +198,34 @@ func TestBuildKitEgressAttach_FlusherEmitsReports(t *testing.T) {
 		t.Fatal("flusher did not emit a report within 2s")
 	}
 }
+
+// TestBuildKitEgressAttach_CloseStopsRingBeforeCancel pins the shutdown
+// order: the ringbuf reader must be stopped before the flusher's context
+// is cancelled, so the flusher's final flush sees every late event.
+func TestBuildKitEgressAttach_CloseStopsRingBeforeCancel(t *testing.T) {
+	t.Parallel()
+
+	var order []string
+
+	done := make(chan struct{})
+	close(done)
+
+	b := &BuildKitEgressAttach{
+		handle:      &fakeEBPFHandle{platform: &fakePlatform{}},
+		cancel:      func() { order = append(order, "cancel") },
+		stopRing:    func() { order = append(order, "stopRing") },
+		flusherDone: done,
+	}
+
+	if err := b.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := b.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+
+	if len(order) != 2 || order[0] != "stopRing" || order[1] != "cancel" {
+		t.Fatalf("shutdown order = %v, want [stopRing cancel]", order)
+	}
+}

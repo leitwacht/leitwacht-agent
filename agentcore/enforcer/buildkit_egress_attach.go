@@ -174,31 +174,39 @@ func (b *BuildKitEgressAttach) runFlusher(
 		StartedAt:   time.Now(),
 	}
 
+	flush := func(bucketTS time.Time) {
+		violations, dns, overflow := b.recorder.SnapshotAndReset()
+		if len(violations) == 0 && len(dns) == 0 {
+			return
+		}
+
+		markUnattributed(violations)
+
+		stats := &EgressStats{
+			DNSActivity:   dns,
+			Violations:    violations,
+			OverflowCount: overflow,
+		}
+
+		report(context.Background(), info, stats, true, bucketTS)
+
+		log.Debug("buildkit egress attach: bucket flushed",
+			"violations", len(violations),
+			"dns_entries", len(dns),
+			"overflow", overflow,
+		)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
+			// Final flush so a partial bucket is not lost on
+			// restart or shutdown.
+			flush(time.Now())
+
 			return
 		case bucketTS := <-ticker.C:
-			violations, dns, overflow := b.recorder.SnapshotAndReset()
-			if len(violations) == 0 && len(dns) == 0 {
-				continue
-			}
-
-			markUnattributed(violations)
-
-			stats := &EgressStats{
-				DNSActivity:   dns,
-				Violations:    violations,
-				OverflowCount: overflow,
-			}
-
-			report(context.Background(), info, stats, true, bucketTS)
-
-			log.Debug("buildkit egress attach: bucket flushed",
-				"violations", len(violations),
-				"dns_entries", len(dns),
-				"overflow", overflow,
-			)
+			flush(bucketTS)
 		}
 	}
 }

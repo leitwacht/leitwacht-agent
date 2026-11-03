@@ -189,8 +189,20 @@ func (j *CgroupJoiner) Run(ctx context.Context) error {
 	removes := make(chan CgroupRemoveEvent, j.channelBuffer)
 
 	sourceErr := make(chan error, 1)
+	sourceDone := make(chan struct{})
+
 	go func() {
+		defer close(sourceDone)
+
 		sourceErr <- j.source.Run(ctx, creates, removes)
+	}()
+
+	// Await the source goroutine so a caller that cancels ctx and
+	// waits for Run knows the event source is gone. (Deferred-match
+	// goroutines are bound to ctx and exit on cancellation; they are
+	// not awaited here.)
+	defer func() {
+		<-sourceDone
 	}()
 
 	for {

@@ -33,6 +33,15 @@ type InotifyCgroupSource struct {
 	// in that case so operators see a loud config issue.
 	WatchPaths []string
 
+	// ScanExisting, when set, reports every directory already present
+	// under each watch path as a create once the initial watches are
+	// in place. Use it for sources started after the cgroup parent
+	// already exists (lazy activation, restarts) so children created
+	// before the watch existed are still seen by the joiner. Leave it
+	// unset for a cold agent start, where pre-existing children
+	// belong to in-flight builds the fresh registry cannot match.
+	ScanExisting bool
+
 	// rewatchEvery overrides rewatchInterval. Test-only.
 	rewatchEvery time.Duration
 }
@@ -144,6 +153,14 @@ func (s *InotifyCgroupSource) Run(ctx context.Context, creates chan<- CgroupCrea
 		}
 
 		return nil
+	}
+
+	if s.ScanExisting {
+		for _, p := range s.WatchPaths {
+			if err := emitExisting(p); err != nil {
+				return err
+			}
+		}
 	}
 
 	retryLost := func() error {

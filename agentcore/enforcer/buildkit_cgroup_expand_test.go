@@ -1,6 +1,4 @@
-//go:build linux
-
-package main
+package enforcer
 
 import (
 	"io"
@@ -86,7 +84,7 @@ func TestExpandCgroupGlobs(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := expandCgroupGlobs(tc.patterns, log)
+			got := ExpandCgroupGlobs(tc.patterns, log)
 			sort.Strings(got)
 
 			want := append([]string{}, tc.want...)

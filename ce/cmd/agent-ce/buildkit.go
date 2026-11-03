@@ -4,11 +4,9 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"io"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -45,15 +43,16 @@ const buildKitSessionTTL = 2 * time.Minute
 // egress events stay unattributed at the cgroup level — useful for
 // confirming Phase 1 wiring before tuning the path.
 //
-// Returns the BuildKitEgressAttach (or nil when not started) so main()
-// can Close() it during shutdown. Returning nil-error nil-attach is
-// the documented "feature disabled" outcome.
+// Returns the CgroupResolver (or nil when not started) so main() can
+// Close() it during shutdown (it owns the joiner and egress attach).
+// Returning nil-error nil-resolver is the documented "feature
+// disabled" outcome.
 func startBuildKitAttribution(
 	ctx context.Context,
 	cfg *config.Config,
 	log *slog.Logger,
 	mgr *enforcer.Manager,
-) (*enforcer.BuildKitEgressAttach, error) {
+) (*enforcer.CgroupResolver, error) {
 	if cfg.BuildkitGRPCAddr == "" {
 		return nil, nil //nolint:nilnil // documented disable
 	}
@@ -94,131 +93,80 @@ func startBuildKitAttribution(
 	enforcer.SetBuildKitLookup(registry.LookupByCgroupID)
 
 	rawPatterns := splitTrim(cfg.BuildkitCgroupPaths, ",")
-	cgroupPaths := expandCgroupGlobs(rawPatterns, log)
-
-	switch {
-	case len(cgroupPaths) > 0:
-		source := enforcer.NewInotifyCgroupSource(cgroupPaths)
-		joiner := enforcer.NewCgroupJoiner(registry, source, log)
-
-		go superviseJoiner(ctx, joiner, log)
-
-		log.Info("buildkit attribution active",
-			"grpc_addr", cfg.BuildkitGRPCAddr,
-			"cgroup_patterns", strings.Join(rawPatterns, ","),
-			"cgroup_paths_resolved", strings.Join(cgroupPaths, ","),
-		)
-	case len(rawPatterns) > 0:
-		log.Warn("buildkit attribution: cgroup patterns supplied but no paths matched; cgroup-join disabled",
-			"grpc_addr", cfg.BuildkitGRPCAddr,
-			"cgroup_patterns", strings.Join(rawPatterns, ","),
-		)
-	default:
+	if len(rawPatterns) == 0 {
 		log.Warn("buildkit attribution active without cgroup-join "+
 			"(LEITWACHT_CE_BUILDKIT_CGROUP_PATHS is empty); "+
 			"sessions and vertices will be tracked but egress events "+
 			"will not carry per-vertex attribution",
 			"grpc_addr", cfg.BuildkitGRPCAddr,
 		)
+
+		return nil, nil //nolint:nilnil // nothing to attach to
 	}
 
-	// Cgroup-level egress attach. The joiner above populates the
-	// SessionRegistry with cgroup_id → vertex bindings; the attach
+	// buildkitd creates its cgroup parent lazily (first RUN step), so
+	// the patterns are re-resolved in the background: the resolver
+	// (re)starts the joiner and the egress attach whenever the
+	// resolved set becomes non-empty or changes. The startup
+	// expansion is synchronous, so an attach failure there stays
+	// fatal.
+	//
+	// Cgroup-level egress attach: the joiner populates the
+	// SessionRegistry with cgroup_id -> vertex bindings; the attach
 	// loads a manager-owned eBPF egress filter at the same cgroup
-	// parents so RUN-step traffic actually reaches LookupBuildKitBinding
-	// in the ringbuf reader.
+	// parents so RUN-step traffic reaches LookupBuildKitBinding.
 	//
 	// Opt-out (LEITWACHT_CE_BUILDKIT_DISABLE_CGROUP_ATTACH=true):
 	// keeps the registry/watcher/joiner running but skips the eBPF
-	// load. Effectively disables BuildKit egress observation + future
-	// enforcement; useful when the cgroup_skb attach isn't supported
-	// (cgroup v1, exotic namespacing) and the operator prefers
-	// session/vertex tracking only over a startup error.
+	// load. Useful when cgroup_skb attach isn't supported (cgroup v1,
+	// exotic namespacing) and the operator prefers session/vertex
+	// tracking only over a startup error.
+	rc := enforcer.CgroupResolverConfig{
+		Patterns: rawPatterns,
+		Logger:   log,
+		LogAttrs: []any{
+			"grpc_addr", cfg.BuildkitGRPCAddr,
+			"cgroup_patterns", strings.Join(rawPatterns, ","),
+		},
+		NewJoiner: func(paths []string, scanExisting bool) enforcer.JoinerRunner {
+			src := enforcer.NewInotifyCgroupSource(paths)
+			src.ScanExisting = scanExisting
+
+			return enforcer.NewCgroupJoiner(registry, src, log)
+		},
+	}
+
 	if cfg.BuildkitDisableCgroupAttach {
 		log.Info("buildkit cgroup-level attach disabled by config; sessions tracked, egress unobserved",
 			"reason", "LEITWACHT_CE_BUILDKIT_DISABLE_CGROUP_ATTACH=true",
 		)
+	} else {
+		rc.StartAttach = func(ctx context.Context, paths []string) (io.Closer, error) {
+			a, err := enforcer.StartBuildKitEgressAttach(
+				ctx, mgr.Platform(), paths, log, mgr.ReportFunc, mgr.BucketInterval)
+			if err != nil {
+				return nil, fmt.Errorf("buildkit egress attach: %w", err)
+			}
 
-		return nil, nil //nolint:nilnil // documented disable
+			if a == nil {
+				return nil, nil //nolint:nilnil // no paths: nothing to close
+			}
+
+			log.Info("buildkit egress attach active",
+				"cgroup_paths", strings.Join(paths, ","),
+				"bucket_interval", mgr.BucketInterval,
+			)
+
+			return a, nil
+		}
 	}
 
-	if len(cgroupPaths) == 0 {
-		return nil, nil //nolint:nilnil // nothing to attach to
+	resolver := enforcer.NewCgroupResolver(rc)
+	if err := resolver.Start(ctx); err != nil {
+		return nil, err
 	}
 
-	attach, err := enforcer.StartBuildKitEgressAttach(
-		ctx,
-		mgr.Platform(),
-		cgroupPaths,
-		log,
-		mgr.ReportFunc,
-		mgr.BucketInterval,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("buildkit egress attach: %w", err)
-	}
-
-	log.Info("buildkit egress attach active",
-		"cgroup_paths", strings.Join(cgroupPaths, ","),
-		"bucket_interval", mgr.BucketInterval,
-	)
-
-	return attach, nil
-}
-
-// joinerRestartMin and joinerRestartMax bound the backoff between
-// cgroup-joiner restarts.
-const (
-	joinerRestartMin = time.Second
-	joinerRestartMax = time.Minute
-)
-
-// joinerRunner is the part of the cgroup joiner the supervisor needs;
-// an interface so tests can drive restarts.
-type joinerRunner interface {
-	Run(ctx context.Context) error
-}
-
-// superviseJoiner runs the cgroup joiner and restarts it with
-// exponential backoff whenever it exits before ctx is done. A dead
-// joiner would otherwise leave every new RUN cgroup unbound (and, with
-// a kill policy configured, unchecked) until the agent restarts.
-func superviseJoiner(ctx context.Context, joiner joinerRunner, log *slog.Logger) {
-	superviseJoinerWith(ctx, joiner, log, joinerRestartMin, joinerRestartMax)
-}
-
-func superviseJoinerWith(ctx context.Context, joiner joinerRunner, log *slog.Logger, minB, maxB time.Duration) {
-	backoff := minB
-
-	for ctx.Err() == nil {
-		started := time.Now()
-		err := joiner.Run(ctx)
-
-		if ctx.Err() != nil {
-			return
-		}
-
-		// A run that stayed up a while was healthy; restart quickly.
-		if time.Since(started) > maxB {
-			backoff = minB
-		}
-
-		if errors.Is(err, enforcer.ErrCgroupJoinUnsupported) {
-			log.Error("buildkit cgroup joiner unsupported; not restarting", "error", err)
-
-			return
-		}
-
-		log.Error("buildkit cgroup joiner exited; restarting", "error", err, "backoff", backoff)
-
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(backoff):
-		}
-
-		backoff = min(backoff*2, maxB)
-	}
+	return resolver, nil
 }
 
 // compileDenyVertexPatterns parses the comma-separated regex list from
@@ -265,80 +213,6 @@ func resolveRequiredAttrs(raw string) []string {
 	for _, k := range plain {
 		k = strings.ToUpper(k)
 		out = append(out, "build-arg:"+k)
-	}
-
-	return out
-}
-
-// expandCgroupGlobs walks each configured cgroup pattern and resolves
-// it to concrete paths via filepath.Glob, deduplicating the result.
-// Plain (non-glob) paths flow through unchanged when they exist; a
-// non-existent plain path is logged at WARN but otherwise dropped.
-// Glob patterns that match zero paths log at WARN (operators tend to
-// notice "no buildkitd seen yet" better than a silent skip).
-//
-// Operators in K8s pass shapes like:
-//
-//	/sys/fs/cgroup/kubepods.slice/**/buildkit
-//	/sys/fs/cgroup/system.slice/docker-*.scope/buildkit
-//
-// The Go stdlib glob supports `*` per path component but not the
-// `**` operator. We approximate `**` by treating it as `*` per
-// component during pattern walk: callers that want deep wildcards
-// should write a `*` per directory level (e.g.,
-// `kubepods.slice/*/*/buildkit`) or use a wrapper that pre-expands.
-func expandCgroupGlobs(patterns []string, log *slog.Logger) []string {
-	if len(patterns) == 0 {
-		return nil
-	}
-
-	seen := make(map[string]struct{}, len(patterns))
-	out := make([]string, 0, len(patterns))
-
-	for _, p := range patterns {
-		if !strings.ContainsAny(p, "*?[") {
-			info, err := os.Stat(p)
-			if err != nil || !info.IsDir() {
-				log.Warn("buildkit cgroup path missing or not a directory; skipping",
-					"path", p, "error", err)
-
-				continue
-			}
-
-			if _, dup := seen[p]; !dup {
-				seen[p] = struct{}{}
-				out = append(out, p)
-			}
-
-			continue
-		}
-
-		matches, err := filepath.Glob(p)
-		if err != nil {
-			log.Warn("buildkit cgroup glob is malformed; skipping",
-				"pattern", p, "error", err)
-
-			continue
-		}
-
-		if len(matches) == 0 {
-			log.Warn("buildkit cgroup glob matched zero paths",
-				"pattern", p)
-
-			continue
-		}
-
-		for _, m := range matches {
-			info, err := os.Stat(m)
-			if err != nil || !info.IsDir() {
-				continue
-			}
-
-			if _, dup := seen[m]; !dup {
-				seen[m] = struct{}{}
-				out = append(out, m)
-			}
-		}
 	}
 
 	return out

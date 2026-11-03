@@ -13,6 +13,9 @@ import (
 // main loop can degrade gracefully.
 type InotifyCgroupSource struct {
 	WatchPaths []string
+
+	// ScanExisting is accepted for portability and ignored.
+	ScanExisting bool
 }
 
 // NewInotifyCgroupSource matches the Linux signature so callers stay

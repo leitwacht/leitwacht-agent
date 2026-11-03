@@ -1,6 +1,4 @@
-//go:build linux
-
-package main
+package enforcer
 
 import (
 	"context"
@@ -10,8 +8,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"gitlab.com/leitwacht/leitwacht-agent/agentcore/enforcer"
 )
 
 type flakyJoiner struct {
@@ -63,7 +59,7 @@ func TestSuperviseJoiner_RestartsAfterExit(t *testing.T) {
 func TestSuperviseJoiner_StopsOnUnsupported(t *testing.T) {
 	t.Parallel()
 
-	j := &flakyJoiner{failFor: 100, failWith: enforcer.ErrCgroupJoinUnsupported}
+	j := &flakyJoiner{failFor: 100, failWith: ErrCgroupJoinUnsupported}
 	done := make(chan struct{})
 
 	go func() {

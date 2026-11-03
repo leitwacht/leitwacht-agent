@@ -407,7 +407,7 @@ Descendant cgroups. The LSM programs (`credwatch`, `proc_mem`) look up
 the task's own cgroup id in `known_containers` first; on a miss they walk
 the task's ancestors with `bpf_get_current_ancestor_cgroup_id` (absolute
 levels 0..15, stopping at the task's own level) and take the first
-registered container, root-most first. A process that `mkdir`s a child
+registered container, nearest first. A process that `mkdir`s a child
 cgroup under a monitored container and moves itself in (privileged or
 dind jobs, any writable cgroupfs) is therefore still enforced, with the
 matched container's flags (enforce / observe-only / exempt). The bound is

@@ -126,9 +126,9 @@ struct {
  * current task belongs to. leaf is bpf_get_current_cgroup_id(); on
  * success *match is the container's cgroup id (== leaf for an exact
  * match, an ancestor id otherwise) and the container's config is
- * returned. The leaf is tried first, then ancestors from the root
- * downwards; the first registered one wins (the outermost, i.e. the
- * enclosing job container, when containers are nested). Requires bpf_get_current_ancestor_cgroup_id (5.7, same release
+ * returned. The leaf is tried first, then ancestors from the nearest
+ * one upwards; the first registered one wins, so with nested registered
+ * containers the INNERMOST (nearest) container's config applies. Requires bpf_get_current_ancestor_cgroup_id (5.7, same release
  * that introduced BPF LSM, so no new kernel requirement). */
 static __always_inline struct cgroup_proc_config *find_container(__u64 leaf, __u64 *match)
 {
@@ -139,15 +139,31 @@ static __always_inline struct cgroup_proc_config *find_container(__u64 leaf, __u
         return cfg;
     }
 
+    /* Pass 1: the task's own level. Ancestors at levels 0..depth-1 are
+     * strict ancestors; depth defaults to MAX_ANCESTOR_LEVEL when the task
+     * sits at or below the last probed level (all probed levels are then
+     * strict ancestors). Single-pass "remember the last match" is
+     * miscompiled by clang 14 (verifier: R1 !read_ok), hence two passes. */
+    int depth = MAX_ANCESTOR_LEVEL;
+
 #pragma unroll
     for (int lvl = 0; lvl < MAX_ANCESTOR_LEVEL; lvl++) {
         __u64 anc = bpf_get_current_ancestor_cgroup_id(lvl);
 
-        /* 0: lvl is deeper than the task's cgroup. == leaf: reached the
-         * task's own level (already looked up). Either way no more
-         * strict ancestors remain. */
-        if (anc == 0 || anc == leaf)
+        if (anc == 0 || anc == leaf) {
+            depth = lvl;
             break;
+        }
+    }
+
+    /* Pass 2: nearest ancestor first, so the innermost registered
+     * container wins. */
+#pragma unroll
+    for (int lvl = MAX_ANCESTOR_LEVEL - 1; lvl >= 0; lvl--) {
+        if (lvl >= depth)
+            continue;
+
+        __u64 anc = bpf_get_current_ancestor_cgroup_id(lvl);
 
         cfg = bpf_map_lookup_elem(&known_containers, &anc);
         if (cfg) {

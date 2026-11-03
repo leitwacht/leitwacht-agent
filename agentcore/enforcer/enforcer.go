@@ -427,8 +427,11 @@ func (m *Manager) CgroupPathForPID(pid int) (string, error) {
 	return m.platform.GetCgroupPath(pid)
 }
 
-// ContainerIDForCgroup resolves a cgroup ID to a container ID by searching
-// the credwatch and proc_mem cgroup-to-container maps.
+// ContainerIDForCgroup resolves a REGISTERED container cgroup ID to a
+// container ID by searching the credwatch and proc_mem cgroup-to-container
+// maps. It does not resolve descendant cgroups: pass an event's
+// ContainerCgroupID (the matched container cgroup), not its CgroupID
+// (the task's own, possibly unregistered, child cgroup).
 func (m *Manager) ContainerIDForCgroup(cgroupID uint64) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()

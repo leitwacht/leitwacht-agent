@@ -64,3 +64,16 @@ func TestVerifierStatsEgress(t *testing.T) {
 
 	logVerifierStats(t, spec)
 }
+
+func TestVerifierStatsProcMem(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+
+	spec, err := loadProcMem()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	logVerifierStats(t, spec)
+}

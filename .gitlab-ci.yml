@@ -66,6 +66,9 @@ variables:
 
 default:
   image: ${GO_IMAGE}
+  id_tokens:
+    LEITWACHT_JOB_TOKEN:
+      aud: leitwacht-dogfood
 
 # ---------------------------------------------------------------- LINT
 lint:
@@ -283,6 +286,8 @@ build-agent-ce:
   variables:
     COSIGN_YES: "true"
   id_tokens:
+    LEITWACHT_JOB_TOKEN:
+      aud: leitwacht-dogfood
     SIGSTORE_ID_TOKEN:
       aud: sigstore
   before_script:
@@ -357,6 +362,8 @@ sbom-agent-ce:
   variables:
     COSIGN_YES: "true"
   id_tokens:
+    LEITWACHT_JOB_TOKEN:
+      aud: leitwacht-dogfood
     SIGSTORE_ID_TOKEN:
       aud: sigstore
   before_script:

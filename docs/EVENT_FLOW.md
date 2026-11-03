@@ -533,3 +533,69 @@ per query, with no buffering and no timers.
   `DNSProxyConfig.ClusterDomain` (CE `LEITWACHT_CE_CLUSTER_DOMAIN`, EE
   `LEITWACHT_CLUSTER_DOMAIN`, helm `clusterDomain` /
   `agent.clusterDomain`) sets the cluster domain.
+
+## DNS configuration advisory (`dns_config`)
+
+The same attach-time `resolv.conf` read (and the same security rules)
+also yields `options ndots:N` (last occurrence wins, clamped to 0-15 as
+in glibc, default 1 when absent). Per container the agent computes:
+
+- `ndots`, `ndots_explicit` (false when the default applies);
+- `search_count`, the number of search domains (at most 6);
+- `noncluster_search_count`, the search domains neither equal to nor
+  under the configured cluster domain (never derived from the file);
+- `extra_queries_2dot` / `extra_queries_1dot`: lookups issued per record
+  type before the absolute try, for a name such as
+  `registry.example.com` (2 dots) and `example.com` (1 dot). A name with
+  fewer dots than `ndots` is relative, so every search domain is tried
+  first (extra = `search_count`); otherwise the absolute name goes first
+  (extra = 0). Names with a trailing dot are unaffected.
+
+One structured Info line, `dns config observed`, is logged per attach
+with exactly those numbers, `readable` (false when resolv.conf could not
+be read, as opposed to empty) and the truncated container ID.
+Search-domain names are container-controlled and are never logged.
+
+A `dns_config` advisory (action `observed`, no enforcement effect) is
+emitted when `ndots >= 3 AND search_count >= 2` (recommendation
+`lower_ndots`: set `ndots:2` via the pod `dnsConfig`) or
+`noncluster_search_count >= 1` (`node_search_domains`, which wins when
+both hold). Both are Kubernetes advice, so they are evaluated only when
+the container attached under a pod cgroup shape or its search list has an
+entry under the cluster domain; Docker/Podman containers (LAN domains and
+the like) are logged but get no advisory.
+
+Delivery never touches the attach path. The advisory is queued to one
+background worker (64 deep; overflow and post-shutdown observations are
+dropped and counted, `Manager.DNSConfigDropped`), so the callback set with
+`Manager.SetOnDNSConfig` runs on a background goroutine and must be
+concurrency-safe. It is reported at most once per netns for an unattributed
+attach (the init sibling that usually attaches first) plus at most once for
+an attributed one, and at most once per hour per config fingerprint (ndots
+plus search list), with one exception: an attributed report is still
+delivered inside the hour when the last delivered report for that config
+was unattributed, so the build container's report (with project and job) is
+not lost to the sibling's. An unattributed report never displaces an
+attributed one inside the hour. `seen_count` is the number of reports of
+that config that passed the per-netns gate since the previous delivery
+(not a raw attach count). It is raised after the attach has succeeded, and
+carries `ProjectPath`/`JobID`/`JobURL` (inherited from the netns primary
+when the container has none).
+
+The advisory `message` is pure space-separated `key=value` (so the EE gRPC
+adapter needs no proto change, only an accepted `advisory_type`); CE
+NDJSON/webhook records also carry a structured `details` object,
+including `noncluster_suffixes` (sanitised to `[a-z0-9._-]`, at most 6,
+253 characters each; still container-controlled, so render escaped). The
+Prometheus advisory counter counts it under `kind="dns_config"`.
+
+Where the parser deliberately differs from glibc:
+
+- `ndots:3abc`: glibc's atoi reads 3; the agent ignores the token. Huge
+  all-digit values clamp to 15; other non-numeric values are ignored.
+- An inline `#` on an options line ends the line for the agent; glibc does
+  not treat it as a comment there.
+- Search lists are capped at 6 entries (glibc before 2.26's limit); newer
+  glibc and musl accept more, so counts are a lower bound.
+- `RES_OPTIONS` / `LOCALDOMAIN` in the process environment override the
+  file and are invisible to the agent.

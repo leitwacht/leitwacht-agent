@@ -168,6 +168,11 @@ func main() {
 	h.DisableFreeze = cfg.FreezeTimeout == 0
 
 	wireCredwatchKill(mgr, w, multi, log)
+	mgr.SetOnDNSConfig(func(o enforcer.DNSConfigObservation) {
+		if a := o.Advisory(); a != nil {
+			_ = multi.ReportAdvisory(context.Background(), a)
+		}
+	})
 	emitCredwatchAdvisory(credwatchCfg, mgr, multi)
 	wireProcMemKill(mgr, w, multi, log)
 	emitProcMemAdvisory(cfg, mgr, multi)

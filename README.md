@@ -60,6 +60,15 @@ violations). This is deliberate: leitwacht is the data plane for **CI
 runner** egress, and non-runner workloads should not be silently
 intercepted. Non-Runner use cases are out of scope for v0.1.0.
 
+## DNS configuration advisory
+
+At attach the agent reads each container's `resolv.conf` (ndots and search
+domains) and logs one `dns config observed` line with counts only. When the
+configuration amplifies lookups (`ndots >= 3` with 2+ search domains) or
+carries non-cluster search suffixes, CE emits a `dns_config` advisory on its
+NDJSON / webhook / Prometheus sinks, with a `lower_ndots` or
+`node_search_domains` recommendation. Details: `docs/EVENT_FLOW.md`.
+
 ## Known limitations (v0.1.0)
 
 - **IPv4 only.** The eBPF programs and DNS proxy enforce on IPv4 traffic; IPv6 egress is dropped at the netns boundary regardless of policy. CI jobs that require IPv6 connectivity cannot use leitwacht enforcement until this is addressed.

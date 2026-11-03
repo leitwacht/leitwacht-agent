@@ -20,9 +20,18 @@ const fuseSuperMagic = 0x65735546
 // host files; the final component must be a regular file (no FIFO/device
 // open can block the agent). Any failure yields nil (no suppression).
 func readSearchList(procRoot string, pid int) []string {
+	return readResolvConf(procRoot, pid).search
+}
+
+// readResolvConf is readSearchList's full form: it also yields ndots. Any
+// failure yields the zero-value defaults (no search list, ndots 1, not
+// explicit).
+func readResolvConf(procRoot string, pid int) resolvConf {
+	none := resolvConf{ndots: defaultNdots}
+
 	rootFd, err := unix.Open(procRoot+"/"+strconv.Itoa(pid)+"/root", unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil
+		return none
 	}
 	defer unix.Close(rootFd) //nolint:errcheck // best-effort close of a read-only fd
 
@@ -33,25 +42,25 @@ func readSearchList(procRoot string, pid int) []string {
 		Resolve: unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS,
 	})
 	if err != nil {
-		return nil
+		return none
 	}
 	defer unix.Close(pathFd) //nolint:errcheck // best-effort close of an O_PATH fd
 
 	var st unix.Stat_t
 	if unix.Fstat(pathFd, &st) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG {
-		return nil
+		return none
 	}
 
 	// A FUSE server could stall a synchronous attach on read.
 	var sfs unix.Statfs_t
 	if unix.Fstatfs(pathFd, &sfs) != nil || sfs.Type == fuseSuperMagic {
-		return nil
+		return none
 	}
 
 	// Reopen the very same inode (no path walk, so no TOCTOU).
 	fd, err := unix.Open("/proc/self/fd/"+strconv.Itoa(pathFd), unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NONBLOCK, 0)
 	if err != nil {
-		return nil
+		return none
 	}
 
 	f := os.NewFile(uintptr(fd), "resolv.conf")
@@ -59,8 +68,8 @@ func readSearchList(procRoot string, pid int) []string {
 
 	buf, err := io.ReadAll(io.LimitReader(f, maxResolvConfBytes))
 	if err != nil && !errors.Is(err, io.EOF) {
-		return nil
+		return none
 	}
 
-	return parseSearchList(buf)
+	return parseResolvConf(buf)
 }

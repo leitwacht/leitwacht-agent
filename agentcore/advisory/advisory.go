@@ -30,6 +30,12 @@ const (
 	KindProcMemRead              Kind = "proc_mem_read"
 	KindProcMemLSMUnavailable    Kind = "proc_mem_lsm_unavailable"
 	KindDNSViolationKill         Kind = "dns_violation_kill"
+	// KindDNSConfig flags a container resolver configuration (ndots,
+	// search domains) that amplifies lookups or carries non-cluster
+	// suffixes. Informational; no enforcement change. EE carries it on
+	// the existing advisory_type + message fields (no proto change); the
+	// server must accept the new advisory_type string.
+	KindDNSConfig Kind = "dns_config"
 )
 
 // Advisory is the plain-Go view of a single security concern the agent
@@ -52,4 +58,10 @@ type Advisory struct {
 	ActionTaken  string
 	PolicyAction string
 	OccurredAt   time.Time
+
+	// Details is optional structured payload for sinks that can render it
+	// (CE NDJSON/webhook). It is NOT carried by the EE gRPC adapter: every
+	// advisory that sets Details must also put the same facts in Message.
+	// Values may include container-controlled strings; render escaped.
+	Details map[string]any
 }

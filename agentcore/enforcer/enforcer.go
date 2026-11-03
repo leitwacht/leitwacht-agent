@@ -108,7 +108,11 @@ type NetnsContext struct {
 	// unattributed (cgroup 0) queries. Both protected by mu.
 	searchLists map[uint64][]string
 	searchFirst []string
-	pids        map[string]int // containerID -> pid, for primaryPID update
+	// dnsCfgReported / dnsCfgReportedAttributed gate the dns_config report
+	// to at most one per netns (an unattributed sibling report is allowed
+	// only before any report; an attributed one once). Protected by mu.
+	dnsCfgReported, dnsCfgReportedAttributed bool
+	pids                                     map[string]int // containerID -> pid, for primaryPID update
 
 	// joinerDeny / joinerAllow track which deny- and static-allow-map
 	// entries each joiner contributed so Detach can reverse them.
@@ -202,17 +206,19 @@ func (nctx *NetnsContext) searchListFor(cgroupID uint64) []string {
 // registerSearchList snapshots the container's resolv.conf search list once
 // and records it under each cgroup ID. A missing or search-less file leaves
 // the container with no list (nothing is suppressed); logged once.
-func (m *Manager) registerSearchList(nctx *NetnsContext, cgroupIDs []uint64, pid int) {
+func (m *Manager) registerSearchList(nctx *NetnsContext, cgroupIDs []uint64, pid int) resolvConf {
 	root := m.procRoot
 	if root == "" {
 		root = "/proc"
 	}
 
-	list := readSearchList(root, pid)
+	rc := readResolvConf(root, pid)
+
+	list := rc.search
 	if len(list) == 0 {
 		m.logger.Info("no resolver search list for container; DNS search-expansion suppression disabled", "pid", pid)
 
-		return
+		return rc
 	}
 
 	nctx.mu.Lock()
@@ -229,6 +235,8 @@ func (m *Manager) registerSearchList(nctx *NetnsContext, cgroupIDs []uint64, pid
 	if nctx.searchFirst == nil {
 		nctx.searchFirst = list
 	}
+
+	return rc
 }
 
 // lookupDNSRecorder returns the shared DNS recorder for DNS proxy queries.
@@ -351,8 +359,10 @@ type Manager struct {
 	credwatchContainers        map[string]*credwatchContainerState //nolint:unused,nolintlint // containerID → tracked state
 	credwatchCgroupToContainer map[uint64]string                   //nolint:unused,nolintlint // cgroupID → containerID
 	OnCredwatchEvent           func(event CredwatchEvent)          //nolint:unused,nolintlint // callback for kill + report
-	onDNSViolation             DNSViolationFunc                    // called from DNS proxy on block-mode violations
-	dnsViolationState          map[string]int                      // containerID -> attempts (-1: in flight or done); protected by mu
+	dnsCfg                     dnsConfigState
+	onDNSConfig                DNSConfigFunc    // called once per attach with the resolver config
+	onDNSViolation             DNSViolationFunc // called from DNS proxy on block-mode violations
+	dnsViolationState          map[string]int   // containerID -> attempts (-1: in flight or done); protected by mu
 
 	// Proc_mem LSM (global, not per-container).
 	// Fields used by proc_mem_linux.go; appear unused on non-linux builds.
@@ -1777,7 +1787,7 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 		dnsPIDCgroupIDs:   dnsPIDCgroupIDs,
 	}
 
-	m.registerSearchList(nctx, append([]uint64{cgID}, dnsPIDCgroupIDs...), pid)
+	rc := m.registerSearchList(nctx, append([]uint64{cgID}, dnsPIDCgroupIDs...), pid)
 
 	// attach_path: ground-truth signal for "are we doing single pod-level
 	// attach in K8s?" Three buckets:
@@ -1810,6 +1820,9 @@ func (m *Manager) attachEnforcer(info ContainerInfo, pid int, pol *policy.Resolv
 		"attach_path", attachPath,
 		"duration_ms", time.Since(start).Milliseconds(),
 	)
+
+	// Last step, after every fallible one: a rolled-back attach reports nothing.
+	m.reportDNSConfig(nctx, info, rc, attachPath != "per_container_non_k8s")
 
 	return e, nil
 }
@@ -2326,6 +2339,7 @@ func (m *Manager) DetachAll() []*DetachResult {
 	// abort. sync.Once so calling DetachAll twice doesn't panic on
 	// double-close.
 	m.shutdownChOnce.Do(func() { close(m.shutdownCh) })
+	m.stopDNSConfigWorker()
 
 	m.mu.Lock()
 

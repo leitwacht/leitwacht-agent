@@ -14,24 +14,52 @@ const (
 )
 
 // parseSearchList extracts the resolver search list from resolv.conf
-// content. Only "search" and "domain" directives matter; as in glibc, the
-// last occurrence of either wins ("domain" yields a one-entry list).
+// content; see parseResolvConf for the rules.
+func parseSearchList(data []byte) []string {
+	return parseResolvConf(data).search
+}
+
+// resolvConf is the part of a container's resolv.conf the agent cares about.
+type resolvConf struct {
+	// search is the normalised search list (see normalizeSearch).
+	search []string
+	// ndots is the effective "options ndots:N" value, clamped to
+	// [0, maxNdots]; defaultNdots when not explicit.
+	ndots int
+	// ndotsExplicit is true when an options line set ndots.
+	ndotsExplicit bool
+	// readable is true when resolv.conf was read (an empty file is
+	// readable; a missing or refused one is not). Set by the reader.
+	readable bool
+}
+
+const (
+	// defaultNdots is the resolver default when no ndots option is present.
+	defaultNdots = 1
+	// maxNdots is glibc's RES_MAXNDOTS clamp.
+	maxNdots = 15
+)
+
+// parseResolvConf parses resolv.conf content. Only "search", "domain" and
+// "options ndots:N" matter; as in glibc, the last occurrence of search or
+// domain wins ("domain" yields a one-entry list) and the last ndots option
+// wins (values above 15 clamp to 15; non-numeric values are ignored).
 // Entries are lowercased with any trailing dot removed, and at most
-// maxSearchEntries are kept. ndots/options/nameserver lines are ignored.
+// maxSearchEntries are kept. nameserver and other options are ignored.
 // If data fills the read cap, a final unterminated line is discarded as
 // possibly truncated.
-func parseSearchList(data []byte) []string {
+func parseResolvConf(data []byte) resolvConf {
+	rc := resolvConf{ndots: defaultNdots, readable: true}
+
 	if len(data) >= maxResolvConfBytes {
 		data = data[:maxResolvConfBytes]
 
 		if i := bytes.LastIndexByte(data, '\n'); i >= 0 {
 			data = data[:i]
 		} else {
-			return nil
+			return rc // readable, but nothing trustworthy in it
 		}
 	}
-
-	var list []string
 
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
@@ -41,13 +69,56 @@ func parseSearchList(data []byte) []string {
 
 		switch strings.ToLower(fields[0]) {
 		case "search":
-			list = normalizeSearch(fields[1:])
+			rc.search = normalizeSearch(fields[1:])
 		case "domain":
-			list = normalizeSearch(fields[1:2])
+			rc.search = normalizeSearch(fields[1:2])
+		case "options":
+			if n, ok := parseNdotsOption(fields[1:]); ok {
+				rc.ndots, rc.ndotsExplicit = n, true
+			}
 		}
 	}
 
-	return list
+	return rc
+}
+
+// parseNdotsOption returns the last valid ndots:N among the option tokens
+// of one options line.
+func parseNdotsOption(opts []string) (int, bool) {
+	n, found := 0, false
+
+	for _, o := range opts {
+		if strings.HasPrefix(o, "#") || strings.HasPrefix(o, ";") {
+			break // comment tail
+		}
+
+		v, ok := strings.CutPrefix(o, "ndots:")
+		if !ok || v == "" {
+			continue
+		}
+
+		val := 0
+
+		for _, c := range v {
+			if c < '0' || c > '9' {
+				val = -1
+
+				break
+			}
+
+			if val <= maxNdots { // saturate: huge values clamp, no overflow
+				val = val*10 + int(c-'0')
+			}
+		}
+
+		if val < 0 {
+			continue
+		}
+
+		n, found = min(val, maxNdots), true
+	}
+
+	return n, found
 }
 
 func normalizeSearch(raw []string) []string {

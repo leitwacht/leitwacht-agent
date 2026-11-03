@@ -188,6 +188,7 @@ func (w *Webhook) ReportAdvisory(_ context.Context, a *advisory.Advisory) error 
 		Message:      a.Message,
 		ActionTaken:  a.ActionTaken,
 		PolicyAction: a.PolicyAction,
+		Details:      a.Details,
 		OccurredAt:   occurred,
 	}
 	w.dispatch(rec)

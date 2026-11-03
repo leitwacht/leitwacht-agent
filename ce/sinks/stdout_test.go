@@ -85,3 +85,49 @@ func TestStdoutEmitsNDJSON(t *testing.T) {
 		t.Errorf("kind = %v, want %v", a["kind"], advisory.KindDinDDetected)
 	}
 }
+
+func TestStdoutRendersDNSConfigAdvisory(t *testing.T) {
+	var buf bytes.Buffer
+
+	sink := NewStdout(&buf, "node-1", slog.Default())
+
+	o := enforcer.DNSConfigObservation{
+		ContainerID: "abc", K8s: true, Ndots: 5, NdotsExplicit: true, SearchCount: 3,
+		NonClusterSearchCount: 1, ExtraQueries2Dot: 3, ExtraQueries1Dot: 3,
+		NonClusterSuffixes: []string{"ec2.internal"},
+	}
+
+	a := o.Advisory()
+	if a == nil {
+		t.Fatal("no advisory")
+	}
+
+	if err := sink.ReportAdvisory(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := sink.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var v map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &v); err != nil {
+		t.Fatalf("%v: %q", err, buf.String())
+	}
+
+	d, _ := v["details"].(map[string]any)
+	if v["kind"] != "dns_config" || v["action_taken"] != "observed" || d == nil ||
+		d["ndots"] != float64(5) || d["recommendation"] != "node_search_domains" ||
+		d["extra_queries_2dot"] != float64(3) {
+		t.Fatalf("unexpected record: %v", v)
+	}
+
+	sfx, _ := d["noncluster_suffixes"].([]any)
+	if len(sfx) != 1 || sfx[0] != "ec2.internal" {
+		t.Fatalf("suffixes: %v", d["noncluster_suffixes"])
+	}
+
+	if !strings.Contains(v["message"].(string), "ndots=5") {
+		t.Fatalf("message: %v", v["message"])
+	}
+}

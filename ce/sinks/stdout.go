@@ -142,17 +142,20 @@ type violationRecord struct {
 }
 
 type advisoryRecord struct {
-	Type         string    `json:"type"`
-	Hostname     string    `json:"hostname"`
-	ContainerID  string    `json:"container_id,omitempty"`
-	ProjectPath  string    `json:"project_path,omitempty"`
-	JobID        string    `json:"job_id,omitempty"`
-	JobURL       string    `json:"job_url,omitempty"`
-	Kind         string    `json:"kind"`
-	Message      string    `json:"message,omitempty"`
-	ActionTaken  string    `json:"action_taken,omitempty"`
-	PolicyAction string    `json:"policy_action,omitempty"`
-	OccurredAt   time.Time `json:"occurred_at"`
+	Type         string `json:"type"`
+	Hostname     string `json:"hostname"`
+	ContainerID  string `json:"container_id,omitempty"`
+	ProjectPath  string `json:"project_path,omitempty"`
+	JobID        string `json:"job_id,omitempty"`
+	JobURL       string `json:"job_url,omitempty"`
+	Kind         string `json:"kind"`
+	Message      string `json:"message,omitempty"`
+	ActionTaken  string `json:"action_taken,omitempty"`
+	PolicyAction string `json:"policy_action,omitempty"`
+	// Details is structured per-kind payload (e.g. dns_config). Values can
+	// include container-controlled strings; consumers must escape on render.
+	Details    map[string]any `json:"details,omitempty"`
+	OccurredAt time.Time      `json:"occurred_at"`
 }
 
 // ReportAsync renders a violation report as NDJSON and queues it for
@@ -208,6 +211,7 @@ func (s *Stdout) ReportAdvisory(_ context.Context, a *advisory.Advisory) error {
 		Message:      a.Message,
 		ActionTaken:  a.ActionTaken,
 		PolicyAction: a.PolicyAction,
+		Details:      a.Details,
 		OccurredAt:   occurred,
 	})
 	return nil

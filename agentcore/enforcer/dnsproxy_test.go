@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/miekg/dns"
@@ -729,6 +730,12 @@ func TestHandleDNSQuery_OnDNSViolation_AuditMode(t *testing.T) {
 		denyFQDN("denied.example.com", policy.DenyResolutionSinkhole),
 	})
 
+	up := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
+		return []*dns.Msg{replyTo(q, q.Id, aRR(strings.TrimSuffix(q.Question[0].Name, "."), "198.51.100.7"))}
+	})
+	cfg.DockerUDPDial = up.dialUDP
+	cfg.DockerTCPDial = up.dialTCP
+
 	var violationCalled bool
 
 	cfg.OnDNSViolation = func(_ uint64, _, _ string) {
@@ -754,4 +761,99 @@ func TestHandleDNSQuery_OnDNSViolation_AuditMode(t *testing.T) {
 	}
 
 	_ = rec // suppress unused warning
+}
+
+// TestHandleDNSQuery_AuditVsBlockMatrix pins audit-mode as observe-only:
+// a deny match forwards upstream and returns the real answer, while block
+// mode keeps NXDOMAIN/sinkhole plus the kill callback.
+func TestHandleDNSQuery_AuditVsBlockMatrix(t *testing.T) {
+	const upstreamIP = "198.51.100.7"
+
+	tests := []struct {
+		name       string
+		mode       string
+		resolution string
+		query      string
+		wantAction string
+		wantRcode  int
+		wantReal   bool // real upstream answer returned
+		wantSink   bool
+		wantKill   bool
+	}{
+		{"audit/deny-nxdomain", "audit", policy.DenyResolutionNXDomain, "svc.example.test", "dns_observed", dns.RcodeSuccess, true, false, false},
+		{"audit/deny-sinkhole", "audit", policy.DenyResolutionSinkhole, "svc.example.test", "dns_observed", dns.RcodeSuccess, true, false, false},
+		{"audit/allow", "audit", "", "ok.example.org", "dns_allowed", dns.RcodeSuccess, true, false, false},
+		{"audit/no-match", "audit", "", "other.example.net", "dns_observed", dns.RcodeSuccess, true, false, false},
+		{"block/deny-nxdomain", "block", policy.DenyResolutionNXDomain, "svc.example.test", "dns_denied", dns.RcodeNameError, false, false, true},
+		{"block/deny-sinkhole", "block", policy.DenyResolutionSinkhole, "svc.example.test", "dns_denied", dns.RcodeSuccess, false, true, true},
+		{"block/allow", "block", "", "ok.example.org", "dns_allowed", dns.RcodeSuccess, true, false, false},
+		{"block/no-match", "block", "", "other.example.net", "dns_blocked", dns.RcodeSuccess, false, true, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			res := tc.resolution
+			if res == "" {
+				res = policy.DenyResolutionSinkhole
+			}
+
+			cfg, pol, rec := testDNSConfig(tc.mode, []policy.Rule{
+				denyFQDN("*.example.test", res),
+				allowFQDN("ok.example.org", 443),
+			})
+
+			var upstreamQueries atomic.Int32
+
+			up := fakeUpstream(t, func(q *dns.Msg) []*dns.Msg {
+				upstreamQueries.Add(1)
+
+				return []*dns.Msg{replyTo(q, q.Id, aRR(strings.TrimSuffix(q.Question[0].Name, "."), upstreamIP))}
+			})
+			cfg.DockerUDPDial = up.dialUDP
+			cfg.DockerTCPDial = up.dialTCP
+
+			var killed bool
+
+			cfg.OnDNSViolation = func(_ uint64, _, _ string) { killed = true }
+
+			resp := HandleDNSQuery(makeQuery(tc.query, dns.TypeA), cfg, pol, rec, 0, "", "", "", 7)
+
+			if resp.Rcode != tc.wantRcode {
+				t.Fatalf("rcode = %d, want %d", resp.Rcode, tc.wantRcode)
+			}
+
+			var gotIPs []string
+
+			for _, rr := range resp.Answer {
+				if a, ok := rr.(*dns.A); ok {
+					gotIPs = append(gotIPs, a.A.String())
+				}
+			}
+
+			if got := containsIP(gotIPs, upstreamIP); got != tc.wantReal {
+				t.Errorf("real upstream answer = %v, want %v (answers %v)", got, tc.wantReal, gotIPs)
+			}
+
+			if got := containsIP(gotIPs, SinkholeIPv4); got != tc.wantSink {
+				t.Errorf("sinkhole answer = %v, want %v", got, tc.wantSink)
+			}
+
+			if killed != tc.wantKill {
+				t.Errorf("kill callback = %v, want %v", killed, tc.wantKill)
+			}
+
+			_, activity := rec.Snapshot()
+			if len(activity) != 1 || activity[0].Action != tc.wantAction {
+				t.Fatalf("activity = %+v, want one entry with action %s", activity, tc.wantAction)
+			}
+
+			if tc.mode == "block" && !tc.wantReal && upstreamQueries.Load() != 0 {
+				t.Errorf("block-mode %s contacted upstream %d times, want 0", tc.name, upstreamQueries.Load())
+			}
+
+			if tc.name == "block/deny-nxdomain" && len(activity[0].ResolvedIPs) != 0 {
+				t.Errorf("nxdomain deny recorded resolved IPs %v, want none", activity[0].ResolvedIPs)
+			}
+		})
+	}
 }

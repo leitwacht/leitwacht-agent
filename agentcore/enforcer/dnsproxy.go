@@ -191,7 +191,19 @@ func HandleDNSQuery(
 	match, matchIdx, matched := matchFirstRule(qname, rules)
 	if matched {
 		if match.Action == policy.ActionDeny {
-			return handleDenyRule(msg, cfg, qname, qtype, match, recorder, pid, comm, parentComm, binaryPath, cgroupID, pol.Action == policy.ActionAudit)
+			// Audit mode observes only: a deny match must not alter name
+			// resolution (NXDOMAIN or sinkhole would break e.g. in-cluster
+			// search-path lookups). Forward and record as dns_observed.
+			// Note: this records the resolved IPs, which the EE server's
+			// baseline learning consumes; the server must not learn allows
+			// for names matching deny rules (handled server-side).
+			if pol.Action == policy.ActionAudit {
+				cfg.Logger.Debug("dns would deny (audit)", "domain", qname, "pattern", match.Pattern, "resolution", match.Resolution)
+
+				return forwardAndObserve(msg, cfg, qname, qtype, recorder, pid, comm, parentComm, binaryPath)
+			}
+
+			return handleDenyRule(msg, cfg, qname, qtype, match, recorder, pid, comm, parentComm, binaryPath, cgroupID)
 		}
 
 		return handleAllowRule(msg, cfg, qname, qtype, match, matchIdx, recorder, pid, comm, parentComm, binaryPath)
@@ -251,13 +263,14 @@ func matchesRule(qname string, r policy.Rule) bool {
 	return wildcard.MatchesSingle(qname, r.Pattern)
 }
 
-// handleDenyRule returns the right DNS response for a matching deny rule:
+// handleDenyRule (block mode only; audit forwards in HandleDNSQuery) returns
+// the right DNS response for a matching deny rule:
 // NXDOMAIN when resolution=nxdomain (k8s search-path cleanup), sinkhole
 // A record otherwise (forensic signal on follow-up connect).
 func handleDenyRule(
 	msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uint16, rule policy.Rule,
 	recorder *ViolationRecorder, pid uint32, comm, parentComm, binaryPath string,
-	cgroupID uint64, isAudit bool,
+	cgroupID uint64,
 ) *dns.Msg {
 	useNXDomain := rule.Resolution == policy.DenyResolutionNXDomain
 
@@ -272,7 +285,7 @@ func handleDenyRule(
 
 	cfg.Logger.Debug("dns denied", "domain", qname, "pattern", rule.Pattern, "resolution", rule.Resolution)
 
-	if cfg.OnDNSViolation != nil && !isAudit {
+	if cfg.OnDNSViolation != nil {
 		cfg.OnDNSViolation(cgroupID, qname, "dns_denied")
 	}
 

@@ -48,15 +48,18 @@ type Config struct {
 	ClusterDomain    string
 	CredwatchEnabled bool
 	CredwatchPaths   string // comma-separated path suffixes to watch
-	CredwatchExclude string // comma-separated path suffixes to exclude
-	ProcMemEnabled   bool
-	RecordEnvNames   bool // when true, attach env-var NAMES (never values) to each Violation report
-	MaxConcurrentEnf int
-	EventBuffer      int           // size of the watcher's event channel; back-pressures containerd subscriptions when full
-	NetnsGrace       time.Duration // how long a netns context survives after its last container detaches
-	FreezeTimeout    time.Duration // pre-attach container freeze budget; 0 disables the freeze
-	FreezeStateDir   string        // where freeze markers are persisted for crash recovery; empty = built-in default
-	BucketInterval   time.Duration
+	CredwatchExclude string // comma-separated path suffixes to exclude (no event, no enforcement)
+	// CredwatchReportOnly: comma-separated suffixes reported when opened
+	// but never denied or killed on, even in enforce mode.
+	CredwatchReportOnly string
+	ProcMemEnabled      bool
+	RecordEnvNames      bool // when true, attach env-var NAMES (never values) to each Violation report
+	MaxConcurrentEnf    int
+	EventBuffer         int           // size of the watcher's event channel; back-pressures containerd subscriptions when full
+	NetnsGrace          time.Duration // how long a netns context survives after its last container detaches
+	FreezeTimeout       time.Duration // pre-attach container freeze budget; 0 disables the freeze
+	FreezeStateDir      string        // where freeze markers are persisted for crash recovery; empty = built-in default
+	BucketInterval      time.Duration
 
 	// Sinks.
 	StdoutEnabled  bool
@@ -164,6 +167,7 @@ func Load() (*Config, error) {
 		ClusterDomain:              envOr("LEITWACHT_CE_CLUSTER_DOMAIN", "cluster.local"),
 		CredwatchPaths:             envOr("LEITWACHT_CE_CREDWATCH_PATHS", defaultCredwatchPaths),
 		CredwatchExclude:           envOr("LEITWACHT_CE_CREDWATCH_EXCLUDE", defaultCredwatchExclude),
+		CredwatchReportOnly:        envOr("LEITWACHT_CE_CREDWATCH_REPORT_ONLY_PATHS", defaultCredwatchReportOnly),
 		PromAddr:                   envOr("LEITWACHT_CE_PROM_ADDR", ":9090"),
 		WebhookURL:                 os.Getenv("LEITWACHT_CE_WEBHOOK_URL"),
 		WebhookAuth:                os.Getenv("LEITWACHT_CE_WEBHOOK_AUTH"),
@@ -393,10 +397,16 @@ func envDuration(key string, def time.Duration) (time.Duration, error) {
 
 const defaultCredwatchPaths = "/.aws/credentials,/.ssh/id_rsa,/.ssh/id_ed25519,/.ssh/id_ecdsa," +
 	"/.ssh/config,/.ssh/authorized_keys," +
-	"/.kube/config,/.docker/config.json,/.git-credentials," +
+	"/.kube/config,/.git-credentials," +
 	"/.config/gcloud/application_default_credentials.json,/.vault-token," +
 	"/.config/gcloud/credentials.db,/.azure/accessTokens.json," +
 	"/.terraform.d/credentials.tfrc.json," +
 	"/secrets/vault_token,/rancher/k3s/k3s.yaml"
 
-const defaultCredwatchExclude = "/.npmrc,/.netrc,/.pypirc"
+// Registry-login files: routinely read by package managers and image
+// pulls, so by default they are reported when opened but never denied
+// and never kill the container, even in enforce mode.
+const defaultCredwatchReportOnly = "/.docker/config.json,/.npmrc,/.netrc,/.pypirc"
+
+// Suffixes with no event and no enforcement at all. Empty by default.
+const defaultCredwatchExclude = ""

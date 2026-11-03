@@ -20,6 +20,24 @@
 #define CW_KIND_LINK       2  /* path_link of a watched file */
 #define CW_KIND_DPATH_FAIL 3  /* file_open, d_path failed, (parent,name) matched */
 
+/* OR-ed into credwatch_event.kind when the match is in the report-only
+ * class: the event is emitted but the access is always allowed, in every
+ * mode. The low bits keep the CW_KIND_* hook identifier, so the event
+ * struct layout is unchanged. */
+#define CW_KIND_REPORT_ONLY 0x80
+
+/* Class stored as the value of watched_suffixes / watched_pairs /
+ * watched_suffixes / watched_pairs / watched_dirs. 0 (absent) = not watched.
+ * Userspace resolves a suffix listed in both classes to report-only and
+ * never inserts an excluded suffix. When two DIFFERENT suffixes match
+ * one path, match_suffix returns the longest (most specific) one, and
+ * for (parent, name) pairs the highest class wins. The BPF program
+ * keeps no running "best" across the unrolled scan: carrying a
+ * variable through 127 branching iterations exceeds the verifier's
+ * 1M-instruction budget. */
+#define CW_CLASS_WATCHED     1  /* deny in enforce mode */
+#define CW_CLASS_REPORT_ONLY 2  /* emit event, never deny */
+
 #define PATH_BUF_LEN 512
 
 /* Pseudo-filesystem magics to skip — credential files never live on these.
@@ -152,15 +170,17 @@ struct {
  * egress.c __sock_owner_btf_hint comment for rationale. */
 volatile const struct credwatch_event __credwatch_event_btf_hint;
 
-/* match_suffix checks whether the resolved path ends with any watched
- * suffix. Only the last 128 bytes of the path can hold a suffix (they
+/* match_suffix returns the class (CW_CLASS_*) of the strongest watched
+ * suffix the resolved path ends with, or 0 for none. Candidates are
+ * tried from the earliest '/' in the window, so the longest matching
+ * suffix decides. Only the last 128 bytes of the path can hold a suffix (they
  * are at most 63 bytes), so only that tail window is scanned; every '/'
  * in it is tried as a suffix start. Position 0 is included, so a path
  * equal to an absolute suffix matches.
  *
  * path is the 512-byte per-CPU scratch buffer; all indexing is masked
  * with PATH_BUF_LEN-1 so the verifier can bound the variable offsets. */
-static __always_inline int match_suffix(const char *path, __u32 path_len)
+static __always_inline __u8 match_suffix(const char *path, __u32 path_len)
 {
     __u32 ws = path_len > 128 ? path_len - 128 : 0;
 
@@ -187,7 +207,7 @@ static __always_inline int match_suffix(const char *path, __u32 path_len)
 
         __u8 *found = bpf_map_lookup_elem(&watched_suffixes, &suffix);
         if (found)
-            return 1;
+            return *found;
     }
 
     return 0;
@@ -232,28 +252,31 @@ static __always_inline int fill_pair(struct dentry *d, struct pair_key *k)
     return 1;
 }
 
-/* pair_watched: is (parent, name) a watched pair, or is name watched
- * with no parent requirement? */
-#define PAIR_IN(map_, k_)                                              \
+/* pair_class returns the class of (parent, name) in map_, falling back
+ * to the name with no parent requirement; the stronger class wins. */
+#define PAIR_CLASS(map_, k_)                                           \
     ({                                                                 \
-        int _hit = bpf_map_lookup_elem(&(map_), (k_)) != 0;            \
-        if (!_hit) {                                                   \
-            struct pair_key _any = {};                                 \
-            __builtin_memcpy(_any.name, (k_)->name, sizeof(_any.name)); \
-            _hit = bpf_map_lookup_elem(&(map_), &_any) != 0;           \
-        }                                                              \
-        _hit;                                                          \
+        __u8 _cls = 0;                                                 \
+        __u8 *_v = bpf_map_lookup_elem(&(map_), (k_));                 \
+        if (_v)                                                        \
+            _cls = *_v;                                                \
+        struct pair_key _any = {};                                     \
+        __builtin_memcpy(_any.name, (k_)->name, sizeof(_any.name));    \
+        _v = bpf_map_lookup_elem(&(map_), &_any);                      \
+        if (_v && *_v > _cls)                                          \
+            _cls = *_v;                                                \
+        _cls;                                                          \
     })
 
-static __always_inline int pair_watched(const struct pair_key *k)
+static __always_inline __u8 pair_class(const struct pair_key *k)
 {
-    return PAIR_IN(watched_pairs, k);
+    return PAIR_CLASS(watched_pairs, k);
 }
 
 /* emit_credwatch publishes one event. src is copied into the 128-byte
  * path field; n (a compile-time constant after inlining) is how many
  * bytes. */
-static __always_inline void emit_credwatch(__u64 cgroup_id, __u8 kind,
+static __always_inline void emit_credwatch(__u64 cgroup_id, __u8 kind, __u8 cls,
                                            const void *src, __u32 n)
 {
     struct credwatch_event *evt;
@@ -272,7 +295,7 @@ static __always_inline void emit_credwatch(__u64 cgroup_id, __u8 kind,
     evt->cgroup_id = cgroup_id;
     evt->pid = bpf_get_current_pid_tgid() >> 32;
     evt->timestamp_ns = bpf_ktime_get_ns();
-    evt->kind = kind;
+    evt->kind = cls == CW_CLASS_REPORT_ONLY ? (kind | CW_KIND_REPORT_ONLY) : kind;
     bpf_get_current_comm(&evt->comm, sizeof(evt->comm));
     (void)bpf_probe_read_kernel(&evt->path, n, src);
     bpf_ringbuf_submit(evt, 0);
@@ -292,8 +315,11 @@ static __always_inline struct cgroup_proc_config *watched_container(__u64 *cgrou
     return cfg;
 }
 
-static __always_inline int verdict(struct cgroup_proc_config *cfg)
+static __always_inline int verdict(struct cgroup_proc_config *cfg, __u8 cls)
 {
+    /* Report-only paths are never denied, in any mode. */
+    if (cls == CW_CLASS_REPORT_ONLY)
+        return 0;
     if (cfg->flags & FLAG_OBSERVE_ONLY)
         return 0;
     return -EPERM;
@@ -346,18 +372,22 @@ int BPF_PROG(credwatch_file_open, struct file *file)
          * Fall back to the (parent, name) pair: a match is treated as
          * a hit, anything else is let through, so only genuinely
          * suspicious opens are denied. */
-        if (!pair_watched(&pk))
+        __u8 pcls = pair_class(&pk);
+
+        if (!pcls)
             return 0;
 
-        emit_credwatch(cgroup_id, CW_KIND_DPATH_FAIL, pk.name, 64);
+        emit_credwatch(cgroup_id, CW_KIND_DPATH_FAIL, pcls, pk.name, 64);
 
-        return verdict(cfg);
+        return verdict(cfg, pcls);
     }
 
     if (path_len > PATH_BUF_LEN)
         path_len = PATH_BUF_LEN;
 
-    if (!match_suffix(buf, path_len))
+    __u8 cls = match_suffix(buf, path_len);
+
+    if (!cls)
         return 0;
 
     /* Report the tail of the path (the part that matched). */
@@ -366,9 +396,9 @@ int BPF_PROG(credwatch_file_open, struct file *file)
     if (tail > PATH_BUF_LEN - 128)
         tail = PATH_BUF_LEN - 128;
 
-    emit_credwatch(cgroup_id, CW_KIND_OPEN, buf + tail, 128);
+    emit_credwatch(cgroup_id, CW_KIND_OPEN, cls, buf + tail, 128);
 
-    return verdict(cfg);
+    return verdict(cfg, cls);
 }
 
 /* dentry_verdict is shared by the path_rename and path_link hooks. A
@@ -399,19 +429,23 @@ static __always_inline int dentry_verdict(struct dentry *d, __u8 kind)
     if (!fill_pair(d, &pk))
         return 0;
 
+    __u8 cls;
+
     if (type == S_IFREG) {
-        if (!pair_watched(&pk))
-            return 0;
+        cls = pair_class(&pk);
     } else if (type == S_IFDIR) {
-        if (!PAIR_IN(watched_dirs, &pk))
-            return 0;
+        /* Only watched (deny-class) directories are populated. */
+        cls = PAIR_CLASS(watched_dirs, &pk);
     } else {
         return 0;
     }
 
-    emit_credwatch(cgroup_id, kind, pk.name, 64);
+    if (!cls)
+        return 0;
 
-    return verdict(cfg);
+    emit_credwatch(cgroup_id, kind, cls, pk.name, 64);
+
+    return verdict(cfg, cls);
 }
 
 SEC("lsm/path_rename")

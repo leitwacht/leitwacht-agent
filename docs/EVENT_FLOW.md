@@ -380,7 +380,16 @@ socket stamped with the agent's `SO_MARK`.
 ## Credential-file watch: scope and residual gaps
 
 `credwatch` denies (or, for observe-only containers, reports) opens of
-regular files whose resolved path ends in a watched suffix. The path is
+regular files whose resolved path ends in a watched suffix. A second,
+report-only class (default `/.docker/config.json`, `/.npmrc`, `/.netrc`,
+`/.pypirc`) emits the same event but never denies, in any mode: the
+BPF verdict is 0 and the event kind byte carries `0x80`
+(`CW_KIND_REPORT_ONLY`), surfaced as `CredwatchEvent.ReportOnly` and
+`action_taken=reported`, so userspace never kills on it. Precedence is
+exclude (no event), then report-only, then watched for a suffix listed
+in several classes (resolved in userspace); when different suffixes
+match one path the longest wins; report-only paths do
+not protect their parent directory against rename. The path is
 resolved into a 512-byte buffer and only its tail is matched. If the
 path still cannot be resolved, a watched `(parent directory, file name)`
 pair decides; anything else is let through so generic names such as

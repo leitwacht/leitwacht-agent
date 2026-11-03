@@ -103,10 +103,16 @@ clusterDomain: cluster.local
 # (/.ssh/id_rsa, /.aws/credentials, etc.) inside monitored containers.
 credwatch:
   enabled: false
-  # Comma-separated path suffixes to watch. Defaults are baked into the
-  # binary; override only to add or remove paths.
+  # Comma-separated path suffixes to watch (deny + kill in enforce mode).
+  # Defaults are baked into the binary; override only to add or remove paths.
   paths: ""
-  # Comma-separated path suffixes to exclude from watching.
+  # Comma-separated path suffixes that are REPORTED when opened but never
+  # denied and never kill the container, even in enforce mode. Default:
+  # /.docker/config.json,/.npmrc,/.netrc,/.pypirc (registry logins).
+  # Beats `paths`; an empty string keeps the default.
+  reportOnly: ""
+  # Comma-separated path suffixes with no event and no enforcement at
+  # all. Beats both `paths` and `reportOnly`. Default: none.
   exclude: ""
 
 # Proc-mem: BPF LSM hook that blocks /proc/<pid>/mem reads by

@@ -89,6 +89,27 @@ omits the field, the mode defaults to `enforce` (matching the historical
 (`leitwacht.io/allow-cred-read`, `leitwacht.io/allow-proc-read`) still
 apply on top and suppress events entirely for a marked container.
 
+#### Path classes (credwatch)
+
+Each credential path suffix falls in one class; precedence is exclude,
+then report-only, then watched:
+
+| Class       | Default paths | Behaviour |
+| ----------- | ------------- | --------- |
+| watched     | cloud credentials, SSH keys, kubeconfig, `.git-credentials`, vault tokens, ... | `enforce`: open denied (EPERM) and container killed. `observe`: event only. |
+| report-only | `/.docker/config.json`, `/.npmrc`, `/.netrc`, `/.pypirc` | Event with `action_taken=reported`; the open is **always allowed** and the container is never killed, in every mode. Registry logins are normally read by package managers, so reads are reported rather than treated as theft. |
+| exclude     | none | No event, no enforcement. |
+
+Override with `LEITWACHT_CE_CREDWATCH_PATHS` (watched),
+`LEITWACHT_CE_CREDWATCH_REPORT_ONLY_PATHS` (report-only) and
+`LEITWACHT_CE_CREDWATCH_EXCLUDE` (exclude); each is a comma-separated list
+of path suffixes and an unset variable keeps the default. A suffix listed
+as report-only is not watched even if it also appears in the watched list
+(and an excluded suffix is neither). When two different suffixes match
+one path, the longest (most specific) one decides.
+`off` mode and the `leitwacht.io/allow-cred-read` label still suppress
+events entirely.
+
 ### `job_overrides`
 
 Optional per-CI-job overrides for `credwatch` / `proc_mem`. Keys are CI

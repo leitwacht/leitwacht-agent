@@ -264,66 +264,108 @@ func splitSuffix(suffix string) (grandparent, parent, name string) {
 
 // populateWatchedPathMaps populates the watched_filenames,
 // watched_suffixes, watched_pairs and watched_dirs BPF maps from the
-// configured WatchedPaths and ExcludedPaths. Excluded suffixes are
-// skipped entirely, so no hook (open, rename, link) acts on them.
+// configured watched, report-only and excluded paths. Precedence:
+// exclude beats report-only beats watched. Excluded suffixes are
+// skipped entirely, so no hook (open, rename, link) acts on them. A
+// suffix in both the watched and report-only lists is report-only.
+// Report-only suffixes do not populate watched_dirs, so renaming their
+// parent directory is neither reported nor denied.
 // Called once at StartCredwatch time (global, not per-container).
-func populateWatchedPathMaps(objs *credwatchObjects, watchedPaths, excludedPaths []string) error {
+func populateWatchedPathMaps(objs *credwatchObjects, watchedPaths, reportOnlyPaths, excludedPaths []string) error {
 	excluded := make(map[string]struct{}, len(excludedPaths))
 	for _, p := range excludedPaths {
 		excluded[p] = struct{}{}
 	}
 
+	reportOnly := make(map[string]struct{}, len(reportOnlyPaths))
+	for _, p := range reportOnlyPaths {
+		reportOnly[p] = struct{}{}
+	}
+
+	// Watched first, report-only second: map Puts overwrite, so the
+	// report-only class replaces a watched class on a shared
+	// (parent, name) pair.
 	for _, suffix := range watchedPaths {
-		if _, isExcluded := excluded[suffix]; isExcluded {
+		if _, skip := excluded[suffix]; skip {
 			continue
 		}
 
-		// Populate watched_suffixes map (the full suffix, e.g. "/.ssh/id_rsa")
-		var suffixKey [64]byte
-		copy(suffixKey[:], suffix)
-
-		if err := objs.WatchedSuffixes.Put(suffixKey[:], uint8(1)); err != nil {
-			return fmt.Errorf("put watched_suffixes %q: %w", suffix, err)
-		}
-
-		// Populate watched_filenames map (the last path component, e.g. "id_rsa")
-		filename := path.Base(suffix)
-		if filename == "." || filename == "/" {
+		if _, skip := reportOnly[suffix]; skip {
 			continue
 		}
 
-		var fnameKey [64]byte
-		copy(fnameKey[:], filename)
+		if err := putWatchedSuffix(objs, suffix, credwatchClassWatched); err != nil {
+			return err
+		}
+	}
 
-		if err := objs.WatchedFilenames.Put(fnameKey[:], uint8(1)); err != nil {
-			return fmt.Errorf("put watched_filenames %q: %w", filename, err)
+	for _, suffix := range reportOnlyPaths {
+		if _, skip := excluded[suffix]; skip {
+			continue
 		}
 
-		// watched_pairs: struct pair_key { char parent[32]; char name[64]; }.
-		// Strings are truncated to leave room for the NUL, matching what
-		// the BPF side reads.
-		grandparent, parent, name := splitSuffix(suffix)
-
-		var pairKey [96]byte
-		copy(pairKey[:31], parent)
-		copy(pairKey[32:95], name)
-
-		if err := objs.WatchedPairs.Put(pairKey[:], uint8(1)); err != nil {
-			return fmt.Errorf("put watched_pairs %q: %w", suffix, err)
+		if err := putWatchedSuffix(objs, suffix, credwatchClassReportOnly); err != nil {
+			return err
 		}
+	}
 
-		// watched_dirs: (grandparent, directory) of the file. Generic
-		// directory names are only protected when a grandparent
-		// distinguishes them.
-		if _, generic := genericDirNames[parent]; parent != "" && (!generic || grandparent != "") {
-			var dirKey [96]byte
-			copy(dirKey[:31], grandparent)
-			copy(dirKey[32:95], parent)
+	return nil
+}
 
-			if err := objs.WatchedDirs.Put(dirKey[:], uint8(1)); err != nil {
-				return fmt.Errorf("put watched_dirs %q: %w", parent, err)
-			}
-		}
+// putWatchedSuffix inserts one suffix into the BPF maps with the given
+// class (credwatchClass*). Only the watched class registers its parent
+// directory in watched_dirs.
+func putWatchedSuffix(objs *credwatchObjects, suffix string, class uint8) error {
+	// watched_suffixes: the full suffix, e.g. "/.ssh/id_rsa".
+	var suffixKey [64]byte
+	copy(suffixKey[:], suffix)
+
+	if err := objs.WatchedSuffixes.Put(suffixKey[:], class); err != nil {
+		return fmt.Errorf("put watched_suffixes %q: %w", suffix, err)
+	}
+
+	// watched_filenames: the last path component, e.g. "id_rsa". A
+	// presence flag only; the class lives in the other maps.
+	filename := path.Base(suffix)
+	if filename == "." || filename == "/" {
+		return nil
+	}
+
+	var fnameKey [64]byte
+	copy(fnameKey[:], filename)
+
+	if err := objs.WatchedFilenames.Put(fnameKey[:], uint8(1)); err != nil {
+		return fmt.Errorf("put watched_filenames %q: %w", filename, err)
+	}
+
+	// watched_pairs: struct pair_key { char parent[32]; char name[64]; }.
+	// Strings are truncated to leave room for the NUL, matching what
+	// the BPF side reads.
+	grandparent, parent, name := splitSuffix(suffix)
+
+	var pairKey [96]byte
+	copy(pairKey[:31], parent)
+	copy(pairKey[32:95], name)
+
+	if err := objs.WatchedPairs.Put(pairKey[:], class); err != nil {
+		return fmt.Errorf("put watched_pairs %q: %w", suffix, err)
+	}
+
+	// watched_dirs: (grandparent, directory) of the file. Generic
+	// directory names are only protected when a grandparent
+	// distinguishes them. Report-only files do not protect their
+	// directory.
+	_, generic := genericDirNames[parent]
+	if class != credwatchClassWatched || parent == "" || (generic && grandparent == "") {
+		return nil
+	}
+
+	var dirKey [96]byte
+	copy(dirKey[:31], grandparent)
+	copy(dirKey[32:95], parent)
+
+	if err := objs.WatchedDirs.Put(dirKey[:], class); err != nil {
+		return fmt.Errorf("put watched_dirs %q: %w", parent, err)
 	}
 
 	return nil
@@ -385,7 +427,7 @@ func (m *Manager) StartCredwatch() error {
 	m.credwatchLSMLoaded = true
 
 	// Populate watched suffix and filename maps from config.
-	if err := populateWatchedPathMaps(objs, m.credwatchCfg.WatchedPaths, m.credwatchCfg.ExcludedPaths); err != nil {
+	if err := populateWatchedPathMaps(objs, m.credwatchCfg.WatchedPaths, m.credwatchCfg.ReportOnlyPaths, m.credwatchCfg.ExcludedPaths); err != nil {
 		lsm.Close()
 		m.credwatchState = nil
 		m.credwatchLSMLoaded = false
@@ -405,6 +447,7 @@ func (m *Manager) StartCredwatch() error {
 	m.credwatchStop = stop
 	m.logger.Info("credwatch LSM loaded",
 		"watched_suffixes", len(m.credwatchCfg.WatchedPaths),
+		"report_only_suffixes", len(m.credwatchCfg.ReportOnlyPaths),
 		"excluded", len(m.credwatchCfg.ExcludedPaths),
 	)
 
@@ -560,6 +603,7 @@ func (m *Manager) handleCredwatchBPFEvent(evt credwatchEventBPF) {
 		TimestampNs: monotonicToWallNs(int64(evt.TimestampNs), nowMonoNs, nowWallNs), //nolint:gosec // monotonic ns fits int64
 		Reason:      credwatchReason(evt.Kind),
 		ObserveOnly: observeOnly,
+		ReportOnly:  credwatchKindReportOnlyFlag(evt.Kind),
 	}
 
 	m.logger.Warn("credential file access detected",
@@ -568,6 +612,7 @@ func (m *Manager) handleCredwatchBPFEvent(evt credwatchEventBPF) {
 		"comm", event.Comm,
 		"path", event.Path,
 		"reason", event.Reason,
+		"report_only", event.ReportOnly,
 	)
 
 	if m.OnCredwatchEvent != nil {

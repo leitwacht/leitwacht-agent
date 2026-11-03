@@ -289,9 +289,10 @@ func newEnforcer(cfg *config.Config, log *slog.Logger) (*enforcer.Manager, enfor
 
 	platform := &enforcer.LinuxPlatform{Logger: log}
 	credwatchCfg := enforcer.CredwatchConfig{
-		Enabled:       cfg.CredwatchEnabled,
-		WatchedPaths:  enforcer.ParsePathList(cfg.CredwatchPaths),
-		ExcludedPaths: enforcer.ParsePathList(cfg.CredwatchExclude),
+		Enabled:         cfg.CredwatchEnabled,
+		WatchedPaths:    enforcer.ParsePathList(cfg.CredwatchPaths),
+		ExcludedPaths:   enforcer.ParsePathList(cfg.CredwatchExclude),
+		ReportOnlyPaths: enforcer.ParsePathList(cfg.CredwatchReportOnly),
 	}
 
 	mgr := enforcer.NewManager(log, cfg.MaxConcurrentEnf, upstreams, trusted, platform, credwatchCfg, enforcer.ProcMemConfig{Enabled: cfg.ProcMemEnabled})
@@ -353,17 +354,32 @@ func newWatcher(cfg *config.Config, log *slog.Logger) (watcher.ContainerWatcher,
 	return w, nil
 }
 
+// credwatchAction maps an event to the advisory action_taken string.
+// "reported" is a report-only path (allowed by the BPF program in every
+// mode, never killed); "observed" is a path that would have been denied
+// but the container is in observe mode; "killed" is a deny in enforce
+// mode.
+func credwatchAction(ev enforcer.CredwatchEvent) string {
+	switch {
+	case ev.ReportOnly:
+		return "reported"
+	case ev.ObserveOnly:
+		return "observed"
+	default:
+		return "killed"
+	}
+}
+
 func wireCredwatchKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *sinks.Multi, log *slog.Logger) {
 	mgr.OnCredwatchEvent = func(ev enforcer.CredwatchEvent) {
-		// Observe-only: the BPF program already allowed the open.
-		// Userspace must skip its kill + detach paths too, otherwise
-		// we cancel the BPF allow with a userspace SIGKILL and the
-		// label is meaningless. The advisory still fires (operators
-		// see every touch) but with action_taken=observed.
-		action := "killed"
-		if ev.ObserveOnly {
-			action = "observed"
-		} else if ev.ContainerID != "" {
+		// Report-only and observe-only: the BPF program already allowed
+		// the open. Userspace must skip its kill + detach paths too,
+		// otherwise we cancel the BPF allow with a userspace SIGKILL
+		// and the report-only class / observe label is meaningless. The
+		// advisory still fires (operators see every touch) with
+		// action_taken=reported or observed.
+		action := credwatchAction(ev)
+		if action == "killed" && ev.ContainerID != "" {
 			if err := w.KillContainer(context.Background(), ev.ContainerID); err != nil {
 				log.Warn("credwatch kill failed", "container", ev.ContainerID, "error", err)
 			}
@@ -374,7 +390,7 @@ func wireCredwatchKill(mgr *enforcer.Manager, w watcher.ContainerWatcher, sink *
 			Message:     fmt.Sprintf("credential file access detected: pid=%d comm=%q path=%q reason=%s", ev.PID, ev.Comm, ev.Path, ev.Reason),
 			ActionTaken: action,
 		})
-		if !ev.ObserveOnly {
+		if action == "killed" {
 			if result := mgr.Detach(ev.ContainerID); result != nil {
 				sink.ReportAsync(context.Background(), result.Info, &result.Stats, false, time.Time{})
 			}

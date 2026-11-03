@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestLoadCanonicalisesActionEnums(t *testing.T) {
 	cases := []struct {
@@ -105,5 +108,46 @@ func TestLoadDNSCacheSize(t *testing.T) {
 
 	if _, err = Load(); err == nil {
 		t.Fatal("non-numeric size must be rejected")
+	}
+}
+
+func TestLoadCredwatchPathClasses(t *testing.T) {
+	t.Setenv("LEITWACHT_CE_DNS_UPSTREAM", "10.0.0.2:53")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if c.CredwatchReportOnly != "/.docker/config.json,/.npmrc,/.netrc,/.pypirc" {
+		t.Errorf("report-only default = %q", c.CredwatchReportOnly)
+	}
+
+	if c.CredwatchExclude != "" {
+		t.Errorf("exclude default = %q, want empty", c.CredwatchExclude)
+	}
+
+	for _, ro := range strings.Split(c.CredwatchReportOnly, ",") {
+		for _, w := range strings.Split(c.CredwatchPaths, ",") {
+			if ro == w {
+				t.Errorf("%q is both watched and report-only by default", ro)
+			}
+		}
+	}
+
+	if !strings.Contains(c.CredwatchPaths, "/.aws/credentials") {
+		t.Error("high-value paths must stay watched")
+	}
+
+	t.Setenv("LEITWACHT_CE_CREDWATCH_REPORT_ONLY_PATHS", "/.foo/bar")
+
+	if c, err = Load(); err != nil || c.CredwatchReportOnly != "/.foo/bar" {
+		t.Fatalf("override = %q, err %v", c.CredwatchReportOnly, err)
+	}
+
+	t.Setenv("LEITWACHT_CE_CREDWATCH_REPORT_ONLY_PATHS", "")
+
+	if c, err = Load(); err != nil || c.CredwatchReportOnly != "" {
+		t.Fatalf("explicit empty must disable the class, got %q err %v", c.CredwatchReportOnly, err)
 	}
 }

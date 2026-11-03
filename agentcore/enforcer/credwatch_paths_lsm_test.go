@@ -45,7 +45,7 @@ func credwatchTestEnv(t *testing.T, watched []string, allow, observeOnly bool) (
 		}
 	})
 
-	if err = populateWatchedPathMaps(objs, watched, nil); err != nil {
+	if err = populateWatchedPathMaps(objs, watched, nil, nil); err != nil {
 		t.Fatalf("populateWatchedPathMaps: %v", err)
 	}
 
@@ -338,7 +338,7 @@ func TestCredwatchExclusionHonouredByRenameLink(t *testing.T) {
 	objs, _ := credwatchTestEnv(t, []string{"/.testcred/secret"}, false, false)
 
 	// Re-populate: add an excluded second suffix.
-	if err := populateWatchedPathMaps(objs, []string{"/.keep/secret", "/.testcred/secret"}, []string{"/.keep/secret"}); err != nil {
+	if err := populateWatchedPathMaps(objs, []string{"/.keep/secret", "/.testcred/secret"}, nil, []string{"/.keep/secret"}); err != nil {
 		t.Fatal(err)
 	}
 

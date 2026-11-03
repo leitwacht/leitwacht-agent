@@ -84,6 +84,10 @@ spec:
             - name: LEITWACHT_CE_CREDWATCH_PATHS
               value: {{ .Values.credwatch.paths | quote }}
             {{- end }}
+            {{- if .Values.credwatch.reportOnly }}
+            - name: LEITWACHT_CE_CREDWATCH_REPORT_ONLY_PATHS
+              value: {{ .Values.credwatch.reportOnly | quote }}
+            {{- end }}
             {{- if .Values.credwatch.exclude }}
             - name: LEITWACHT_CE_CREDWATCH_EXCLUDE
               value: {{ .Values.credwatch.exclude | quote }}

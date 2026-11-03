@@ -119,7 +119,7 @@ func TestDefenseInDepth_CredwatchKill(t *testing.T) {
 	defer objs.Close()    //nolint:errcheck // test cleanup
 
 	// 2. Populate watched path maps with a test suffix
-	err = populateWatchedPathMaps(objs, []string{"/.ssh/id_rsa"}, nil)
+	err = populateWatchedPathMaps(objs, []string{"/.ssh/id_rsa"}, nil, nil)
 	if err != nil {
 		t.Fatalf("populateWatchedPathMaps: %v", err)
 	}

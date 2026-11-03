@@ -19,13 +19,29 @@ type CredwatchEvent struct {
 	// program emitted this event but DID NOT deny the open — the
 	// userspace callback should also skip its kill path.
 	ObserveOnly bool
+	// ReportOnly is true when the matched path is in the report-only
+	// class (registry-login files such as /.docker/config.json). The BPF
+	// program emitted the event and allowed the open regardless of mode;
+	// userspace must never kill on it. Distinct from ObserveOnly, which
+	// is a per-container mode: ReportOnly is a property of the path.
+	ReportOnly bool
 }
 
 // CredwatchConfig holds credwatch enforcement configuration.
 type CredwatchConfig struct {
-	Enabled       bool
-	WatchedPaths  []string // path suffixes to watch, e.g. "/.ssh/id_rsa"
-	ExcludedPaths []string // suffixes to exclude from watching
+	Enabled bool
+	// WatchedPaths are suffixes denied (and the container killed) in
+	// enforce mode, e.g. "/.ssh/id_rsa".
+	WatchedPaths []string
+	// ReportOnlyPaths are suffixes that are reported when opened but
+	// never denied, even in enforce mode (registry logins such as
+	// "/.docker/config.json"). A suffix listed here
+	// and in WatchedPaths is report-only; when different suffixes match
+	// one path, the longest wins.
+	ReportOnlyPaths []string
+	// ExcludedPaths are suffixes with no event and no enforcement at
+	// all. Exclude beats both WatchedPaths and ReportOnlyPaths.
+	ExcludedPaths []string
 }
 
 // credwatchEventBPF matches the BPF struct credwatch_event (packed, 165 bytes).
@@ -65,11 +81,27 @@ const (
 	credwatchKindRename    = 1
 	credwatchKindLink      = 2
 	credwatchKindDPathFail = 3
+
+	// credwatchKindReportOnly is OR-ed into the kind byte by the BPF
+	// program for report-only matches (CW_KIND_REPORT_ONLY).
+	credwatchKindReportOnly = 0x80
 )
+
+// BPF map value classes for the watched_* maps (CW_CLASS_* in credwatch.c).
+const (
+	credwatchClassWatched    = 1
+	credwatchClassReportOnly = 2
+)
+
+// credwatchKindReportOnlyFlag reports whether the BPF kind byte carries
+// the report-only marker.
+func credwatchKindReportOnlyFlag(kind uint8) bool {
+	return kind&credwatchKindReportOnly != 0
+}
 
 // credwatchReason maps a BPF event kind to its advisory reason string.
 func credwatchReason(kind uint8) string {
-	switch kind {
+	switch kind &^ credwatchKindReportOnly {
 	case credwatchKindRename:
 		return "rename"
 	case credwatchKindLink:

@@ -116,7 +116,7 @@ func TestCredwatchRingbufDirect(t *testing.T) {
 	defer objs.Close()    //nolint:errcheck // test cleanup
 
 	// 2. Populate watched suffix and filename maps
-	err = populateWatchedPathMaps(objs, []string{"/.testcred/secret"}, nil)
+	err = populateWatchedPathMaps(objs, []string{"/.testcred/secret"}, nil, nil)
 	if err != nil {
 		t.Fatalf("populateWatchedPathMaps: %v", err)
 	}

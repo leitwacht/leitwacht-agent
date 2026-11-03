@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -426,6 +427,12 @@ func freezeCgroup(ctx context.Context, cgroupPath string, timeout time.Duration)
 			}
 		}
 
+		// A read-only or restricted cgroupfs cannot be frozen; fall back to
+		// the runtime pause rather than failing the container.
+		if isFreezeDenied(err) {
+			return nil, fmt.Errorf("%w: write cgroup.freeze in %s: %w", ErrFreezeUnavailable, cgroupPath, err)
+		}
+
 		return nil, fmt.Errorf("write cgroup.freeze: %w", err)
 	}
 
@@ -511,4 +518,11 @@ func (f *Freezer) validCgroupPath(p string) bool {
 	}
 
 	return filepath.IsAbs(p) && !strings.Contains(p, "..") && strings.HasPrefix(filepath.Clean(p), strings.TrimRight(root, "/")+"/")
+}
+
+// isFreezeDenied reports whether err means the cgroup freezer cannot be
+// written at all (read-only cgroupfs, missing permission) as opposed to the
+// container having gone away.
+func isFreezeDenied(err error) bool {
+	return errors.Is(err, syscall.EROFS) || errors.Is(err, syscall.EACCES) || errors.Is(err, syscall.EPERM)
 }

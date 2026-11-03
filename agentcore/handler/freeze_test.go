@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -345,5 +346,47 @@ func TestThawFailureKeepsMarker(t *testing.T) {
 
 	if entries, _ := os.ReadDir(state); len(entries) != 1 {
 		t.Fatalf("marker removed although the thaw failed (%d left)", len(entries))
+	}
+}
+
+func TestIsFreezeDenied(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{syscall.EROFS, true},
+		{syscall.EACCES, true},
+		{syscall.EPERM, true},
+		{&os.PathError{Op: "open", Path: "x", Err: syscall.EROFS}, true},
+		{syscall.ENOENT, false},
+		{syscall.EBUSY, false},
+		{nil, false},
+	}
+	for _, c := range cases {
+		if got := isFreezeDenied(c.err); got != c.want {
+			t.Errorf("isFreezeDenied(%v) = %v, want %v", c.err, got, c.want)
+		}
+	}
+}
+
+func TestFreezeCgroupPermissionDeniedIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permissions")
+	}
+
+	dir := t.TempDir()
+	f := filepath.Join(dir, "cgroup.freeze")
+
+	if err := os.WriteFile(f, nil, 0o444); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := freezeCgroup(context.Background(), dir, time.Second)
+	if !errors.Is(err, ErrFreezeUnavailable) {
+		t.Fatalf("want ErrFreezeUnavailable, got %v", err)
 	}
 }

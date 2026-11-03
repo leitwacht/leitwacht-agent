@@ -89,6 +89,13 @@ trustedCIDRs: []
 # Quote "off" to disable (an unquoted off is a YAML boolean, also accepted).
 dnsExpansionSuppression: structural
 
+# Per-netns DNS positive-answer cache, in entries. Only successful answers
+# the proxy forwarded under an allow rule or in audit mode are cached (never
+# denies, NXDOMAIN, SERVFAIL, or synthesized replies), for at most the
+# answer's TTL (capped at 300s), and it is flushed on any policy change.
+# Policy checks and event recording still run on every query. 0 disables.
+dnsCacheSize: 1024
+
 # Kubernetes cluster domain. Never derived from the container's search list.
 clusterDomain: cluster.local
 

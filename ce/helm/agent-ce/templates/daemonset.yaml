@@ -92,6 +92,8 @@ spec:
               value: {{ .Values.procMem.enabled | quote }}
             - name: LEITWACHT_CE_DNS_EXPANSION_SUPPRESSION
               value: {{ if kindIs "bool" .Values.dnsExpansionSuppression }}{{ ternary "structural" "off" .Values.dnsExpansionSuppression | quote }}{{ else }}{{ .Values.dnsExpansionSuppression | default "structural" | quote }}{{ end }}
+            - name: LEITWACHT_CE_DNS_CACHE_SIZE
+              value: {{ if hasKey .Values "dnsCacheSize" }}{{ .Values.dnsCacheSize | int | quote }}{{ else }}"1024"{{ end }}
             - name: LEITWACHT_CE_CLUSTER_DOMAIN
               value: {{ .Values.clusterDomain | default "cluster.local" | quote }}
             - name: LEITWACHT_CE_RECORD_ENV_NAMES

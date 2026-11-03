@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"gitlab.com/leitwacht/leitwacht-agent/agentcore/clusterdomain"
+	"gitlab.com/leitwacht/leitwacht-agent/agentcore/enforcer"
 )
 
 // Config is the resolved CE daemon settings.
@@ -39,6 +40,9 @@ type Config struct {
 	// that the cluster DNS confirms do not exist; "off" treats them like any
 	// other query.
 	DNSExpansionSuppression string
+	// DNSCacheSize is the per-netns DNS positive-answer cache capacity in
+	// entries (default 1024); 0 disables the cache.
+	DNSCacheSize int
 	// ClusterDomain is the Kubernetes cluster domain (never derived from the
 	// container's search list).
 	ClusterDomain    string
@@ -213,6 +217,10 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.DNSCacheSize, err = envInt("LEITWACHT_CE_DNS_CACHE_SIZE", enforcer.DefaultDNSCacheSize)
+	if err != nil {
+		return nil, err
+	}
 
 	bucket, err := envDuration("LEITWACHT_CE_BUCKET_INTERVAL", 5*time.Minute) //nolint:govet // err is re-declared intentionally to keep the err-check pattern uniform across envBool/envInt/envDuration above
 	if err != nil {
@@ -301,6 +309,9 @@ func (c *Config) Validate() error {
 
 	if c.DNSExpansionSuppression != "structural" && c.DNSExpansionSuppression != "off" {
 		return fmt.Errorf("LEITWACHT_CE_DNS_EXPANSION_SUPPRESSION = %q (must be \"structural\" or \"off\")", c.DNSExpansionSuppression)
+	}
+	if c.DNSCacheSize < 0 {
+		return fmt.Errorf("LEITWACHT_CE_DNS_CACHE_SIZE = %d (must be >= 0; 0 disables the cache)", c.DNSCacheSize)
 	}
 	if err := validateCIDRList(c.TrustedCIDRs); err != nil {
 		return fmt.Errorf("LEITWACHT_CE_TRUSTED_CIDRS: %w", err)

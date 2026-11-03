@@ -80,3 +80,30 @@ func TestLoadClusterDomain(t *testing.T) {
 		t.Fatal("invalid cluster domain must be rejected at startup")
 	}
 }
+
+func TestLoadDNSCacheSize(t *testing.T) {
+	t.Setenv("LEITWACHT_CE_DNS_UPSTREAM", "10.0.0.2:53")
+
+	c, err := Load()
+	if err != nil || c.DNSCacheSize != 1024 {
+		t.Fatalf("default = %d, err %v; want 1024", c.DNSCacheSize, err)
+	}
+
+	t.Setenv("LEITWACHT_CE_DNS_CACHE_SIZE", "0")
+
+	if c, err = Load(); err != nil || c.DNSCacheSize != 0 {
+		t.Fatalf("0 = %d, err %v; want disabled", c.DNSCacheSize, err)
+	}
+
+	t.Setenv("LEITWACHT_CE_DNS_CACHE_SIZE", "-1")
+
+	if _, err = Load(); err == nil {
+		t.Fatal("negative size must be rejected")
+	}
+
+	t.Setenv("LEITWACHT_CE_DNS_CACHE_SIZE", "lots")
+
+	if _, err = Load(); err == nil {
+		t.Fatal("non-numeric size must be rejected")
+	}
+}

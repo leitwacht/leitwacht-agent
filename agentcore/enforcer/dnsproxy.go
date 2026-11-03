@@ -145,6 +145,17 @@ type DNSProxyConfig struct {
 	// OnDNSViolation; "off" treats them like any other query.
 	ExpansionSuppression string
 
+	// CacheSize is the capacity of the per-proxy positive-answer cache
+	// (entries). 0 disables it. Only answers the proxy forwarded and
+	// would return as a successful positive answer on an allow/forward
+	// path are cached; see dnsCache. Applied by NewDNSProxy.
+	CacheSize int
+
+	// cache is nil when disabled. Policy decision, event recording and
+	// allow-map seeding still run on every query; the cache replaces only
+	// the upstream round trip.
+	cache *dnsCache
+
 	// upstreamFailLast / upstreamFailSuppressed rate-limit the
 	// per-query upstream-failure log (unix nanos of the last emission,
 	// and how many lines were swallowed since).
@@ -428,8 +439,34 @@ func forwardAndObserve(
 // forwardAndFilter proxies the query upstream, strips AAAA answers, and
 // returns the filtered response plus the A-record IPs seen. Returns
 // ok=false (and a SERVFAIL response) if the upstream failed.
+//
+// This is the only forwarding path that consults the positive-answer cache
+// (allow-rule match, audit forwarding). The expansion-classification probe
+// calls forwardAndFilterResolved directly and never reads or writes it.
+// Callers still perform RecordDNS and allow-map seeding from the returned
+// ips, so a cache hit has the same side effects as a forwarded query.
 func forwardAndFilter(msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uint16) (*dns.Msg, []string, bool) {
+	cache := cfg.cache
+
+	key, cacheable := dnsCacheKey{}, false
+	if cache != nil {
+		key, cacheable = dnsCacheKeyFor(msg)
+	}
+
+	var gen uint64
+
+	if cacheable {
+		if resp, ips, hit := cache.get(key, msg); hit {
+			return resp, ips, true
+		}
+
+		gen = cache.generation()
+	}
+
 	resp, ips, _, ok := forwardAndFilterResolved(msg, cfg, qname, qtype)
+	if ok && cacheable {
+		cache.put(key, resp, ips, gen)
+	}
 
 	return resp, ips, ok
 }
@@ -888,6 +925,7 @@ type DNSProxy struct {
 
 // NewDNSProxy creates a proxy with the given config.
 func NewDNSProxy(cfg *DNSProxyConfig) *DNSProxy {
+	cfg.cache = newDNSCache(cfg.CacheSize)
 	p := &DNSProxy{cfg: cfg, sem: make(chan struct{}, maxInflightQueries)}
 	p.policy.Store(cfg.Policy)
 
@@ -897,7 +935,19 @@ func NewDNSProxy(cfg *DNSProxyConfig) *DNSProxy {
 // UpdatePolicy atomically swaps the active policy. Queries already in flight
 // use the old policy; subsequent queries use the new one.
 func (p *DNSProxy) UpdatePolicy(pol *policy.ResolvedPolicy) {
-	p.policy.Store(pol)
+	old := p.policy.Swap(pol)
+
+	// Flush only when the effective policy content changed (same
+	// fingerprint rule as the allow-map flush on attach).
+	if old == nil || pol == nil || policyFingerprint(old) != policyFingerprint(pol) {
+		p.cfg.cache.flush()
+	}
+}
+
+// CacheStats returns the positive-answer cache counters (zero when the
+// cache is disabled).
+func (p *DNSProxy) CacheStats() DNSCacheStats {
+	return p.cfg.cache.stats()
 }
 
 // Start begins serving DNS on pre-bound sockets. The sockets must have been
@@ -990,6 +1040,8 @@ func (p *DNSProxy) Start(udpConn net.PacketConn, tcpListener net.Listener) {
 
 // Stop shuts down both UDP and TCP servers.
 func (p *DNSProxy) Stop() {
+	p.cfg.cache.flush()
+
 	// Close the underlying connections to unblock ActivateAndServe.
 	if p.udpConn != nil {
 		_ = p.udpConn.Close()

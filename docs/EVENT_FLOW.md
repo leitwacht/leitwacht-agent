@@ -534,6 +534,26 @@ per query, with no buffering and no timers.
   `LEITWACHT_CLUSTER_DOMAIN`, helm `clusterDomain` /
   `agent.clusterDomain`) sets the cluster domain.
 
+### DNS positive-answer cache
+
+`DNSProxyConfig.CacheSize` (CE `LEITWACHT_CE_DNS_CACHE_SIZE`, default
+1024; helm `dnsCacheSize`; `0` disables) bounds a per-proxy (per netns)
+LRU of upstream answers. It replaces only the upstream round trip:
+policy matching, `RecordDNS` and allow-map seeding run on every query,
+hit or miss.
+
+- Cached: responses the proxy forwarded on an allow-rule match or in
+  audit mode, NOERROR with at least one answer after AAAA stripping and
+  out-of-chain filtering (the filtered response is stored), not
+  truncated, minimum TTL above zero.
+- Never cached: deny/sinkhole, NXDOMAIN, SERVFAIL, any synthesized
+  reply, the expansion-classification probe, block-mode no-match.
+- Key: lowercased name, type, class and the EDNS DO bit. Lifetime is the
+  minimum answer TTL, capped at 300 s; hits are served with TTLs reduced
+  by the time spent in cache and the client's ID and question.
+- Flushed on every policy update and on `Stop`; a store racing a flush
+  is discarded. `DNSProxy.CacheStats()` returns hit/miss/size counters.
+
 ## DNS configuration advisory (`dns_config`)
 
 The same attach-time `resolv.conf` read (and the same security rules)

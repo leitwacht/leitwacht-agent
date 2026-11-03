@@ -311,6 +311,11 @@ type Manager struct {
 	// ExpansionSuppression is "structural" (default when empty) or "off";
 	// see DNSProxyConfig.ExpansionSuppression. Set before the first Attach.
 	ExpansionSuppression string
+
+	// DNSCacheSize is the per-netns DNS positive-answer cache capacity
+	// (entries); 0 disables it. See DNSProxyConfig.CacheSize. Set before
+	// the first Attach.
+	DNSCacheSize int
 	// ClusterDomain is the Kubernetes cluster domain ("cluster.local" when
 	// empty); see DNSProxyConfig.ClusterDomain.
 	ClusterDomain string
@@ -1576,6 +1581,7 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 		EgressReady:          nctx.egressAttached.Load,
 		SearchListFor:        nctx.searchListFor,
 		ExpansionSuppression: m.ExpansionSuppression,
+		CacheSize:            m.DNSCacheSize,
 		ClusterDomain:        m.ClusterDomain,
 		OnDNSViolation: func(cgroupID uint64, domain, action string) {
 			m.handleDNSViolation(nctx, cgroupID, domain, action)

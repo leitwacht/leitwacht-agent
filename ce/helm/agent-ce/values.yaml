@@ -109,7 +109,8 @@ credwatch:
   # Comma-separated path suffixes that are REPORTED when opened but never
   # denied and never kill the container, even in enforce mode. Default:
   # /.docker/config.json,/.npmrc,/.netrc,/.pypirc (registry logins).
-  # Beats `paths`; an empty string keeps the default.
+  # Beats `paths`. "" keeps the default; "-" disables the class (an
+  # explicit empty list, so /.docker/config.json etc. are not reported).
   reportOnly: ""
   # Comma-separated path suffixes with no event and no enforcement at
   # all. Beats both `paths` and `reportOnly`. Default: none.

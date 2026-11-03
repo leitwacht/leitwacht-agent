@@ -388,8 +388,10 @@ BPF verdict is 0 and the event kind byte carries `0x80`
 `action_taken=reported`, so userspace never kills on it. Precedence is
 exclude (no event), then report-only, then watched for a suffix listed
 in several classes (resolved in userspace); when different suffixes
-match one path the longest wins; report-only paths do
-not protect their parent directory against rename. The path is
+match one path the longest wins; a report-only file's
+parent directory is registered as class 2, so moving it is reported
+and allowed. A report-only event also sets `ObserveOnly` for consumers
+that predate `ReportOnly`. The path is
 resolved into a 512-byte buffer and only its tail is matched. If the
 path still cannot be resolved, a watched `(parent directory, file name)`
 pair decides; anything else is let through so generic names such as

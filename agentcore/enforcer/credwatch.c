@@ -27,11 +27,13 @@
 #define CW_KIND_REPORT_ONLY 0x80
 
 /* Class stored as the value of watched_suffixes / watched_pairs /
- * watched_suffixes / watched_pairs / watched_dirs. 0 (absent) = not watched.
+ * watched_dirs. 0 (absent) = not watched.
  * Userspace resolves a suffix listed in both classes to report-only and
  * never inserts an excluded suffix. When two DIFFERENT suffixes match
  * one path, match_suffix returns the longest (most specific) one, and
- * for (parent, name) pairs the highest class wins. The BPF program
+ * for (parent, name) pairs an exact (parent, name) entry wins over a
+ * name-only entry; userspace never lets report-only downgrade a key a
+ * watched suffix holds. The BPF program
  * keeps no running "best" across the unrolled scan: carrying a
  * variable through 127 branching iterations exceeds the verifier's
  * 1M-instruction budget. */
@@ -170,7 +172,7 @@ struct {
  * egress.c __sock_owner_btf_hint comment for rationale. */
 volatile const struct credwatch_event __credwatch_event_btf_hint;
 
-/* match_suffix returns the class (CW_CLASS_*) of the strongest watched
+/* match_suffix returns the class (CW_CLASS_*) of the longest watched
  * suffix the resolved path ends with, or 0 for none. Candidates are
  * tried from the earliest '/' in the window, so the longest matching
  * suffix decides. Only the last 128 bytes of the path can hold a suffix (they
@@ -252,19 +254,23 @@ static __always_inline int fill_pair(struct dentry *d, struct pair_key *k)
     return 1;
 }
 
-/* pair_class returns the class of (parent, name) in map_, falling back
- * to the name with no parent requirement; the stronger class wins. */
+/* pair_class returns the class of (parent, name) in map_. An exact
+ * (parent, name) entry decides; the name-only entry (empty parent) is
+ * consulted only on a miss, so a loose report-only "/credentials" can
+ * never override an exact watched "/.aws/credentials". */
 #define PAIR_CLASS(map_, k_)                                           \
     ({                                                                 \
         __u8 _cls = 0;                                                 \
         __u8 *_v = bpf_map_lookup_elem(&(map_), (k_));                 \
-        if (_v)                                                        \
+        if (_v) {                                                      \
             _cls = *_v;                                                \
-        struct pair_key _any = {};                                     \
-        __builtin_memcpy(_any.name, (k_)->name, sizeof(_any.name));    \
-        _v = bpf_map_lookup_elem(&(map_), &_any);                      \
-        if (_v && *_v > _cls)                                          \
-            _cls = *_v;                                                \
+        } else {                                                       \
+            struct pair_key _any = {};                                 \
+            __builtin_memcpy(_any.name, (k_)->name, sizeof(_any.name)); \
+            _v = bpf_map_lookup_elem(&(map_), &_any);                  \
+            if (_v)                                                    \
+                _cls = *_v;                                            \
+        }                                                              \
         _cls;                                                          \
     })
 
@@ -434,7 +440,8 @@ static __always_inline int dentry_verdict(struct dentry *d, __u8 kind)
     if (type == S_IFREG) {
         cls = pair_class(&pk);
     } else if (type == S_IFDIR) {
-        /* Only watched (deny-class) directories are populated. */
+        /* Parent directories of watched (class 1) and report-only
+         * (class 2) suffixes are populated. */
         cls = PAIR_CLASS(watched_dirs, &pk);
     } else {
         return 0;

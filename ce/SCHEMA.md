@@ -110,6 +110,15 @@ one path, the longest (most specific) one decides.
 `off` mode and the `leitwacht.io/allow-cred-read` label still suppress
 events entirely.
 
+**Upgrading.** `/.docker/config.json` is no longer watched by default
+(report-only instead, so it no longer denies or kills), and `.npmrc`,
+`.netrc`, `.pypirc` were removed from the default exclude list, so reads of
+them now emit `reported` events where there were none. Report-only beats
+`paths` for the same suffix. Set `LEITWACHT_CE_CREDWATCH_REPORT_ONLY_PATHS=`
+(empty; Helm `credwatch.reportOnly: "-"`) to disable the class, or put the
+files back in `LEITWACHT_CE_CREDWATCH_EXCLUDE` for no events. Report-only
+files also report (and allow) a rename of their parent directory.
+
 ### `job_overrides`
 
 Optional per-CI-job overrides for `credwatch` / `proc_mem`. Keys are CI

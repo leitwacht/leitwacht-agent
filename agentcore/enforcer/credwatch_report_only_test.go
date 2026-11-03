@@ -55,7 +55,66 @@ func TestHandleCredwatchBPFEventReportOnly(t *testing.T) {
 		t.Errorf("report-only event decoded wrong: %+v", got[0])
 	}
 
-	if got[1].ReportOnly {
+	if !got[0].ObserveOnly {
+		t.Error("ReportOnly events must also set ObserveOnly (defence in depth)")
+	}
+
+	if got[1].ReportOnly || got[1].ObserveOnly {
 		t.Errorf("plain event must not be ReportOnly: %+v", got[1])
+	}
+}
+
+func pairKeyOf(parent, name string) [96]byte {
+	var k [96]byte
+	copy(k[:31], parent)
+	copy(k[32:95], name)
+
+	return k
+}
+
+func TestBuildWatchClasses(t *testing.T) {
+	// A suffix in both lists is report-only.
+	wc := buildWatchClasses([]string{"/.docker/config.json", "/.aws/credentials"}, []string{"/.docker/config.json"}, nil)
+	if got := wc.pairs[pairKeyOf(".docker", "config.json")]; got != credwatchClassReportOnly {
+		t.Errorf("shared suffix pair class = %d, want report-only", got)
+	}
+
+	// Exclude beats both.
+	wc = buildWatchClasses([]string{"/.aws/credentials"}, []string{"/.npmrc"}, []string{"/.aws/credentials", "/.npmrc"})
+	if len(wc.suffixes) != 0 || len(wc.pairs) != 0 || len(wc.dirs) != 0 {
+		t.Errorf("excluded suffixes must not be inserted: %+v", wc)
+	}
+
+	// Finding 2: report-only never downgrades a pair/dir key a different
+	// watched suffix holds, in either list order.
+	wc = buildWatchClasses([]string{"/x/.docker/config.json"}, []string{"/.docker/config.json"}, nil)
+	if got := wc.pairs[pairKeyOf(".docker", "config.json")]; got != credwatchClassWatched {
+		t.Errorf("pair downgraded to %d", got)
+	}
+
+	if got := wc.dirs[pairKeyOf("x", ".docker")]; got != credwatchClassWatched {
+		t.Errorf("dir (x,.docker) class = %d, want watched", got)
+	}
+
+	// The report-only suffix itself keeps its own class.
+	var sk [64]byte
+	copy(sk[:], "/.docker/config.json")
+
+	if got := wc.suffixes[sk]; got != credwatchClassReportOnly {
+		t.Errorf("suffix class = %d, want report-only", got)
+	}
+
+	// Finding 3: a report-only file registers its parent dir as class 2.
+	wc = buildWatchClasses(nil, []string{"/.docker/config.json"}, nil)
+	if got := wc.dirs[pairKeyOf("", ".docker")]; got != credwatchClassReportOnly {
+		t.Errorf("report-only parent dir class = %d, want report-only", got)
+	}
+
+	// Finding 1 (userspace half): a name-only report-only entry has an
+	// empty parent, so it is a different key from the exact watched pair.
+	wc = buildWatchClasses([]string{"/.aws/credentials"}, []string{"/credentials"}, nil)
+	if wc.pairs[pairKeyOf(".aws", "credentials")] != credwatchClassWatched ||
+		wc.pairs[pairKeyOf("", "credentials")] != credwatchClassReportOnly {
+		t.Errorf("exact and name-only pairs must keep separate classes: %+v", wc.pairs)
 	}
 }

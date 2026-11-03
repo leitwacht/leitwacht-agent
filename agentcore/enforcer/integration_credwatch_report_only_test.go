@@ -42,7 +42,10 @@ func TestIntegrationCredwatchReportOnlyClass(t *testing.T) {
 	// /.docker/config.json is in BOTH lists: report-only must win.
 	if err = populateWatchedPathMaps(objs,
 		[]string{"/.aws/credentials", "/.docker/config.json"},
-		[]string{"/.docker/config.json", "/.npmrc"},
+		// "/credentials" is a deliberately loose name-only report-only
+		// entry: it must NOT downgrade the exact watched
+		// "/.aws/credentials" for rename/link (finding 1).
+		[]string{"/.docker/config.json", "/.npmrc", "/credentials"},
 		nil); err != nil {
 		t.Fatalf("populateWatchedPathMaps: %v", err)
 	}
@@ -78,6 +81,7 @@ probe npmrc /root/.npmrc
 probe aws /root/.aws/credentials
 if mv /root/.npmrc /root/.npmrc2 2>/dev/null; then echo ok > /tmp/r-mv-npmrc; else echo denied > /tmp/r-mv-npmrc; fi
 if mv /root/.aws/credentials /root/.aws/c2 2>/dev/null; then echo ok > /tmp/r-mv-aws; else echo denied > /tmp/r-mv-aws; fi
+if mv /root/.docker /root/.d 2>/dev/null; then echo ok > /tmp/r-mv-dockerdir; else echo denied > /tmp/r-mv-dockerdir; fi
 echo done > /tmp/r-done
 sleep 120`
 
@@ -113,11 +117,12 @@ sleep 120`
 	}
 
 	want := map[string]string{
-		"docker":   "ok",     // report-only beats watched
-		"npmrc":    "ok",     // report-only
-		"aws":      "denied", // watched, enforce
-		"mv-npmrc": "ok",     // rename of a report-only file
-		"mv-aws":   "denied", // rename of a watched file
+		"docker":       "ok",     // report-only beats watched
+		"npmrc":        "ok",     // report-only
+		"aws":          "denied", // watched, enforce
+		"mv-npmrc":     "ok",     // rename of a report-only file
+		"mv-aws":       "denied", // rename of a watched file, despite name-only report-only "/credentials"
+		"mv-dockerdir": "ok",     // rename of a report-only file's parent dir: allowed + reported
 	}
 
 	for k, v := range want {
@@ -152,6 +157,8 @@ sleep 120`
 			seen["aws-open"] = ro
 		case p == ".npmrc" && reason == "rename":
 			seen["npmrc-rename"] = ro
+		case p == ".docker" && reason == "rename":
+			seen["dockerdir-rename"] = ro
 		case p == "credentials" && reason == "rename":
 			seen["aws-rename"] = ro
 		}
@@ -159,7 +166,7 @@ sleep 120`
 
 	for k, wantRO := range map[string]bool{
 		"docker-open": true, "npmrc-open": true, "aws-open": false,
-		"npmrc-rename": true, "aws-rename": false,
+		"npmrc-rename": true, "aws-rename": false, "dockerdir-rename": true,
 	} {
 		got, ok := seen[k]
 		if !ok {

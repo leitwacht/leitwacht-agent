@@ -24,6 +24,9 @@ type CredwatchEvent struct {
 	// program emitted the event and allowed the open regardless of mode;
 	// userspace must never kill on it. Distinct from ObserveOnly, which
 	// is a per-container mode: ReportOnly is a property of the path.
+	// ObserveOnly is also set whenever ReportOnly is, so a consumer that
+	// only checks ObserveOnly never kills on a report-only event;
+	// check ReportOnly first to tell the two apart.
 	ReportOnly bool
 }
 

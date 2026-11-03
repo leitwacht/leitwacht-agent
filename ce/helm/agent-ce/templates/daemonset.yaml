@@ -86,7 +86,7 @@ spec:
             {{- end }}
             {{- if .Values.credwatch.reportOnly }}
             - name: LEITWACHT_CE_CREDWATCH_REPORT_ONLY_PATHS
-              value: {{ .Values.credwatch.reportOnly | quote }}
+              value: {{ if eq (toString .Values.credwatch.reportOnly) "-" }}""{{ else }}{{ .Values.credwatch.reportOnly | quote }}{{ end }}
             {{- end }}
             {{- if .Values.credwatch.exclude }}
             - name: LEITWACHT_CE_CREDWATCH_EXCLUDE

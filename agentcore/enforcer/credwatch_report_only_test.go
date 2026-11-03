@@ -118,3 +118,50 @@ func TestBuildWatchClasses(t *testing.T) {
 		t.Errorf("exact and name-only pairs must keep separate classes: %+v", wc.pairs)
 	}
 }
+
+func TestBuildWatchClassesNameOnlyWatchedNotShadowed(t *testing.T) {
+	// Dir key ("", ".docker") is watched via the name-only entry; the
+	// exact ("root", ".docker") report-only key must be lifted,
+	// whatever order the suffixes are listed in.
+	orders := [][2][]string{
+		{{"/.docker/token", "/.aws/credentials"}, {"/root/.docker/config.json", "/.npmrc"}},
+		{{"/.aws/credentials", "/.docker/token"}, {"/.npmrc", "/root/.docker/config.json"}},
+	}
+
+	for i, o := range orders {
+		wc := buildWatchClasses(o[0], o[1], nil)
+		if got := wc.dirs[pairKeyOf("root", ".docker")]; got != credwatchClassWatched {
+			t.Errorf("order %d: dir (root,.docker) = %d, want watched", i, got)
+		}
+
+		if got := wc.dirs[pairKeyOf("", ".docker")]; got != credwatchClassWatched {
+			t.Errorf("order %d: dir (,.docker) = %d, want watched", i, got)
+		}
+	}
+
+	// Analogous pair case: name-only watched "/credentials"-style entry
+	// ("" parent) vs exact report-only (.aws, credentials).
+	wc := buildWatchClasses([]string{"/credentials"}, []string{"/.aws/credentials"}, nil)
+	if got := wc.pairs[pairKeyOf(".aws", "credentials")]; got != credwatchClassWatched {
+		t.Errorf("pair (.aws,credentials) = %d, want watched", got)
+	}
+
+	// Without a name-only watched key, report-only stays report-only.
+	wc = buildWatchClasses(nil, []string{"/.aws/credentials"}, nil)
+	if got := wc.pairs[pairKeyOf(".aws", "credentials")]; got != credwatchClassReportOnly {
+		t.Errorf("lone report-only pair = %d, want report-only", got)
+	}
+}
+
+// Reverse list order for the no-downgrade rule: the result must not
+// depend on which list a suffix sits in or its position.
+func TestBuildWatchClassesNoDowngradeReverseOrder(t *testing.T) {
+	a := buildWatchClasses([]string{"/x/.docker/config.json", "/y/other"}, []string{"/.docker/config.json"}, nil)
+	b := buildWatchClasses([]string{"/y/other", "/x/.docker/config.json"}, []string{"/.docker/config.json"}, nil)
+
+	for name, wc := range map[string]watchClasses{"a": a, "b": b} {
+		if got := wc.pairs[pairKeyOf(".docker", "config.json")]; got != credwatchClassWatched {
+			t.Errorf("%s: pair downgraded to %d", name, got)
+		}
+	}
+}

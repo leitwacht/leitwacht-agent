@@ -311,7 +311,34 @@ func buildWatchClasses(watchedPaths, reportOnlyPaths, excludedPaths []string) wa
 		}
 	}
 
+	wc.hardenExact()
+
 	return wc
+}
+
+// hardenExact lifts every exact (parent, name) key held at the
+// report-only class to watched when the name-only key ("", name) is
+// watched. BPF consults the name-only key only on an exact miss, so an
+// exact report-only key would otherwise shadow a loose watched entry.
+// Order-independent post-pass; no BPF cost.
+func hardenExact(m map[[96]byte]uint8) {
+	for k, v := range m {
+		if v != credwatchClassReportOnly {
+			continue
+		}
+
+		var anyKey [96]byte
+		copy(anyKey[32:], k[32:])
+
+		if m[anyKey] == credwatchClassWatched {
+			m[k] = credwatchClassWatched
+		}
+	}
+}
+
+func (wc *watchClasses) hardenExact() {
+	hardenExact(wc.pairs)
+	hardenExact(wc.dirs)
 }
 
 // setClass stores class under key unless it would downgrade a watched

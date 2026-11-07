@@ -57,6 +57,14 @@ type BuildKitEgressAttach struct {
 	// session-level attribution fallback.
 	sessions SessionsLookup
 
+	// bindings resolves a cgroup's final binding at flush time.
+	bindings BindingLookup
+
+	// joinWindow is the hold window; heldRows are unbound rows carried
+	// to the next flush (touched only by the flusher goroutine).
+	joinWindow time.Duration
+	heldRows   []Violation
+
 	closeOnce sync.Once
 }
 
@@ -71,6 +79,16 @@ type BuildKitAttachOption func(*buildKitAttachConfig)
 
 type buildKitAttachConfig struct {
 	sessions SessionsLookup
+	bindings BindingLookup
+
+	joinWindow time.Duration
+}
+
+// WithBindingLookup overrides the flush-time cgroup binding resolver.
+// The default is the hook installed with SetBuildKitEventLookup, falling
+// back to the live lookup.
+func WithBindingLookup(fn BindingLookup) BuildKitAttachOption {
+	return func(c *buildKitAttachConfig) { c.bindings = fn }
 }
 
 // WithSessionLookup overrides the session resolver used for the
@@ -102,7 +120,7 @@ func StartBuildKitEgressAttach(
 		return nil, nil //nolint:nilnil // documented: no paths == opt-out, not error
 	}
 
-	cfg := buildKitAttachConfig{sessions: lookupBuildKitSessions}
+	cfg := buildKitAttachConfig{sessions: lookupBuildKitSessions, bindings: lookupBuildKitEventBinding, joinWindow: joinPendingWindow}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -221,6 +239,8 @@ func StartBuildKitEgressAttach(
 		ancestors:   ancestors,
 		registrar:   registrar,
 		sessions:    cfg.sessions,
+		bindings:    cfg.bindings,
+		joinWindow:  cfg.joinWindow,
 	}
 
 	if bucketInterval > 0 && report != nil {
@@ -253,8 +273,9 @@ func (b *BuildKitEgressAttach) runFlusher(
 		StartedAt:   time.Now(),
 	}
 
-	flush := func(bucketTS time.Time) {
-		violations, dns, overflow := b.recorder.SnapshotAndReset()
+	flush := func(bucketTS time.Time, final bool) {
+		violations, dns, overflow := b.collect(final, interval)
+
 		if len(violations) == 0 && len(dns) == 0 {
 			return
 		}
@@ -282,11 +303,11 @@ func (b *BuildKitEgressAttach) runFlusher(
 		case <-ctx.Done():
 			// Final flush so a partial bucket is not lost on
 			// restart or shutdown.
-			flush(time.Now())
+			flush(time.Now(), true)
 
 			return
 		case bucketTS := <-ticker.C:
-			flush(bucketTS)
+			flush(bucketTS, false)
 		}
 	}
 }
@@ -335,6 +356,95 @@ func (b *BuildKitEgressAttach) Close() error {
 	})
 
 	return firstErr
+}
+
+// collect drains the recorder for a flush and resolves the rows.
+//
+// Rows recorded before the cgroup-join layer linked their RUN cgroup
+// carry no binding; they are resolved here with the final binding. Rows
+// whose join may still be pending are held for the next flush (never on
+// the final one, and only when the interval is long enough that each row
+// is held at most once). Held rows live in a slice on the attach, not
+// the recorder, so they bypass the recorder's per-bucket cap; they are
+// older than the interval at the next flush, hence never held twice.
+func (b *BuildKitEgressAttach) collect(final bool, interval time.Duration) ([]Violation, []DNSActivityEntry, int64) {
+	violations, dns, overflow := b.recorder.SnapshotAndReset()
+
+	violations = append(b.heldRows, violations...)
+	b.heldRows = nil
+
+	violations, b.heldRows = resolveAtFlush(violations, b.bindings, time.Now(),
+		!final && interval > 2*b.joinWindow, b.joinWindow)
+
+	return violations, dns, overflow
+}
+
+// joinPendingWindow is the default for how long after an event its RUN
+// cgroup may still be waiting for the join layer: the joiner retries a
+// match for its deferred-match timeout (2s by default) from cgroup
+// creation, plus margin. A row younger than this that is still unbound
+// at flush may yet be linked, so it is held for the next flush. Use
+// JoinPendingWindowFor to derive it from a non-default timeout.
+const joinPendingWindow = 3 * time.Second
+
+// JoinPendingWindowFor derives the hold window from the joiner's
+// deferred-match timeout (the WithDeferredMatch value) plus one second of
+// margin.
+func JoinPendingWindowFor(deferredMatchTimeout time.Duration) time.Duration {
+	return deferredMatchTimeout + time.Second
+}
+
+// WithJoinPendingWindow sets the hold window; pass
+// JoinPendingWindowFor(timeout) when the joiner is built with a
+// non-default WithDeferredMatch. Default 3s.
+func WithJoinPendingWindow(d time.Duration) BuildKitAttachOption {
+	return func(c *buildKitAttachConfig) { c.joinWindow = d }
+}
+
+// resolveAtFlush re-resolves rows that were unbound when recorded. A row
+// is "unbound" when it carries no session, project or ambiguity of its
+// own and has a cgroup id. For those, the binding that exists NOW (live,
+// or retained after the cgroup was removed) is authoritative: it is the
+// join layer's final decision, exact or deliberately ambiguous, and is
+// applied unchanged, so nothing here can turn an ambiguous join into a
+// single attribution. Rows still unbound and younger than
+// joinPendingWindow are returned as held when canHold is set; everything
+// else proceeds to the session fallback / unattributed flagging.
+func resolveAtFlush(
+	violations []Violation, lookup BindingLookup, now time.Time, canHold bool, window time.Duration,
+) ([]Violation, []Violation) {
+	if lookup == nil {
+		return violations, nil
+	}
+
+	out := violations[:0]
+
+	var held []Violation
+
+	for _, v := range violations {
+		if v.CgroupID == 0 || v.BuildSessionRef != "" || v.BuildProjectPath != "" || v.BuildAmbiguous {
+			out = append(out, v)
+
+			continue
+		}
+
+		if binding, ok := lookup(v.CgroupID, v.Timestamp); ok {
+			applyBuildKitBinding(&v, binding)
+			out = append(out, v)
+
+			continue
+		}
+
+		if canHold && now.Sub(v.Timestamp) < window {
+			held = append(held, v)
+
+			continue
+		}
+
+		out = append(out, v)
+	}
+
+	return out, held
 }
 
 // attributeBySession is the session-level fallback for rows the

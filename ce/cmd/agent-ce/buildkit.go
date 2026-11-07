@@ -92,6 +92,7 @@ func startBuildKitAttribution(
 	// fine, because no cgroup bindings exist yet anyway.
 	enforcer.SetBuildKitLookup(registry.LookupByCgroupID)
 	enforcer.SetBuildKitSessionLookup(registry.SessionsActiveAt)
+	enforcer.SetBuildKitEventLookup(registry.LookupForEvent)
 
 	rawPatterns := splitTrim(cfg.BuildkitCgroupPaths, ",")
 	if len(rawPatterns) == 0 {

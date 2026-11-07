@@ -691,6 +691,7 @@ func (j *CgroupJoiner) handleRemove(evt CgroupRemoveEvent) {
 
 	for id, binding := range j.registry.cgroupIndex {
 		if binding.ContainerID == evt.ContainerID {
+			j.registry.retireLocked(id, binding)
 			delete(j.registry.cgroupIndex, id)
 
 			return

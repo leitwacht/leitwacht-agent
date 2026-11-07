@@ -674,6 +674,7 @@ func (h *linuxEBPFHandle) StartRingbufReader(
 				BinaryPath: binaryPath,
 				Timestamp:  time.Now(),
 				Action:     action,
+				CgroupID:   ev.CgroupID,
 			}
 
 			// Stamp BuildKit step attribution if the event's cgroup
@@ -682,23 +683,7 @@ func (h *linuxEBPFHandle) StartRingbufReader(
 			// isn't installed or the cgroup isn't tracked (the
 			// common case for non-BuildKit egress).
 			if binding, ok := LookupBuildKitBinding(ev.CgroupID); ok {
-				v.BuildSessionRef = binding.SessionRef
-				v.BuildVertexDigest = binding.VertexDigest
-				v.BuildVertexName = binding.VertexName
-				v.BuildAmbiguous = binding.Ambiguous
-				v.BuildAmbiguousCandidates = binding.AmbiguousCandidates
-
-				// Per-row CI override: the CI runner passes CI metadata
-				// as --build-arg LEITWACHT_CI_*= when invoking docker
-				// buildx. BuildKit propagates these as FrontendAttrs on
-				// the session; the cgroup-join layer carries them
-				// through to the binding. For a persistent shared
-				// buildkitd that serves many CI jobs, this is how each
-				// violation row attributes to the real job rather than
-				// to the buildkitd pod's own labels.
-				v.BuildProjectPath, v.BuildJobID, v.BuildPipelineID,
-					v.BuildJobName, v.BuildJobStage, v.BuildGitRef,
-					v.BuildJobURL = CIOverrideFromFrontendAttrs(binding.FrontendAttrs)
+				applyBuildKitBinding(&v, binding)
 			}
 
 			recorder.RecordViolation(v)

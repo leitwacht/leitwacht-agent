@@ -47,6 +47,13 @@ type SessionRegistry struct {
 	// enrichment (Phase 3).
 	cgroupIndex map[uint64]CgroupBinding
 
+	// retired keeps the final binding of cgroups removed from the index
+	// (runc tore the RUN container down) for retiredRetention, so egress
+	// recorded from a short-lived RUN step can still be resolved when the
+	// bucket flushes after the cgroup is gone. Entries are looked up by
+	// event time (LookupForEvent), never as a live binding. Guarded by mu.
+	retired map[uint64]retiredBinding
+
 	// completedTTL controls how long a completed session stays in
 	// the registry. Set to a small value (default 30s) so the
 	// cgroup-join layer can still attribute tail traffic (cache
@@ -376,6 +383,50 @@ func lookupBuildKitSessions(at time.Time) ([]SessionState, bool) {
 	return (*fn)(at)
 }
 
+// buildKitEventLookup is the flush-time binding resolver (live or
+// recently retired). Installed alongside SetBuildKitLookup; when unset
+// the flush falls back to LookupBuildKitBinding (live bindings only).
+//
+//nolint:gochecknoglobals // package-level hook, same rationale as buildKitLookup.
+var buildKitEventLookup atomic.Pointer[BindingLookup]
+
+// BindingLookup resolves the cgroup binding for an event at a time.
+type BindingLookup func(cgroupID uint64, at time.Time) (CgroupBinding, bool)
+
+// SetBuildKitEventLookup installs the flush-time resolver. Pass
+// SessionRegistry.LookupForEvent. Passing nil restores the default.
+func SetBuildKitEventLookup(fn BindingLookup) {
+	if fn == nil {
+		buildKitEventLookup.Store(nil)
+
+		return
+	}
+
+	buildKitEventLookup.Store(&fn)
+}
+
+func lookupBuildKitEventBinding(id uint64, at time.Time) (CgroupBinding, bool) {
+	if fn := buildKitEventLookup.Load(); fn != nil {
+		return (*fn)(id, at)
+	}
+
+	return LookupBuildKitBinding(id)
+}
+
+// applyBuildKitBinding stamps a cgroup binding's session/vertex and the
+// session's per-row CI override onto a violation.
+func applyBuildKitBinding(v *Violation, binding CgroupBinding) {
+	v.BuildSessionRef = binding.SessionRef
+	v.BuildVertexDigest = binding.VertexDigest
+	v.BuildVertexName = binding.VertexName
+	v.BuildAmbiguous = binding.Ambiguous
+	v.BuildAmbiguousCandidates = binding.AmbiguousCandidates
+
+	v.BuildProjectPath, v.BuildJobID, v.BuildPipelineID,
+		v.BuildJobName, v.BuildJobStage, v.BuildGitRef,
+		v.BuildJobURL = CIOverrideFromFrontendAttrs(binding.FrontendAttrs)
+}
+
 // SessionState is the per-build view: a build ref plus the vertices
 // observed for it. Exported so Phase 2 and Phase 3 can read it; the
 // mutator methods on SessionRegistry are the only intended writers.
@@ -437,6 +488,70 @@ func NewSessionRegistry(completedTTL time.Duration) *SessionRegistry {
 	}
 }
 
+type retiredBinding struct {
+	binding   CgroupBinding
+	retiredAt time.Time
+}
+
+const (
+	// retiredRetention must exceed the longest flush bucket interval
+	// (CE default 5 min) plus the join deadline.
+	retiredRetention = 30 * time.Minute
+	maxRetired       = 4096
+
+	// retiredIDReuseGrace bounds how long after a cgroup's removal an
+	// event is still attributed to its retired binding: cgroup ids are
+	// inodes and can be recycled, so only events that happened while (or
+	// just as) the cgroup existed may resolve to it.
+	retiredIDReuseGrace = time.Second
+)
+
+// retireLocked moves a removed binding into the retired cache. r.mu must
+// be held for writing.
+func (r *SessionRegistry) retireLocked(id uint64, b CgroupBinding) {
+	now := time.Now()
+
+	if r.retired == nil {
+		r.retired = make(map[uint64]retiredBinding)
+	}
+
+	if len(r.retired) >= maxRetired {
+		for k, v := range r.retired {
+			if now.Sub(v.retiredAt) > retiredRetention || len(r.retired) >= maxRetired {
+				delete(r.retired, k)
+			}
+		}
+	}
+
+	r.retired[id] = retiredBinding{binding: b, retiredAt: now}
+}
+
+// LookupForEvent resolves the binding for an egress event that happened
+// at `at` in cgroup cgroupID: the live binding if the cgroup is still
+// linked, else the retired binding of a cgroup removed after `at`
+// (within the id-reuse grace). Used at flush time, when the cgroup-join
+// layer has had time to link cgroups that were unbound when the event
+// was recorded.
+func (r *SessionRegistry) LookupForEvent(cgroupID uint64, at time.Time) (CgroupBinding, bool) {
+	if b, ok := r.LookupByCgroupID(cgroupID); ok {
+		return b, true
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	rb, ok := r.retired[cgroupID]
+	if !ok || time.Since(rb.retiredAt) > retiredRetention {
+		return CgroupBinding{}, false
+	}
+
+	if at.After(rb.retiredAt.Add(retiredIDReuseGrace)) {
+		return CgroupBinding{}, false
+	}
+
+	return rb.binding, true
+}
+
 // LinkCgroup records that the cgroup with the given id holds the runc
 // container for (ref, vertexDigest). Called by the cgroup-join layer
 // after a successful match. Idempotent on repeated calls for the
@@ -450,6 +565,7 @@ func (r *SessionRegistry) LinkCgroup(cgroupID uint64, binding CgroupBinding) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cgroupIndex[cgroupID] = binding
+	delete(r.retired, cgroupID) // a live link supersedes any retired one (id reuse)
 }
 
 // UnlinkCgroup removes a cgroup-to-vertex binding. Called when the
@@ -458,6 +574,11 @@ func (r *SessionRegistry) LinkCgroup(cgroupID uint64, binding CgroupBinding) {
 func (r *SessionRegistry) UnlinkCgroup(cgroupID uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if b, ok := r.cgroupIndex[cgroupID]; ok {
+		r.retireLocked(cgroupID, b)
+	}
+
 	delete(r.cgroupIndex, cgroupID)
 }
 
@@ -530,6 +651,7 @@ func (r *SessionRegistry) LookupByCgroupID(cgroupID uint64) (CgroupBinding, bool
 
 	r.mu.Lock()
 	if cur, still := r.cgroupIndex[cgroupID]; still && cur.LinkedAt.Equal(binding.LinkedAt) {
+		r.retireLocked(cgroupID, cur)
 		delete(r.cgroupIndex, cgroupID)
 	}
 	r.mu.Unlock()

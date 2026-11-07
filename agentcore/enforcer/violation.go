@@ -46,6 +46,12 @@ type Violation struct {
 	BuildAmbiguous           bool                 `json:"build_ambiguous,omitempty"`
 	BuildAmbiguousCandidates []AmbiguousCandidate `json:"build_ambiguous_candidates,omitempty"`
 
+	// CgroupID is the cgroup of the connecting socket's owner. Kept on
+	// the row (not serialized) so BuildKit egress that was unbound when
+	// recorded can be re-resolved at flush time, once the cgroup-join
+	// layer has linked the RUN cgroup.
+	CgroupID uint64 `json:"-"`
+
 	// BuildUnattributed marks egress seen in a watched BuildKit cgroup
 	// subtree that the cgroup-join layer has not bound to any session
 	// or vertex (no match yet, or no match at all). Such events carry

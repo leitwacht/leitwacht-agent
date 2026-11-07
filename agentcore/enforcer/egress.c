@@ -63,12 +63,14 @@ struct allow_key {
    re-resolution, so eviction costs at most one extra DNS round trip.
    Statically-seeded entries must NOT live in this map — see
    allowed_hosts. */
+#ifndef LEITWACHT_BK_MULTI
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __type(key, struct allow_key);
     __type(value, __u32);
     __uint(max_entries, 65536);
 } allowed_ips SEC(".maps");
+#endif /* !LEITWACHT_BK_MULTI */
 
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -77,12 +79,14 @@ struct {
     __uint(max_entries, 1);
 } stats SEC(".maps");
 
+#ifndef LEITWACHT_BK_MULTI
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __type(key, __u32);
     __type(value, __u8);
     __uint(max_entries, 1);
 } config SEC(".maps");
+#endif /* !LEITWACHT_BK_MULTI */
 
 #define DROP_REASON_POLICY   1
 #define DROP_REASON_SINKHOLE 2
@@ -103,6 +107,15 @@ struct drop_event {
     __u32 pid;              /* tgid of connecting task (from sk_storage) */
     char  comm[16];         /* process name */
     char  binary_path[BINARY_PATH_LEN]; /* bpf_d_path result from LSM capture */
+#ifdef LEITWACHT_BK_MULTI
+    /* BuildKit slot-table object only: the verdict is decided per RUN
+       cgroup in the datapath, so the event carries it (userspace must not
+       infer it from a global mode). */
+    __u8  verdict;          /* BK_VERDICT_* */
+    __u8  state;            /* BK_STATE_* of the RUN cgroup at packet time */
+    __u32 slot;             /* policy slot (meaningful when state==BOUND) */
+    __u32 gen;              /* cgroup policy generation */
+#endif
 } __attribute__((packed));
 
 struct {
@@ -142,12 +155,14 @@ struct {
    sinkhole and CE deny_ips) are seeded once and never re-seeded, so
    an LRU would silently evict a deny and turn it into an allow.
    A full map makes the userspace Put fail with E2BIG instead. */
+#ifndef LEITWACHT_BK_MULTI
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct allow_key);
     __type(value, __u32);
     __uint(max_entries, 4096);
 } denied_ips SEC(".maps");
+#endif /* !LEITWACHT_BK_MULTI */
 
 /* Count of drop-event ringbuf reserve failures (ring full). Drop events
    are evidence only; the verdict does not depend on them, but a full
@@ -170,12 +185,14 @@ struct {
    destination into an intermittent, unreproducible drop. Bounded size
    is the right failure mode here — a full map fails loudly at install
    time instead of quietly at 3am. */
+#ifndef LEITWACHT_BK_MULTI
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, struct allow_key);
     __type(value, __u32);
     __uint(max_entries, 4096);
 } allowed_hosts SEC(".maps");
+#endif /* !LEITWACHT_BK_MULTI */
 
 /* Per-socket attribution.
  *
@@ -237,6 +254,7 @@ struct {
     __uint(map_flags, BPF_F_NO_PREALLOC);
 } trusted_nets SEC(".maps");
 
+#ifndef LEITWACHT_BK_MULTI
 static __always_inline void emit_drop_event(struct __sk_buff *skb,
                                             __u32 ip, __u16 port, __u8 proto,
                                             __u8 reason) {
@@ -316,6 +334,8 @@ static __always_inline void emit_drop_event(struct __sk_buff *skb,
     (void)bpf_map_update_elem(&drop_dedup, &dedup_key, &now, BPF_ANY);
 }
 
+#endif /* !LEITWACHT_BK_MULTI */
+
 static __always_inline int account_bytes(struct __sk_buff *skb) {
     __u32 key = 0;
     __u64 *val = bpf_map_lookup_elem(&stats, &key);
@@ -324,6 +344,7 @@ static __always_inline int account_bytes(struct __sk_buff *skb) {
     return 0;
 }
 
+#ifndef LEITWACHT_BK_MULTI
 static __always_inline __u8 get_mode(void) {
     __u32 key = 0;
     __u8 *mode = bpf_map_lookup_elem(&config, &key);
@@ -350,6 +371,9 @@ static __always_inline int apply_drop(struct __sk_buff *skb, __u32 ip,
     return 0; /* block: drop */
 }
 
+#endif /* !LEITWACHT_BK_MULTI */
+
+#ifndef LEITWACHT_BK_MULTI
 SEC("cgroup_skb/egress")
 int egress_filter(struct __sk_buff *skb) {
     /* Use bpf_skb_load_bytes for cgroup_skb — direct packet access is
@@ -507,6 +531,12 @@ int egress_filter(struct __sk_buff *skb) {
     /* Default deny */
     return apply_drop(skb, dst_ip, dst_port, protocol, DROP_REASON_POLICY);
 }
+
+#endif /* !LEITWACHT_BK_MULTI */
+
+#ifdef LEITWACHT_BK_MULTI
+#include "egress_bk.h"
+#endif
 
 /* sock_owners is shared with the LSM hooks in sock_attr.c via cilium/ebpf
  * MapReplacements at LoadEBPF time. The split lets us load + attach the

@@ -108,6 +108,21 @@ type CgroupJoiner struct {
 	// re-link a binding for a runc container that's already gone.
 	inflight sync.Map
 
+	// killOnUnattributed is the explicit opt-in to the fail-closed kill
+	// switch: with require-CI-metadata or deny patterns configured, a
+	// cgroup that cannot be attributed (or whose candidates are
+	// unauthorized or denied) is SIGKILLed. Off by default: the join
+	// layer then only flags the cgroup (CgroupBinding.Flag, surfaced as
+	// Violation.BuildFlag) and leaves it running in audit. Unattributable
+	// or ambiguous builds must never fail closed unless the operator
+	// asked for it.
+	killOnUnattributed bool
+
+	// gone marks containers whose cgroup was removed while their match
+	// was still pending: a late link for one goes straight to the retired
+	// cache (atomically), never through a live index entry.
+	gone sync.Map
+
 	// Rate limiting for the join-deadline warning (see logDeadlineDrop).
 	dropMu         sync.Mutex
 	lastDropLog    time.Time
@@ -173,6 +188,13 @@ func WithProcRoot(root string) JoinerOption {
 // WithStatFn overrides the cgroup-id resolver. Test-only.
 func WithStatFn(fn func(path string) (uint64, error)) JoinerOption {
 	return func(j *CgroupJoiner) { j.statFn = fn }
+}
+
+// WithKillOnUnattributed opts in to the fail-closed kill switch (see
+// CgroupJoiner.killOnUnattributed). Default off: unattributable cgroups
+// are flagged and audited, not killed.
+func WithKillOnUnattributed(enabled bool) JoinerOption {
+	return func(j *CgroupJoiner) { j.killOnUnattributed = enabled }
 }
 
 // WithChannelBuffer overrides the create/remove channel capacity.
@@ -304,6 +326,8 @@ func (j *CgroupJoiner) handleCreate(ctx context.Context, evt CgroupCreateEvent) 
 	if j.deferredMatchTimeout <= 0 {
 		// No retry window: the single attempt above was final. Egress
 		// events for this cgroup will be emitted unattributed.
+		j.registry.noteJoinOutcome(cgroupID, evt.CgroupPath, JoinDeadline)
+
 		return
 	}
 
@@ -334,6 +358,31 @@ func (j *CgroupJoiner) handleCreate(ctx context.Context, evt CgroupCreateEvent) 
 
 		j.deferredMatch(pendingCtx, cgroupID, evt, pending, st)
 	}()
+}
+
+// Attribution-trust flags raised in place of a kill (Violation.BuildFlag).
+const (
+	BuildFlagMissingCI     = "missing_ci_attribution"
+	BuildFlagDenyPattern   = "deny_pattern_match"
+	BuildFlagArgvUntrusted = "argv_untrusted"
+	BuildFlagUnmatched     = "unmatched_under_policy"
+	// BuildFlagHistoryDisconnected is stamped on rows of cgroups judged
+	// while the history watcher was down.
+	BuildFlagHistoryDisconnected = "history_disconnected"
+)
+
+// candidateKey is the policy key a pending vertex's session claims.
+func candidateKey(v PendingVertex) PolicyKey {
+	return keyFromAttrs(v.FrontendAttrs)
+}
+
+func candidateKeysOf(ms []PendingVertex) []PolicyKey {
+	out := make([]PolicyKey, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, candidateKey(m))
+	}
+
+	return out
 }
 
 // tryMatch performs one read-procs + read-argv + match-pending
@@ -423,10 +472,16 @@ func (j *CgroupJoiner) tryMatchState(
 		// session's FrontendAttrs lacked a required key), SIGKILL every
 		// process in this cgroup via cgroup.kill BEFORE writing a
 		// binding.
-		if !m.Authorized {
-			j.killMatched(cgroupID, evt, m, "buildkit cgroup killed: session missing required CI attribution", 0)
+		flag := ""
 
-			return true
+		if !m.Authorized {
+			if j.killOnUnattributed {
+				j.killMatched(cgroupID, evt, m, "buildkit cgroup killed: session missing required CI attribution", 0)
+
+				return true
+			}
+
+			flag = BuildFlagMissingCI
 		}
 
 		// Per-vertex kill-switch: server policy can install regex
@@ -435,17 +490,26 @@ func (j *CgroupJoiner) tryMatchState(
 		// CI-metadata path above. Skipped when no patterns are
 		// installed — back-compat for installations that haven't
 		// opted into per-vertex policy.
+		//
+		// A definite match on a single exactly-linked vertex is explicit
+		// operator policy, not a fail-closed guess: it kills regardless of
+		// WithKillOnUnattributed (which only gates the uncertain paths).
 		if j.registry.MatchesDenyVertexPattern(m.VertexName) {
 			j.killMatched(cgroupID, evt, m, "buildkit cgroup killed: vertex matched a deny policy pattern", 0)
 
 			return true
 		}
 
-		if j.distrustArgvMatch(cgroupID, evt, 1) {
+		stop, untrusted := j.distrustArgvMatch(cgroupID, evt, 1)
+		if stop {
 			return true
 		}
 
-		j.link(cgroupID, evt, m)
+		if untrusted && flag == "" {
+			flag = BuildFlagArgvUntrusted
+		}
+
+		j.linkWith(cgroupID, evt, m, StrengthExactArgv, []PolicyKey{candidateKey(m)}, flag)
 
 		j.logger.Info("buildkit cgroup linked",
 			"cgroup_id", cgroupID,
@@ -465,22 +529,41 @@ func (j *CgroupJoiner) tryMatchState(
 		// landing in ambiguous-link territory. Run this BEFORE the
 		// tiebreaker so it also covers the refined-to-one outcome
 		// below (the refined candidate is one of these).
+		ambFlag := ""
+
 		for i := range matches {
 			if !matches[i].Authorized {
-				j.killMatched(cgroupID, evt, matches[i], "buildkit cgroup killed: ambiguous candidate missing required CI attribution", len(matches))
+				if j.killOnUnattributed {
+					j.killMatched(cgroupID, evt, matches[i], "buildkit cgroup killed: ambiguous candidate missing required CI attribution", len(matches))
 
-				return true
+					return true
+				}
+
+				if ambFlag == "" {
+					ambFlag = BuildFlagMissingCI
+				}
 			}
 
 			if j.registry.MatchesDenyVertexPattern(matches[i].VertexName) {
-				j.killMatched(cgroupID, evt, matches[i], "buildkit cgroup killed: ambiguous candidate matched a deny policy pattern", len(matches))
+				if j.killOnUnattributed {
+					j.killMatched(cgroupID, evt, matches[i], "buildkit cgroup killed: ambiguous candidate matched a deny policy pattern", len(matches))
 
-				return true
+					return true
+				}
+
+				if ambFlag == "" {
+					ambFlag = BuildFlagDenyPattern
+				}
 			}
 		}
 
-		if j.distrustArgvMatch(cgroupID, evt, len(matches)) {
+		stop, untrusted := j.distrustArgvMatch(cgroupID, evt, len(matches))
+		if stop {
 			return true
+		}
+
+		if untrusted && ambFlag == "" {
+			ambFlag = BuildFlagArgvUntrusted
 		}
 
 		// Tiebreaker: environ. Read /proc/<pid>/environ and pick
@@ -492,16 +575,22 @@ func (j *CgroupJoiner) tryMatchState(
 
 		refined := tiebreakByEnviron(matches, environ)
 		if len(refined) == 1 {
-			j.link(cgroupID, evt, refined[0])
+			// Row attribution follows the tiebreak, but the policy binder
+			// sees every candidate: environ is forgeable, so it never
+			// chooses between projects.
+			j.linkWith(cgroupID, evt, refined[0], StrengthEnvironTiebreak, candidateKeysOf(matches), ambFlag)
 
 			return true
 		}
 
-		j.registry.LinkCgroup(cgroupID, CgroupBinding{
+		j.linkCgroup(cgroupID, CgroupBinding{
 			ContainerID:         evt.ContainerID,
 			CgroupPath:          evt.CgroupPath,
 			Ambiguous:           true,
 			AmbiguousCandidates: candidatesFromMatches(matches),
+			Strength:            StrengthAmbiguous,
+			CandidateKeys:       candidateKeysOf(matches),
+			Flag:                ambFlag,
 		})
 
 		j.logger.Info("cgroup-to-vertex join is ambiguous",
@@ -527,15 +616,17 @@ func (j *CgroupJoiner) tryWeakMatch(ctx context.Context, cgroupID uint64, evt Cg
 		return true
 	}
 
-	if j.registry.EnforcementEnabled() {
+	if j.killOnUnattributed && j.registry.EnforcementEnabled() {
 		return j.noMatch(ctx, cgroupID, evt, true)
 	}
 
-	j.registry.LinkCgroup(cgroupID, CgroupBinding{
+	j.linkCgroup(cgroupID, CgroupBinding{
 		ContainerID:         evt.ContainerID,
 		CgroupPath:          evt.CgroupPath,
 		Ambiguous:           true,
 		AmbiguousCandidates: candidatesFromMatches(weak),
+		Strength:            StrengthWeakTail,
+		CandidateKeys:       candidateKeysOf(weak),
 	})
 
 	j.logger.Info("cgroup-to-vertex join is ambiguous (last-command match only)",
@@ -552,9 +643,16 @@ func (j *CgroupJoiner) tryWeakMatch(ctx context.Context, cgroupID uint64, evt Cg
 // policy, while any unauthorized, placeholder or deny-matching session
 // is open, no match is trusted and the cgroup is killed instead of
 // bound. Returns true when it killed (the caller must stop).
-func (j *CgroupJoiner) distrustArgvMatch(cgroupID uint64, evt CgroupCreateEvent, candidates int) bool {
+func (j *CgroupJoiner) distrustArgvMatch(cgroupID uint64, evt CgroupCreateEvent, candidates int) (stop, untrusted bool) {
 	if !j.registry.EnforcementEnabled() || !j.registry.PolicyCandidates().Risky {
-		return false
+		return false, false
+	}
+
+	if !j.killOnUnattributed {
+		// Flag, do not kill: the match is still used for attribution and
+		// binding (rule 1 binds an exact argv match), and the row carries
+		// argv_untrusted for anomaly review.
+		return false, true
 	}
 
 	if j.killCgroup(evt.CgroupPath) {
@@ -566,30 +664,33 @@ func (j *CgroupJoiner) distrustArgvMatch(cgroupID uint64, evt CgroupCreateEvent,
 		)
 	}
 
-	return true
+	return true, true
 }
 
 // noMatch handles a miss. Non-final misses just ask for a retry. A
-// final miss under an enforcing policy fails closed but not blindly:
-// the cgroup may be a legitimate container the vertex text cannot be
+// final miss under a configured policy is treated cautiously: the
+// cgroup may be a legitimate container the vertex text cannot be
 // matched to (a "# syntax=" frontend container, or a RUN whose command
-// BuildKit renders differently from what runs). So the candidate set is
-// every pending RUN vertex of every open session, and the cgroup is
-// killed only if any open session is unauthorized or still a
-// placeholder, or any pending vertex matches a deny pattern, or the
-// history watcher is down (the registry is blind). Otherwise it is
-// bound as ambiguous over all candidates (or left unbound when there
-// are none). Without a policy a miss just leaves the cgroup unbound.
+// BuildKit renders differently from what runs). The candidate set is
+// every pending RUN vertex of every open session. By default the cgroup
+// is never killed: if the history watcher is down it is reported to the
+// policy binder as degraded_history; if an open session is unauthorized,
+// still a placeholder, or a pending vertex matches a deny pattern, the
+// cgroup is bound ambiguous over all candidates with the
+// unmatched_under_policy flag. With the explicit kill opt-in
+// (WithKillOnUnattributed) those risky cases kill the cgroup, as before.
+// Without a policy a miss just leaves the cgroup unbound.
 func (j *CgroupJoiner) noMatch(ctx context.Context, cgroupID uint64, evt CgroupCreateEvent, final bool) bool {
 	if !final || ctx.Err() != nil || !j.registry.EnforcementEnabled() {
 		return false
 	}
 
 	pc := j.registry.PolicyCandidates()
+	historyDown := j.registry.HistoryDisconnected()
 
-	if j.registry.HistoryDisconnected() || pc.Risky {
+	if (historyDown || pc.Risky) && j.killOnUnattributed {
 		reason := "buildkit cgroup killed: unmatched under policy with unauthorized or denied candidate sessions"
-		if j.registry.HistoryDisconnected() {
+		if historyDown {
 			reason = "buildkit cgroup killed: unmatched while the history watcher is disconnected"
 		}
 
@@ -605,31 +706,77 @@ func (j *CgroupJoiner) noMatch(ctx context.Context, cgroupID uint64, evt CgroupC
 		return true
 	}
 
+	if historyDown {
+		// The registry is blind to new sessions: any candidate set would
+		// be a guess. Leave the cgroup unbound and tell the binder.
+		j.logger.Warn("buildkit cgroup unmatched while the history watcher is disconnected; running in audit",
+			"cgroup_id", cgroupID,
+			"container_id", evt.ContainerID,
+		)
+
+		j.registry.noteJoinOutcome(cgroupID, evt.CgroupPath, JoinHistoryDown)
+
+		return true
+	}
+
 	if len(pc.Vertices) > 0 {
-		j.registry.LinkCgroup(cgroupID, CgroupBinding{
+		flag := ""
+		if pc.Risky {
+			flag = BuildFlagUnmatched
+		}
+
+		j.linkCgroup(cgroupID, CgroupBinding{
 			ContainerID:         evt.ContainerID,
 			CgroupPath:          evt.CgroupPath,
 			Ambiguous:           true,
 			AmbiguousCandidates: candidatesFromMatches(pc.Vertices),
+			Strength:            StrengthSessionLevel,
+			CandidateKeys:       candidateKeysOf(pc.Vertices),
+			Flag:                flag,
 		})
 
 		j.logger.Info("cgroup unmatched under policy; bound ambiguous over all open sessions",
 			"container_id", evt.ContainerID,
 			"candidates", len(pc.Vertices),
 		)
+
+		return true
 	}
+
+	j.registry.noteJoinOutcome(cgroupID, evt.CgroupPath, JoinDeadline)
 
 	return true
 }
 
+// linkCgroup records a binding: live, or straight into the retired cache
+// when the container's cgroup is already gone.
+func (j *CgroupJoiner) linkCgroup(cgroupID uint64, b CgroupBinding) {
+	if _, gone := j.gone.Load(b.ContainerID); gone {
+		j.registry.linkCgroupRetired(cgroupID, b)
+
+		return
+	}
+
+	j.registry.LinkCgroup(cgroupID, b)
+}
+
 func (j *CgroupJoiner) link(cgroupID uint64, evt CgroupCreateEvent, m PendingVertex) {
-	j.registry.LinkCgroup(cgroupID, CgroupBinding{
+	j.linkWith(cgroupID, evt, m, StrengthExactArgv, []PolicyKey{candidateKey(m)}, "")
+}
+
+func (j *CgroupJoiner) linkWith(
+	cgroupID uint64, evt CgroupCreateEvent, m PendingVertex, strength string, keys []PolicyKey, flag string,
+) {
+	j.linkCgroup(cgroupID, CgroupBinding{
 		SessionRef:    m.SessionRef,
 		VertexDigest:  m.VertexDigest,
 		VertexName:    m.VertexName,
 		ContainerID:   evt.ContainerID,
 		CgroupPath:    evt.CgroupPath,
 		FrontendAttrs: m.FrontendAttrs,
+		Strength:      strength,
+		CandidateKeys: keys,
+		Flag:          flag,
 	})
 }
 
@@ -708,6 +855,7 @@ func (j *CgroupJoiner) deferredMatch(
 			}
 
 			st.gone = true
+			j.gone.Store(evt.ContainerID, true)
 		case <-tick.C:
 		}
 
@@ -716,6 +864,7 @@ func (j *CgroupJoiner) deferredMatch(
 		if j.tryMatchState(ctx, cgroupID, evt, final, st) {
 			if st.gone {
 				j.registry.retireContainer(cgroupID, evt.ContainerID) // the cgroup no longer exists
+				j.gone.Delete(evt.ContainerID)
 			}
 
 			return
@@ -723,6 +872,7 @@ func (j *CgroupJoiner) deferredMatch(
 
 		if final {
 			j.logDeadlineDrop(cgroupID, evt)
+			j.registry.noteJoinOutcome(cgroupID, evt.CgroupPath, JoinDeadline)
 
 			return
 		}
@@ -782,14 +932,28 @@ func (j *CgroupJoiner) handleRemove(evt CgroupRemoveEvent) {
 	// inode (rare but possible). Scanning by ContainerID is O(n)
 	// over the index, which is bounded by max-parallelism.
 	j.registry.mu.Lock()
-	defer j.registry.mu.Unlock()
+
+	var (
+		goneID uint64
+		found  bool
+	)
 
 	for id, binding := range j.registry.cgroupIndex {
 		if binding.ContainerID == evt.ContainerID {
 			j.registry.retireLocked(id, binding)
 			delete(j.registry.cgroupIndex, id)
 
-			return
+			goneID, found = id, true
+
+			break
+		}
+	}
+
+	j.registry.mu.Unlock()
+
+	if found {
+		if ob := j.registry.obs(); ob != nil {
+			ob.OnUnbind(goneID)
 		}
 	}
 }

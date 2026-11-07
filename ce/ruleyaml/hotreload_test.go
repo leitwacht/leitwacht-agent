@@ -142,3 +142,43 @@ scopes:
 		t.Fatalf("bad reload wiped policy: action=%q ok=%v", pol.Action, ok)
 	}
 }
+
+func TestSetOnReloadFiresAfterReload(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "rules.yaml")
+
+	body := func(action string) string {
+		return "schema_version: 1\nscopes:\n  - name: default\n    default_action: " + action + "\n"
+	}
+
+	if err := os.WriteFile(path, []byte(body("allow")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	l, err := New(path, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fired := make(chan struct{}, 4)
+	l.SetOnReload(func() { fired <- struct{}{} })
+
+	stop := make(chan struct{})
+	defer close(stop)
+
+	ready := make(chan struct{})
+
+	go func() { _ = l.RunWithReady(stop, ready) }()
+
+	<-ready
+
+	if err = os.WriteFile(path, []byte(body("block")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-fired:
+	case <-time.After(3 * time.Second):
+		t.Fatal("onReload not called after a successful reload")
+	}
+}

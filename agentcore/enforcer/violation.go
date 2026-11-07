@@ -31,7 +31,7 @@ type Violation struct {
 	// without the report itself becoming a leak vector.
 	EnvNames     []string  `json:"env_names,omitempty"`
 	Timestamp    time.Time `json:"timestamp"`
-	Action       string    `json:"action"` // dns_blocked, packet_dropped, dns_observed, packet_observed, sinkhole_hit
+	Action       string    `json:"action"` // dns_blocked, packet_dropped, dns_observed, packet_observed, sinkhole_hit, would_block, packet_allowed
 	DomainSource string    `json:"domain_source,omitempty"`
 
 	// BuildKit step attribution. Populated only when the egress
@@ -73,6 +73,33 @@ type Violation struct {
 	BuildJobStage    string `json:"build_job_stage,omitempty"`
 	BuildGitRef      string `json:"build_git_ref,omitempty"`
 	BuildJobURL      string `json:"build_job_url,omitempty"`
+
+	// BuildKit RUN-step enforcement context (egress_bk datapath).
+	//
+	// EnforcementState says what the datapath could do for this row:
+	// enforced | shadow | audit_project | pending_bind |
+	// ambiguous_multi_project | unattributed | degraded_capacity |
+	// degraded_history | policy_unavailable. BindingStrength is how the
+	// RUN cgroup was tied to a policy (exact_argv | environ_tiebreak |
+	// weak_tail | session_level | ambiguous). PolicyKey names the policy
+	// that applied (project@version/job). WouldBlock is set on rows that
+	// passed un-enforced (pre-bind) but the bound policy would deny.
+	// BindingVerified is always false until the build claim is verified
+	// out of band: build-args are forgeable, so rows are "claimed".
+	// DegradedReason carries the reason a cgroup ran in audit although a
+	// policy might have applied. BuildFlag is an anomaly-worthy
+	// attribution flag from the cgroup-join layer (e.g.
+	// missing_ci_attribution, deny_pattern_match, argv_untrusted,
+	// unmatched_under_policy, history_disconnected); a build that cannot
+	// be attributed is flagged, never killed, unless the operator opted
+	// in to the kill switch.
+	EnforcementState string `json:"enforcement_state,omitempty"`
+	BindingStrength  string `json:"binding_strength,omitempty"`
+	PolicyKey        string `json:"policy_key,omitempty"`
+	WouldBlock       bool   `json:"would_block,omitempty"`
+	BindingVerified  bool   `json:"binding_verified,omitempty"`
+	DegradedReason   string `json:"degraded_reason,omitempty"`
+	BuildFlag        string `json:"build_flag,omitempty"`
 }
 
 // DNSActivityEntry tracks DNS queries bucketed by (domain, query_type)
@@ -150,9 +177,16 @@ type ViolationRecorder struct {
 	// dnsOverflow counts DNS (domain, qtype) entries dropped at the cap
 	// this bucket; folded into the overflow count at SnapshotAndReset.
 	dnsOverflow int64
-	capped      bool
-	capCount    int64 // count of violations after cap
-	bucketMode  bool  // when true, uses maxViolationsPerBucket instead of maxViolationsPerContainer
+	// capped is set once the deny/observe cap is reached; allowedCount
+	// counts packet_allowed rows, which have their own cap so a flood of
+	// permitted connections can never push enforcement evidence (drops,
+	// would_block, sinkhole and dns-bypass hits, observations) out of the
+	// bucket. Rows over either cap are counted in capCount, not lost
+	// silently.
+	capped       bool
+	allowedCount int
+	capCount     int64 // count of violations after cap
+	bucketMode   bool  // when true, uses maxViolationsPerBucket instead of maxViolationsPerContainer
 
 	// dnsCache is optional. When present, RecordDNS populates it and
 	// SnapshotAndReset/Snapshot attribute bare violations against it
@@ -209,7 +243,15 @@ func (r *ViolationRecorder) RecordViolation(v Violation) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.capped {
+	allowed := v.Action == "packet_allowed"
+
+	if allowed {
+		if r.allowedCount >= r.capLimit() {
+			r.capCount++
+
+			return
+		}
+	} else if r.capped {
 		r.capCount++
 
 		return
@@ -223,14 +265,23 @@ func (r *ViolationRecorder) RecordViolation(v Violation) {
 
 	r.violations = append(r.violations, v)
 
-	capLimit := maxViolationsPerContainer
-	if r.bucketMode {
-		capLimit = maxViolationsPerBucket
+	if allowed {
+		r.allowedCount++
+
+		return
 	}
 
-	if len(r.violations) >= capLimit {
+	if len(r.violations)-r.allowedCount >= r.capLimit() {
 		r.capped = true
 	}
+}
+
+func (r *ViolationRecorder) capLimit() int {
+	if r.bucketMode {
+		return maxViolationsPerBucket
+	}
+
+	return maxViolationsPerContainer
 }
 
 // RecordDNS records a DNS query and its resolved IPs, with optional
@@ -396,6 +447,7 @@ func (r *ViolationRecorder) SnapshotAndReset() ([]Violation, []DNSActivityEntry,
 	r.dnsOverflow = 0
 	r.dnsAllowedEntries = 0
 	r.capped = false
+	r.allowedCount = 0
 	r.capCount = 0
 
 	// Copy DNS entries out of the pointer map.

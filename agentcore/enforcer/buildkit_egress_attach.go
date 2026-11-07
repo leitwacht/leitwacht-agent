@@ -14,12 +14,14 @@
 // attribution via LookupBuildKitBinding so events from these cgroups
 // inherit session_ref + vertex_digest + per-row CI overrides.
 //
-// Always loads in audit mode: the allow/deny maps are empty so no
-// traffic is blocked. The intent is observation + attribution for
-// shared build infrastructure where per-CI-job policy is enforced at
-// the CI runner pod (via the normal per-container path), not at
-// buildkitd. Enforcement of buildkit-specific egress policy is a
-// follow-up — first we need to see the traffic.
+// Datapath. When the platform can load the egress_bk object
+// (BuildKitPlatform) the attach uses the per-RUN-cgroup policy slot
+// table: a BuildPolicyBinder ties each RUN cgroup to a project policy
+// slot and a mode (audit | shadow | enforce); cgroups it cannot tie to
+// exactly one project's policy run in audit. Without a policy source,
+// every cgroup is audit and the behaviour is the original observation +
+// attribution. A platform without BuildKitPlatform falls back to the
+// per-pod object in always-audit mode.
 
 package enforcer
 
@@ -27,6 +29,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,9 +41,14 @@ import (
 // Close releases the eBPF program, all attached cgroup links, and the
 // ringbuf reader.
 type BuildKitEgressAttach struct {
-	handle   EBPFHandle
+	handle   EBPFHandle // legacy always-audit path (nil with the slot datapath)
+	dp       BuildKitDatapath
+	binder   *BuildPolicyBinder
+	registry *SessionRegistry
 	links    []CgroupLink
 	recorder *ViolationRecorder
+
+	unhook func()
 
 	cancel   context.CancelFunc
 	stopRing func()
@@ -82,6 +91,67 @@ type buildKitAttachConfig struct {
 	bindings BindingLookup
 
 	joinWindow time.Duration
+
+	policySrc  BuildPolicySource
+	registry   *SessionRegistry
+	trusted    []net.IPNet
+	runLevel   int // >0 fixes the RUN-cgroup level (tests only)
+	dns        []net.IP
+	dnsSkipped []string
+}
+
+// WithBuildPolicySource supplies per-project policies to the slot
+// datapath. Without it every build cgroup runs in audit.
+func WithBuildPolicySource(src BuildPolicySource) BuildKitAttachOption {
+	return func(c *buildKitAttachConfig) { c.policySrc = src }
+}
+
+// WithBuildKitRegistry gives the attach the session registry so its
+// policy binder can observe cgroup bindings, sessions and history
+// reliability. Required for binding; without it all cgroups stay audit.
+func WithBuildKitRegistry(r *SessionRegistry) BuildKitAttachOption {
+	return func(c *buildKitAttachConfig) { c.registry = r }
+}
+
+// WithBuildKitTrustedCIDRs sets the trusted networks of the slot
+// datapath (traffic to them is allowed without rules). Default none, so
+// every build connection is observed.
+func WithBuildKitTrustedCIDRs(n []net.IPNet) BuildKitAttachOption {
+	return func(c *buildKitAttachConfig) { c.trusted = n }
+}
+
+// WithBuildKitDNSUpstreams sets the DNS upstream address(es) the port-53
+// pin allows for build cgroups in shadow/enforce (host:port or bare IPv4;
+// only the address is used). Port 53 to anything else is denied there, so
+// without it (an empty list) the pin is off. Required for enforce until
+// the build DNS proxy exists: it does not rely on trusted networks.
+//
+// The upstream must be the resolver buildkitd's RUN steps actually use
+// (buildkitd's resolv.conf or its [dns] setting); otherwise every build's
+// DNS is flagged or dropped as a bypass. The pin is evaluated before the
+// rules, so an explicit deny rule on the upstream IP:53 is overridden.
+// Hostnames cannot be pinned and are skipped with a warning.
+func WithBuildKitDNSUpstreams(upstreams []string) BuildKitAttachOption {
+	return func(c *buildKitAttachConfig) {
+		for _, u := range upstreams {
+			host := strings.TrimSpace(u)
+			if h, _, err := net.SplitHostPort(host); err == nil {
+				host = h
+			}
+
+			if ip := net.ParseIP(host).To4(); ip != nil {
+				c.dns = append(c.dns, ip)
+			} else {
+				c.dnsSkipped = append(c.dnsSkipped, u)
+			}
+		}
+	}
+}
+
+// WithBuildKitRunLevel fixes the RUN cgroup level instead of finding it
+// in the kernel from the parent cgroup ids. For tests only.
+func WithBuildKitRunLevel(level int) BuildKitAttachOption {
+	return func(c *buildKitAttachConfig) { c.runLevel = level }
 }
 
 // WithBindingLookup overrides the flush-time cgroup binding resolver.
@@ -125,9 +195,11 @@ func StartBuildKitEgressAttach(
 		o(&cfg)
 	}
 
-	// Always audit: the buildkit attach is for observation + attribution.
-	// CI-job-scoped enforcement runs at the CI runner pod's per-container
-	// attach (unchanged from before this code existed).
+	if bkp, ok := platform.(BuildKitPlatform); ok {
+		return startBuildKitSlotAttach(parent, bkp, platform, paths, log, report, bucketInterval, &cfg)
+	}
+
+	// Legacy: the per-pod object, always audit (observation + attribution).
 	handle, err := platform.LoadEBPF(true, nil)
 	if err != nil {
 		return nil, fmt.Errorf("load buildkit ebpf: %w", err)
@@ -283,6 +355,14 @@ func (b *BuildKitEgressAttach) runFlusher(
 		attributeBySession(violations, b.sessions)
 		markUnattributed(violations)
 
+		if b.binder != nil {
+			b.binder.Annotate(violations)
+		}
+
+		if b.dp != nil {
+			FinalizeUnbound(violations)
+		}
+
 		stats := &EgressStats{
 			DNSActivity:   dns,
 			Violations:    violations,
@@ -338,6 +418,14 @@ func (b *BuildKitEgressAttach) Close() error {
 		b.cancel()
 		<-b.flusherDone
 
+		if b.unhook != nil {
+			b.unhook()
+		}
+
+		if b.binder != nil {
+			b.binder.Close()
+		}
+
 		if b.registrar != nil {
 			for _, id := range b.ancestors {
 				b.registrar.RemoveSockKnownAncestor(id)
@@ -350,8 +438,16 @@ func (b *BuildKitEgressAttach) Close() error {
 			}
 		}
 
-		if err := b.handle.Close(); err != nil && firstErr == nil {
-			firstErr = err
+		if b.handle != nil {
+			if err := b.handle.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		}
+
+		if b.dp != nil {
+			if err := b.dp.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	})
 
@@ -593,4 +689,192 @@ func commonCIIdentity(open []SessionState) (map[string]string, bool) {
 	}
 
 	return open[0].FrontendAttrs, true
+}
+
+// startBuildKitSlotAttach is the egress_bk path of StartBuildKitEgressAttach.
+func startBuildKitSlotAttach(
+	parent context.Context,
+	bkp BuildKitPlatform,
+	platform Platform,
+	paths []string,
+	log *slog.Logger,
+	report ReportFunc,
+	bucketInterval time.Duration,
+	cfg *buildKitAttachConfig,
+) (*BuildKitEgressAttach, error) {
+	dp, err := bkp.LoadBuildKitEBPF(cfg.trusted)
+	if err != nil {
+		return nil, fmt.Errorf("load buildkit ebpf: %w", err)
+	}
+
+	cleanup := func(links []CgroupLink) {
+		for _, l := range links {
+			_ = l.Close()
+		}
+
+		_ = dp.Close()
+	}
+
+	parentIDs := make([]uint64, 0, len(paths))
+
+	for _, p := range paths {
+		id, idErr := platform.CgroupID(p)
+		if idErr != nil {
+			cleanup(nil)
+
+			return nil, fmt.Errorf("resolve buildkit cgroup %q: %w", p, idErr)
+		}
+
+		parentIDs = append(parentIDs, id)
+	}
+
+	if len(cfg.dnsSkipped) > 0 {
+		log.Warn("buildkit egress attach: DNS upstream is not an IPv4 address and was skipped; the port-53 pin may be off",
+			"skipped", strings.Join(cfg.dnsSkipped, ","))
+	}
+
+	if len(cfg.dns) == 0 {
+		log.Warn("buildkit egress attach: no DNS upstream configured; the port-53 pin is off")
+	}
+
+	if cfg.runLevel < 0 || cfg.runLevel > 64 {
+		cleanup(nil)
+
+		return nil, fmt.Errorf("%w: %d", errBKConfigRange, cfg.runLevel)
+	}
+
+	err = dp.SetConfig(BKConfig{ParentIDs: parentIDs, DNSUpstreams: cfg.dns, RunLevel: uint32(cfg.runLevel)}) //nolint:gosec // range-checked above
+	if err != nil {
+		cleanup(nil)
+
+		return nil, fmt.Errorf("set buildkit config: %w", err)
+	}
+
+	links := make([]CgroupLink, 0, len(paths))
+
+	for _, p := range paths {
+		link, attachErr := dp.AttachCgroup(p)
+		if attachErr != nil {
+			cleanup(links)
+
+			return nil, fmt.Errorf("attach buildkit cgroup %q: %w", p, attachErr)
+		}
+
+		links = append(links, link)
+
+		log.Info("buildkit egress attach: cgroup attached", "path", p)
+	}
+
+	var (
+		registrar SockAncestorRegistrar
+		ancestors []uint64
+	)
+
+	if rg, ok := dp.(SockAncestorRegistrar); ok {
+		registrar = rg
+
+		for i, p := range paths {
+			id := parentIDs[i]
+
+			idErr := rg.AddSockKnownAncestor(id)
+			if idErr != nil {
+				for _, a := range ancestors {
+					rg.RemoveSockKnownAncestor(a)
+				}
+
+				cleanup(links)
+
+				return nil, fmt.Errorf("register buildkit cgroup %q for socket capture: %w", p, idErr)
+			}
+
+			ancestors = append(ancestors, id)
+		}
+	} else {
+		log.Warn("buildkit egress attach: handle cannot register cgroup subtrees; RUN-step egress will not be observed")
+	}
+
+	recorder := NewViolationRecorder(nil)
+	if bucketInterval > 0 {
+		recorder.SetBucketMode()
+	}
+
+	ctx, cancel := context.WithCancel(parent) //nolint:gosec // cancel stored on b, called in Close
+
+	b := &BuildKitEgressAttach{
+		dp:          dp,
+		registry:    cfg.registry,
+		links:       links,
+		recorder:    recorder,
+		cancel:      cancel,
+		flusherDone: make(chan struct{}),
+		ancestors:   ancestors,
+		registrar:   registrar,
+		sessions:    cfg.sessions,
+		bindings:    cfg.bindings,
+		joinWindow:  cfg.joinWindow,
+	}
+
+	if cfg.registry != nil {
+		opts := []BinderOption{
+			WithBinderTrustedCIDRs(cfg.trusted),
+			WithBinderHistory(cfg.registry.HistoryDisconnected, cfg.sessions),
+			WithBinderCgroupCheck(cfg.registry.bindingFor, defaultStatFn),
+			WithBinderDNSUpstreams(cfg.dns),
+		}
+
+		b.binder = NewBuildPolicyBinder(cfg.policySrc, dp, log, opts...)
+		b.unhook = b.binder.InstallEventHook()
+
+		// Seed from bindings that already exist (a resolver swap installs
+		// a new attach under live RUN cgroups), then observe changes.
+		for id, binding := range cfg.registry.CgroupSnapshot() {
+			b.binder.OnBind(id, binding)
+		}
+
+		cfg.registry.SetBindingObserver(b.binder)
+
+		prev := b.unhook
+		binder := b.binder
+		reg := cfg.registry
+
+		b.unhook = func() {
+			reg.ClearBindingObserver(binder)
+			prev()
+		}
+
+		go b.binder.Run(ctx)
+	}
+
+	stopRing, err := dp.StartRingbufReader(ctx, func(_ uint64) *ViolationRecorder { return recorder })
+	if err != nil {
+		cancel()
+
+		if b.unhook != nil {
+			b.unhook()
+		}
+
+		if b.binder != nil {
+			b.binder.Close()
+		}
+
+		if registrar != nil {
+			for _, a := range ancestors {
+				registrar.RemoveSockKnownAncestor(a)
+			}
+		}
+
+		cleanup(links)
+
+		return nil, fmt.Errorf("start buildkit ringbuf reader: %w", err)
+	}
+
+	b.stopRing = stopRing
+
+	if bucketInterval > 0 && report != nil {
+		go b.runFlusher(ctx, bucketInterval, report, log)
+	} else {
+		close(b.flusherDone)
+	}
+
+	return b, nil
 }

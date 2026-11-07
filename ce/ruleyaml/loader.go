@@ -28,6 +28,21 @@ type Loader struct {
 	snapshot atomic.Pointer[snapshot]
 	ready    atomic.Bool
 	version  atomic.Int64
+
+	onReload atomic.Pointer[func()]
+}
+
+// SetOnReload registers fn to run after every successful hot reload
+// (not after the initial load). Used to tell policy consumers that rules
+// changed. fn must not block.
+func (l *Loader) SetOnReload(fn func()) {
+	if fn == nil {
+		l.onReload.Store(nil)
+
+		return
+	}
+
+	l.onReload.Store(&fn)
 }
 
 type snapshot struct {
@@ -155,6 +170,10 @@ func (l *Loader) runWithReady(stop <-chan struct{}, ready chan<- struct{}) error
 				return
 			}
 			l.log.Info("rules reloaded", "path", l.path, "version", l.version.Load())
+
+			if fn := l.onReload.Load(); fn != nil {
+				(*fn)()
+			}
 		})
 	}
 

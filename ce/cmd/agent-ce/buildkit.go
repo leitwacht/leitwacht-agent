@@ -52,6 +52,7 @@ func startBuildKitAttribution(
 	cfg *config.Config,
 	log *slog.Logger,
 	mgr *enforcer.Manager,
+	policySrc enforcer.BuildPolicySource,
 ) (*enforcer.CgroupResolver, error) {
 	if cfg.BuildkitGRPCAddr == "" {
 		return nil, nil //nolint:nilnil // documented disable
@@ -70,6 +71,9 @@ func startBuildKitAttribution(
 	}
 
 	if denyPatterns := compileDenyVertexPatterns(cfg.BuildkitDenyVertexPatterns, log); len(denyPatterns) > 0 {
+		// TODO: these deny patterns apply process-wide, to every build on
+		// this buildkitd. Move them into the per-(project, job) policy
+		// slot so one project's patterns cannot affect another's builds.
 		registry.SetBuildVertexDenyPatterns(denyPatterns)
 
 		log.Info("buildkit per-vertex kill-switch active",
@@ -134,7 +138,8 @@ func startBuildKitAttribution(
 			src := enforcer.NewInotifyCgroupSource(paths)
 			src.ScanExisting = scanExisting
 
-			return enforcer.NewCgroupJoiner(registry, src, log)
+			return enforcer.NewCgroupJoiner(registry, src, log,
+				enforcer.WithKillOnUnattributed(cfg.BuildkitKillOnUnattributed))
 		},
 	}
 
@@ -144,8 +149,24 @@ func startBuildKitAttribution(
 		)
 	} else {
 		rc.StartAttach = func(ctx context.Context, paths []string) (io.Closer, error) {
+			opts := []enforcer.BuildKitAttachOption{
+				enforcer.WithBuildKitRegistry(registry),
+				enforcer.WithBuildPolicySource(policySrc),
+				// Port 53 from build steps is pinned to the DNS upstream in
+				// shadow/enforce; trusted networks are not used for DNS.
+				enforcer.WithBuildKitDNSUpstreams(splitTrim(cfg.DNSUpstream, ",")),
+			}
+
+			// Shadow/enforce need the operator's trusted networks (cluster
+			// DNS, registry mirrors) or every build connection to them
+			// would be judged by rules. In audit they stay unlisted so
+			// every connection is still observed, as before.
+			if cfg.BuildkitEnforcement != "" && cfg.BuildkitEnforcement != "audit" {
+				opts = append(opts, enforcer.WithBuildKitTrustedCIDRs(parseTrustedCIDRs(cfg.TrustedCIDRs, log)))
+			}
+
 			a, err := enforcer.StartBuildKitEgressAttach(
-				ctx, mgr.Platform(), paths, log, mgr.ReportFunc, mgr.BucketInterval)
+				ctx, mgr.Platform(), paths, log, mgr.ReportFunc, mgr.BucketInterval, opts...)
 			if err != nil {
 				return nil, fmt.Errorf("buildkit egress attach: %w", err)
 			}

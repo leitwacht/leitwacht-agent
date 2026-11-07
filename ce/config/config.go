@@ -131,6 +131,46 @@ type Config struct {
 	//   LEITWACHT_CE_BUILDKIT_DENY_VERTEX_PATTERNS="apt-get,curl https?://"
 	BuildkitDenyVertexPatterns string
 
+	// BuildkitEnforcement is the egress mode for BuildKit RUN steps
+	// (LEITWACHT_CE_BUILDKIT_ENFORCEMENT, i.e. buildkit.enforcement):
+	//
+	//   audit   (default) record every connection, drop nothing
+	//   shadow  pass everything, record would_block for connections the
+	//           project's rules would deny
+	//   enforce drop connections the project's rules deny
+	//
+	// shadow and enforce limitations until the build DNS proxy exists:
+	//   - only IP/CIDR rules are enforced; fqdn allow rules are NOT (the
+	//     agent logs an Error once per policy version and flags the rows
+	//     fqdn_rules_inactive), so allow the destinations by address;
+	//   - port 53 from a RUN step is allowed only to LEITWACHT_CE_DNS_UPSTREAM
+	//     (any other resolver is dropped / would_block as a DNS bypass),
+	//     independent of trusted networks and rules (the pin precedes the
+	//     rules, so an explicit deny on the upstream IP:53 is overridden).
+	//     It must be the resolver buildkitd's RUN steps actually use
+	//     (buildkitd's resolv.conf or [dns]), else every build's DNS is
+	//     flagged or dropped as a bypass; hostnames are skipped (Warn);
+	//   - requires BPF cgroup_skb with spin locks and map-in-map (Linux
+	//     5.10 or newer); the RUN-step cgroup level is found in the kernel
+	//     from the configured cgroup paths, a layout that does not match
+	//     runs in audit (rows carry run_level_mismatch).
+	//
+	// It applies to RUN steps of scopes whose effective action is block;
+	// audit/allow scopes always run in audit. A RUN step that cannot be
+	// tied to exactly one project (unattributed, or candidates across
+	// projects) is always audit, never blocked, never killed (see
+	// BuildkitKillOnUnattributed).
+	BuildkitEnforcement string
+
+	// BuildkitKillOnUnattributed opts in to the fail-closed kill switch
+	// (LEITWACHT_CE_BUILDKIT_KILL_ON_UNATTRIBUTED, default false): with
+	// require-CI-metadata or deny patterns configured, RUN cgroups that
+	// cannot be attributed are SIGKILLed. By default they are flagged
+	// (build_flag on the row) and left running in audit. This does NOT
+	// cover a definite deny-pattern match on a single exactly-linked
+	// vertex: that is explicit operator policy and always kills.
+	BuildkitKillOnUnattributed bool
+
 	// BuildkitMaxSessionAge bounds how long a BuildKit session that
 	// never reported completion stays tracked (LEITWACHT_CE_BUILDKIT_MAX_SESSION_AGE,
 	// default 6h). Zero or negative keeps the default.
@@ -175,6 +215,7 @@ func Load() (*Config, error) {
 		BuildkitCgroupPaths:        os.Getenv("LEITWACHT_CE_BUILDKIT_CGROUP_PATHS"),
 		BuildkitRequiredAttrs:      os.Getenv("LEITWACHT_CE_BUILDKIT_REQUIRED_ATTRS"),
 		BuildkitDenyVertexPatterns: os.Getenv("LEITWACHT_CE_BUILDKIT_DENY_VERTEX_PATTERNS"),
+		BuildkitEnforcement:        strings.ToLower(strings.TrimSpace(envOr("LEITWACHT_CE_BUILDKIT_ENFORCEMENT", "audit"))),
 		LogLevel:                   envOr("LEITWACHT_CE_LOG_LEVEL", "info"),
 	}
 
@@ -205,6 +246,10 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	c.BuildkitDisableCgroupAttach, err = envBool("LEITWACHT_CE_BUILDKIT_DISABLE_CGROUP_ATTACH", false)
+	if err != nil {
+		return nil, err
+	}
+	c.BuildkitKillOnUnattributed, err = envBool("LEITWACHT_CE_BUILDKIT_KILL_ON_UNATTRIBUTED", false)
 	if err != nil {
 		return nil, err
 	}
@@ -288,6 +333,12 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("LEITWACHT_CE_UNKNOWN_PROJECT = %q (must be enforce|pass)",
 			c.UnknownProjectMode)
+	}
+	switch c.BuildkitEnforcement {
+	case "", "audit", "shadow", "enforce":
+	default:
+		return fmt.Errorf("LEITWACHT_CE_BUILDKIT_ENFORCEMENT = %q (must be audit|shadow|enforce)",
+			c.BuildkitEnforcement)
 	}
 	if c.MaxConcurrentEnf < 1 {
 		return fmt.Errorf("LEITWACHT_CE_MAX_CONCURRENT = %d (must be >= 1)", c.MaxConcurrentEnf)

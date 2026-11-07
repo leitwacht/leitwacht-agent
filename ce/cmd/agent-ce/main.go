@@ -123,7 +123,17 @@ func main() {
 		mgr.ReportFunc = multi.ReportAsync
 	}
 
-	buildKitAttach, err := startBuildKitAttribution(ctx, cfg, log, mgr)
+	buildKitMode, err := enforcer.ParseBuildPolicyMode(cfg.BuildkitEnforcement)
+	if err != nil {
+		log.Error("buildkit enforcement mode", "error", err)
+		os.Exit(1)
+	}
+
+	buildKitSrc := enforcer.NewProviderBuildPolicySource(policyProvider,
+		func(string) enforcer.BuildPolicyMode { return buildKitMode }, log)
+	loader.SetOnReload(func() { buildKitSrc.Notify("") })
+
+	buildKitAttach, err := startBuildKitAttribution(ctx, cfg, log, mgr, buildKitSrc)
 	if err != nil {
 		log.Error("start buildkit attribution", "error", err)
 		os.Exit(1)

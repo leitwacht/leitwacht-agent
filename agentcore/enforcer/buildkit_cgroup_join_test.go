@@ -612,6 +612,7 @@ func TestCgroupJoiner_KillsUnauthorizedSession(t *testing.T) {
 	j := NewCgroupJoiner(reg, source, nil,
 		WithProcRoot(filepath.Join(root, "proc")),
 		WithStatFn(statFn),
+		WithKillOnUnattributed(true),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -682,6 +683,7 @@ func TestCgroupJoiner_KillsOnDenyVertexPattern(t *testing.T) {
 	j := NewCgroupJoiner(reg, source, nil,
 		WithProcRoot(filepath.Join(root, "proc")),
 		WithStatFn(statFn),
+		WithKillOnUnattributed(true),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -764,6 +766,7 @@ func TestCgroupJoiner_KillsOnDenyVertexPatternAmbiguous(t *testing.T) {
 	j := NewCgroupJoiner(reg, source, nil,
 		WithProcRoot(filepath.Join(root, "proc")),
 		WithStatFn(statFn),
+		WithKillOnUnattributed(true),
 	)
 
 	ctx, cancel := context.WithCancel(context.Background())

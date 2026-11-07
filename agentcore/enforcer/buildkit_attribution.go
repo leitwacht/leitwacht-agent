@@ -129,6 +129,70 @@ type SessionRegistry struct {
 	// attributed by session. Guarded by mu.
 	firstConnect time.Time
 	lostUntil    time.Time
+
+	// observer is told about cgroup binding changes and new sessions
+	// (the policy binder). Called outside r.mu.
+	observer atomic.Pointer[BindingObserver]
+}
+
+// SetBindingObserver installs the observer notified of binding changes.
+func (r *SessionRegistry) SetBindingObserver(o BindingObserver) {
+	if o == nil {
+		r.observer.Store(nil)
+
+		return
+	}
+
+	r.observer.Store(&o)
+}
+
+// ClearBindingObserver removes o if it is still the installed observer
+// (an old attach closing after its replacement installed must not remove
+// the replacement).
+func (r *SessionRegistry) ClearBindingObserver(o BindingObserver) {
+	if cur := r.observer.Load(); cur != nil && *cur == o {
+		r.observer.CompareAndSwap(cur, nil)
+	}
+}
+
+func (r *SessionRegistry) obs() BindingObserver {
+	if p := r.observer.Load(); p != nil {
+		return *p
+	}
+
+	return nil
+}
+
+func (r *SessionRegistry) noteJoinOutcome(id uint64, path string, o JoinOutcome) {
+	if ob := r.obs(); ob != nil {
+		ob.OnJoinOutcome(id, path, o)
+	}
+}
+
+// bindingFor returns the live binding for a cgroup without the inode
+// verification of LookupByCgroupID (the caller verifies identity).
+func (r *SessionRegistry) bindingFor(id uint64) (CgroupBinding, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	b, ok := r.cgroupIndex[id]
+
+	return b, ok
+}
+
+// linkCgroupRetired records the final binding of a cgroup that no longer
+// exists: resolvable for events from while it did, never live, and never
+// announced to the observer.
+func (r *SessionRegistry) linkCgroupRetired(id uint64, b CgroupBinding) {
+	if b.LinkedAt.IsZero() {
+		b.LinkedAt = time.Now()
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.cgroupIndex, id)
+	r.retireLocked(id, b)
 }
 
 type sessionTombstone struct {
@@ -278,6 +342,19 @@ type CgroupBinding struct {
 	// VertexDigest/Name fields are not authoritative.
 	Ambiguous           bool
 	AmbiguousCandidates []AmbiguousCandidate
+
+	// Strength records how the join tied the cgroup to its candidate(s)
+	// (Strength* constants). CandidateKeys are the (project, job) claims
+	// of every candidate considered (one for an exact link). The policy
+	// binder uses them to decide whether a single policy applies; they
+	// never narrow by forgeable evidence.
+	Strength      string
+	CandidateKeys []PolicyKey
+
+	// Flag is an attribution-trust flag raised by the join layer instead
+	// of killing the cgroup (see CgroupJoiner kill-on-unattributed). It
+	// reaches the row as Violation.BuildFlag.
+	Flag string
 }
 
 // AmbiguousCandidate is one of the colliding vertex candidates when
@@ -429,6 +506,8 @@ func applyBuildKitBinding(v *Violation, binding CgroupBinding) {
 	v.BuildVertexName = binding.VertexName
 	v.BuildAmbiguous = binding.Ambiguous
 	v.BuildAmbiguousCandidates = binding.AmbiguousCandidates
+	v.BuildFlag = binding.Flag
+	v.BindingStrength = binding.Strength
 
 	v.BuildProjectPath, v.BuildJobID, v.BuildPipelineID,
 		v.BuildJobName, v.BuildJobStage, v.BuildGitRef,
@@ -571,9 +650,13 @@ func (r *SessionRegistry) LinkCgroup(cgroupID uint64, binding CgroupBinding) {
 	}
 
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.cgroupIndex[cgroupID] = binding
 	delete(r.retired, cgroupID) // a live link supersedes any retired one (id reuse)
+	r.mu.Unlock()
+
+	if ob := r.obs(); ob != nil {
+		ob.OnBind(cgroupID, binding)
+	}
 }
 
 // UnlinkCgroup removes a cgroup-to-vertex binding. Called when the
@@ -581,13 +664,20 @@ func (r *SessionRegistry) LinkCgroup(cgroupID uint64, binding CgroupBinding) {
 // Cheap no-op if the cgroup isn't tracked.
 func (r *SessionRegistry) UnlinkCgroup(cgroupID uint64) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
-	if b, ok := r.cgroupIndex[cgroupID]; ok {
+	b, ok := r.cgroupIndex[cgroupID]
+	if ok {
 		r.retireLocked(cgroupID, b)
 	}
 
 	delete(r.cgroupIndex, cgroupID)
+	r.mu.Unlock()
+
+	if ok {
+		if ob := r.obs(); ob != nil {
+			ob.OnUnbind(cgroupID)
+		}
+	}
 }
 
 // vertexHasCgroup reports whether a (non-ambiguous) binding, live or
@@ -617,11 +707,21 @@ func (r *SessionRegistry) vertexHasCgroup(session, digest string) bool {
 // by now name a different, live container).
 func (r *SessionRegistry) retireContainer(cgroupID uint64, containerID string) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 
-	if b, ok := r.cgroupIndex[cgroupID]; ok && b.ContainerID == containerID {
+	b, ok := r.cgroupIndex[cgroupID]
+	if ok && b.ContainerID == containerID {
 		r.retireLocked(cgroupID, b)
 		delete(r.cgroupIndex, cgroupID)
+	} else {
+		ok = false
+	}
+
+	r.mu.Unlock()
+
+	if ok {
+		if ob := r.obs(); ob != nil {
+			ob.OnUnbind(cgroupID)
+		}
 	}
 }
 
@@ -693,11 +793,23 @@ func (r *SessionRegistry) LookupByCgroupID(cgroupID uint64) (CgroupBinding, bool
 	}
 
 	r.mu.Lock()
+
+	dropped := false
+
 	if cur, still := r.cgroupIndex[cgroupID]; still && cur.LinkedAt.Equal(binding.LinkedAt) {
 		r.retireLocked(cgroupID, cur)
 		delete(r.cgroupIndex, cgroupID)
+
+		dropped = true
 	}
+
 	r.mu.Unlock()
+
+	if dropped {
+		if ob := r.obs(); ob != nil {
+			ob.OnUnbind(cgroupID)
+		}
+	}
 
 	return CgroupBinding{}, false
 }
@@ -880,6 +992,10 @@ func (r *SessionRegistry) SetCIRequirement(require bool, requiredKeys []string) 
 	r.requiredAttrs = append([]string(nil), requiredKeys...) // defensive copy
 }
 
+// TODO: the pattern set is process-wide (every build on this buildkitd).
+// Move it into the per-(project, job) policy slot so one project's
+// patterns cannot affect another project's builds.
+//
 // SetBuildVertexDenyPatterns installs the regex set the cgroup-join
 // layer evaluates against each candidate vertex's Name before linking.
 // A matching vertex causes the layer to SIGKILL the RUN cgroup via
@@ -937,6 +1053,14 @@ func (r *SessionRegistry) evaluateAuthorization(attrs map[string]string) bool {
 // Idempotent on repeated calls for the same ref (a reconnect after
 // disconnect replays in-flight sessions).
 func (r *SessionRegistry) RegisterSession(ref string, startedAt time.Time, attrs map[string]string) {
+	r.registerSession(ref, startedAt, attrs)
+
+	if ob := r.obs(); ob != nil {
+		ob.OnSessionRegistered(attrs)
+	}
+}
+
+func (r *SessionRegistry) registerSession(ref string, startedAt time.Time, attrs map[string]string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.version.Add(1)

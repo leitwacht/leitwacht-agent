@@ -170,6 +170,14 @@ spec:
             - name: LEITWACHT_CE_BUILDKIT_DENY_VERTEX_PATTERNS
               value: {{ join "," .denyVertexPatterns | quote }}
             {{- end }}
+            {{- if .enforcement }}
+            - name: LEITWACHT_CE_BUILDKIT_ENFORCEMENT
+              value: {{ .enforcement | quote }}
+            {{- end }}
+            {{- if .killOnUnattributed }}
+            - name: LEITWACHT_CE_BUILDKIT_KILL_ON_UNATTRIBUTED
+              value: "true"
+            {{- end }}
             {{- end }}
             {{- end }}
             - name: HOSTNAME_OVERRIDE

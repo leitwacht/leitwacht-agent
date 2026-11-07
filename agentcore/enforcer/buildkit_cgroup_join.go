@@ -137,10 +137,29 @@ func (p *pendingDeferredMatch) signalRemoved() { p.removedOnce.Do(func() { close
 // can exit, emptying cgroup.procs, before the next attempt) and when the
 // cgroup appeared (to select vertices that were running then).
 type matchState struct {
-	pid  int
-	argv []string
 	at   time.Time
 	gone bool // the cgroup was removed while the match was pending
+
+	// goodPID/goodArgv are the latest argv that is not an init helper.
+	goodPID  int
+	goodArgv []string
+}
+
+// isInitArgv reports whether argv is a container-runtime helper (runc's
+// init, a buildkit runc wrapper) rather than the RUN step's own process.
+func isInitArgv(argv []string) bool {
+	if len(argv) == 0 {
+		return true
+	}
+
+	base := filepath.Base(argv[0])
+	// Exact basenames: a prefix match would also swallow user binaries
+	// such as runcmd or runctl.
+	if base == "runc" || base == "buildkit-runc" {
+		return true
+	}
+
+	return argv[0] == "/proc/self/exe" && len(argv) > 1 && argv[1] == "init"
 }
 
 // JoinerOption tunes a CgroupJoiner at construction.
@@ -336,21 +355,30 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 func (j *CgroupJoiner) tryMatchState(
 	ctx context.Context, cgroupID uint64, evt CgroupCreateEvent, final bool, st *matchState,
 ) bool {
-	if st.argv == nil {
+	// Re-read the first process's argv on every attempt while the cgroup
+	// exists: early on it is often runc's init or a shim, and only later
+	// the real `sh -c ...`. The last GOOD argv (non-empty, not an init
+	// helper) is remembered for fast steps whose process exits before the
+	// next attempt, and is the only one used once the cgroup is gone.
+	if !st.gone {
 		pid, err := readFirstPID(evt.CgroupPath)
-		if err != nil {
-			return j.noMatch(ctx, cgroupID, evt, final)
-		}
+		if err == nil {
+			var argv []string
 
-		argv, err := readArgv(j.procRoot, pid)
-		if err != nil {
-			return j.noMatch(ctx, cgroupID, evt, final)
+			argv, err = readArgv(j.procRoot, pid)
+			if err == nil {
+				if !isInitArgv(argv) {
+					st.goodPID, st.goodArgv = pid, argv
+				}
+			}
 		}
-
-		st.pid, st.argv = pid, argv
 	}
 
-	argv, pid := st.argv, st.pid
+	if st.goodArgv == nil {
+		return j.noMatch(ctx, cgroupID, evt, final)
+	}
+
+	argv, pid := st.goodArgv, st.goodPID
 
 	pending := j.registry.CandidateVertices(st.at)
 	matches := matchPendingByArgv(pending, argv)
@@ -675,7 +703,7 @@ func (j *CgroupJoiner) deferredMatch(
 			// left live for a cgroup that no longer exists.
 			removedCh = nil
 
-			if st.argv == nil {
+			if st.goodArgv == nil {
 				return
 			}
 

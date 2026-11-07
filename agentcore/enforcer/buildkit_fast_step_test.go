@@ -221,3 +221,53 @@ func TestCgroupJoiner_CompletedVertexWithCgroupNeverLinksSecond(t *testing.T) {
 		t.Fatal("second cgroup linked to a vertex that already has one")
 	}
 }
+
+// Regression: the cgroup's first process is runc's init when first read,
+// and only later the real `sh -c ...`. The argv must be re-read on every
+// attempt (v0.12.4 captured the first one and never looked again).
+func TestCgroupJoiner_RereadsArgvAfterInitHelper(t *testing.T) {
+	root := t.TempDir()
+	reg := NewSessionRegistry(time.Minute)
+	reg.SetHistoryConnected(true)
+	registerFastStep(reg, time.Now().Add(time.Second))
+
+	cg := stageCgroup(t, root, "ctr-init", 5656, "runc\x00init\x00")
+	source := startFastStepJoiner(t, root, reg, 4848)
+
+	source.creates <- CgroupCreateEvent{ContainerID: "ctr-init", CgroupPath: cg}
+	time.Sleep(80 * time.Millisecond) // several attempts see only the init helper
+
+	if _, ok := reg.LookupByCgroupID(4848); ok {
+		t.Fatal("linked from an init helper's argv")
+	}
+
+	// The real process takes over the cgroup.
+	_ = os.WriteFile(filepath.Join(root, "proc", "5656", "cmdline"), []byte(fastStepCmd), 0o644) //nolint:gosec // test fixture
+
+	waitFor(t, time.Second, func() bool {
+		b, ok := reg.LookupByCgroupID(4848)
+
+		return ok && b.VertexDigest == "dig-fast"
+	})
+}
+
+// A cgroup removed while only an init helper was ever seen has no good
+// argv and must stay unlinked.
+func TestCgroupJoiner_RemovedAfterOnlyInitHelperStaysUnlinked(t *testing.T) {
+	root := t.TempDir()
+	reg := NewSessionRegistry(time.Minute)
+	reg.SetHistoryConnected(true)
+	registerFastStep(reg, time.Now().Add(time.Second))
+
+	cg := stageCgroup(t, root, "ctr-init2", 5757, "runc\x00init\x00")
+	source := startFastStepJoiner(t, root, reg, 4949)
+
+	source.creates <- CgroupCreateEvent{ContainerID: "ctr-init2", CgroupPath: cg}
+	time.Sleep(50 * time.Millisecond)
+	source.removes <- CgroupRemoveEvent{ContainerID: "ctr-init2", CgroupPath: cg}
+	time.Sleep(200 * time.Millisecond)
+
+	if _, ok := reg.LookupForEvent(4949, time.Now()); ok {
+		t.Error("linked using an init helper's argv")
+	}
+}

@@ -6,10 +6,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -513,4 +516,188 @@ func dumpLSMLinks(t *testing.T) {
 
 	out, _ := exec.Command("bpftool", "link", "show").CombinedOutput()
 	t.Logf("bpftool link show (full):\n%s", string(out))
+}
+
+// TestHelperDialProcess is not a test: it is the child process of
+// TestLSMSubtreeAncestorGate, started inside a chosen cgroup, that makes
+// one TCP connection to the address in LW_DIAL_ADDR and exits.
+func TestHelperDialProcess(t *testing.T) {
+	addr := os.Getenv("LW_DIAL_ADDR")
+	if addr == "" {
+		t.Skip("helper process only")
+	}
+
+	conn, err := net.DialTimeout("tcp4", addr, time.Second)
+	if err == nil {
+		conn.Close() //nolint:errcheck,gosec // helper
+	}
+}
+
+// TestLSMSubtreeAncestorGate proves the BuildKit RUN-step capture end to
+// end on a real kernel: a process in a (nested) child cgroup of a
+// registered subtree root gets a socket owner and its connect surfaces
+// as an egress event keyed to its pid, while a process in an unrelated,
+// unregistered cgroup tree (egress program attached there too) produces
+// none. Without the ancestor gate the registered case emits nothing.
+func TestLSMSubtreeAncestorGate(t *testing.T) { //nolint:gocognit,cyclop // linear end-to-end scenario
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+
+	ShutdownSentinelLSM()
+	t.Cleanup(ShutdownSentinelLSM)
+
+	platform := &LinuxPlatform{Logger: testLogger()}
+
+	h, err := platform.LoadEBPF(true, nil)
+	if err != nil {
+		t.Skip("LoadEBPF unavailable on this host: ", err)
+	}
+	defer h.Close() //nolint:errcheck // test cleanup
+
+	reg, ok := h.(SockAncestorRegistrar)
+	if !ok {
+		t.Fatal("handle lacks SockAncestorRegistrar")
+	}
+
+	ownIP := firstNonLoopbackIPv4(t)
+
+	base := filepath.Join("/sys/fs/cgroup", fmt.Sprintf("lwtest-%d", os.Getpid()))
+	regRoot, other := base+"-reg", base+"-other"
+	dirs := []string{regRoot, filepath.Join(regRoot, "run"), filepath.Join(regRoot, "run", "nested"),
+		other, filepath.Join(other, "run")}
+
+	for _, d := range dirs {
+		if mkErr := os.Mkdir(d, 0o755); mkErr != nil {
+			t.Skip("cannot create test cgroup (cgroup v2 not writable?): ", mkErr)
+		}
+	}
+
+	t.Cleanup(func() {
+		for i := len(dirs) - 1; i >= 0; i-- {
+			_ = os.Remove(dirs[i])
+		}
+	})
+
+	for _, d := range []string{regRoot, other} {
+		link, attachErr := h.AttachCgroup(d)
+		if attachErr != nil {
+			t.Fatalf("AttachCgroup(%s): %v", d, attachErr)
+		}
+
+		defer link.Close() //nolint:errcheck // test cleanup
+	}
+
+	rootID, idErr := platform.CgroupID(regRoot)
+	if idErr != nil {
+		t.Fatalf("CgroupID: %v", idErr)
+	}
+
+	if addErr := reg.AddSockKnownAncestor(rootID); addErr != nil {
+		t.Fatalf("AddSockKnownAncestor: %v", addErr)
+	}
+	defer reg.RemoveSockKnownAncestor(rootID)
+
+	recorder := NewViolationRecorder(nil)
+	audit := &atomic.Bool{}
+	audit.Store(true)
+
+	stop, err := h.StartRingbufReader(t.Context(), func(uint64) *ViolationRecorder { return recorder }, audit)
+	if err != nil {
+		t.Fatalf("StartRingbufReader: %v", err)
+	}
+	defer stop()
+
+	// One listener (so connects complete) per child, distinct ports: the
+	// kernel-side dedup is per (ip, port) for one second.
+	type child struct {
+		cg       string
+		wantSeen bool
+		port     int
+		pid      int
+	}
+
+	children := []*child{
+		{cg: dirs[1], wantSeen: true},
+		{cg: dirs[2], wantSeen: true},
+		{cg: dirs[4], wantSeen: false},
+	}
+
+	for _, c := range children {
+		ln, listenErr := net.Listen("tcp4", ownIP+":0")
+		if listenErr != nil {
+			t.Fatalf("listen: %v", listenErr)
+		}
+		defer ln.Close() //nolint:errcheck // test cleanup
+
+		c.port = ln.Addr().(*net.TCPAddr).Port
+
+		go func() {
+			for {
+				conn, accErr := ln.Accept()
+				if accErr != nil {
+					return
+				}
+
+				conn.Close() //nolint:errcheck,gosec // test
+			}
+		}()
+	}
+
+	for _, c := range children {
+		fd, openErr := os.Open(c.cg)
+		if openErr != nil {
+			t.Fatalf("open cgroup: %v", openErr)
+		}
+
+		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperDialProcess$") //nolint:gosec // re-exec of the test binary
+		cmd.Env = append(os.Environ(), fmt.Sprintf("LW_DIAL_ADDR=%s:%d", ownIP, c.port))
+		cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(fd.Fd())}
+
+		if startErr := cmd.Start(); startErr != nil {
+			t.Fatalf("start child in %s: %v", c.cg, startErr)
+		}
+
+		c.pid = cmd.Process.Pid
+		_ = cmd.Wait()
+		fd.Close() //nolint:errcheck,gosec // test
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	violations, _, _ := recorder.SnapshotAndReset()
+
+	for _, c := range children {
+		var seen bool
+
+		for _, v := range violations {
+			if v.IP == ownIP && v.Port == c.port && int(v.PID) == c.pid {
+				seen = true
+			}
+		}
+
+		if seen != c.wantSeen {
+			t.Errorf("cgroup %s: event seen=%v, want %v (pid %d port %d, %d events total)",
+				c.cg, seen, c.wantSeen, c.pid, c.port, len(violations))
+		}
+	}
+}
+
+func firstNonLoopbackIPv4(t *testing.T) string {
+	t.Helper()
+
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Skip("no interface addresses: ", err)
+	}
+
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok && !ipn.IP.IsLoopback() && ipn.IP.To4() != nil {
+			return ipn.IP.String()
+		}
+	}
+
+	t.Skip("no non-loopback IPv4 address")
+
+	return ""
 }

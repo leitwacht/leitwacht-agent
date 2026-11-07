@@ -147,3 +147,13 @@ type EBPFHandle interface {
 type CgroupLink interface {
 	Close() error
 }
+
+// SockAncestorRegistrar is implemented by handles whose sock_attr LSM
+// filter supports subtree roots: every task whose cgroup is at or below
+// a registered root gets an sk_storage owner (keyed by its leaf cgroup).
+// Optional so existing EBPFHandle implementations need no change.
+// Registrations are reference counted across all users of the filter.
+type SockAncestorRegistrar interface {
+	AddSockKnownAncestor(cgroupID uint64) error
+	RemoveSockKnownAncestor(cgroupID uint64)
+}

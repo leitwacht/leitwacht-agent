@@ -26,11 +26,13 @@ type sockAttrSockOwner struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	sockAttrMapSockKnownCgroups = "sock_known_cgroups"
-	sockAttrMapSockOwners       = "sock_owners"
-	sockAttrProgSockAttrConnect = "sock_attr_connect"
-	sockAttrProgSockAttrSendmsg = "sock_attr_sendmsg"
-	sockAttrVarSockOwnerBtfHint = "__sock_owner_btf_hint"
+	sockAttrMapSockAncestorsActive = "sock_ancestors_active"
+	sockAttrMapSockKnownAncestors  = "sock_known_ancestors"
+	sockAttrMapSockKnownCgroups    = "sock_known_cgroups"
+	sockAttrMapSockOwners          = "sock_owners"
+	sockAttrProgSockAttrConnect    = "sock_attr_connect"
+	sockAttrProgSockAttrSendmsg    = "sock_attr_sendmsg"
+	sockAttrVarSockOwnerBtfHint    = "__sock_owner_btf_hint"
 )
 
 // loadSockAttr returns the embedded CollectionSpec for sockAttr.
@@ -83,8 +85,10 @@ type sockAttrProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type sockAttrMapSpecs struct {
-	SockKnownCgroups *ebpf.MapSpec `ebpf:"sock_known_cgroups"`
-	SockOwners       *ebpf.MapSpec `ebpf:"sock_owners"`
+	SockAncestorsActive *ebpf.MapSpec `ebpf:"sock_ancestors_active"`
+	SockKnownAncestors  *ebpf.MapSpec `ebpf:"sock_known_ancestors"`
+	SockKnownCgroups    *ebpf.MapSpec `ebpf:"sock_known_cgroups"`
+	SockOwners          *ebpf.MapSpec `ebpf:"sock_owners"`
 }
 
 // sockAttrVariableSpecs contains global variables before they are loaded into the kernel.
@@ -114,12 +118,16 @@ func (o *sockAttrObjects) Close() error {
 //
 // It can be passed to loadSockAttrObjects or ebpf.CollectionSpec.LoadAndAssign.
 type sockAttrMaps struct {
-	SockKnownCgroups *ebpf.Map `ebpf:"sock_known_cgroups"`
-	SockOwners       *ebpf.Map `ebpf:"sock_owners"`
+	SockAncestorsActive *ebpf.Map `ebpf:"sock_ancestors_active"`
+	SockKnownAncestors  *ebpf.Map `ebpf:"sock_known_ancestors"`
+	SockKnownCgroups    *ebpf.Map `ebpf:"sock_known_cgroups"`
+	SockOwners          *ebpf.Map `ebpf:"sock_owners"`
 }
 
 func (m *sockAttrMaps) Close() error {
 	return _SockAttrClose(
+		m.SockAncestorsActive,
+		m.SockKnownAncestors,
 		m.SockKnownCgroups,
 		m.SockOwners,
 	)

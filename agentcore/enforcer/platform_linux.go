@@ -747,6 +747,79 @@ func (h *linuxEBPFHandle) RemoveSockKnownCgroup(cgroupID uint64) {
 	h.lsm.RemoveSockKnownCgroup(cgroupID)
 }
 
+// AddSockKnownAncestor registers a cgroup whose whole subtree is
+// monitored by the sock_attr filter (see sock_known_ancestors).
+func (h *linuxEBPFHandle) AddSockKnownAncestor(cgroupID uint64) error {
+	if h.lsm == nil {
+		return nil
+	}
+
+	return h.lsm.AddSockKnownAncestor(cgroupID)
+}
+
+// RemoveSockKnownAncestor drops one reference to a subtree root.
+func (h *linuxEBPFHandle) RemoveSockKnownAncestor(cgroupID uint64) {
+	if h.lsm == nil {
+		return
+	}
+
+	h.lsm.RemoveSockKnownAncestor(cgroupID)
+}
+
+// refSet counts registrations per cgroup id. The sock_known_* maps are
+// process-wide and shared by every attach, so two owners registering the
+// same id (an old and a new BuildKit attach during a resolver swap, or
+// overlapping per-pod registrations) must not delete each other's entry:
+// the map entry exists while at least one reference does.
+type refSet struct {
+	mu     sync.Mutex
+	counts map[uint64]int
+}
+
+// distinct returns the number of ids with at least one reference.
+func (r *refSet) distinct() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.counts)
+}
+
+// acquire adds a reference and reports whether it is the first.
+func (r *refSet) acquire(id uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.counts == nil {
+		r.counts = make(map[uint64]int)
+	}
+
+	r.counts[id]++
+
+	return r.counts[id] == 1
+}
+
+// release drops a reference and reports whether it was the last. A
+// release with no reference is a no-op (idempotent callers).
+func (r *refSet) release(id uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	n, ok := r.counts[id]
+	if !ok {
+		return false
+	}
+
+	if n <= 1 {
+		delete(r.counts, id)
+
+		return true
+	}
+
+	r.counts[id] = n - 1
+
+	return false
+}
+
 // linuxLSMHandle owns the process-singleton sock_attr bundle: the loaded
 // LSM programs (sock_attr_connect, sock_attr_sendmsg), the SK_STORAGE
 // sock_owners map (read by every per-pod egress program), and the
@@ -759,31 +832,93 @@ type linuxLSMHandle struct {
 	links      []link.Link
 	SockOwners *ebpf.Map // re-exposed for MapReplacements wiring
 	logger     *slog.Logger
+
+	cgroupRefs   refSet // sock_known_cgroups registrations
+	ancestorRefs refSet // sock_known_ancestors registrations
+
+	// flagMu serializes updates of the sock_ancestors_active flag so the
+	// last remover and a concurrent first adder cannot interleave.
+	flagMu sync.Mutex
 }
 
-// AddSockKnownCgroup registers a cgroup_id with the LSM filter.
-// Returns nil if the SockKnownCgroups map is unavailable (defensive —
-// shouldn't happen once the singleton is loaded).
+// syncAncestorFlag publishes whether any subtree root is registered, so
+// the BPF side can skip the ancestor probe entirely when none is.
+func (h *linuxLSMHandle) syncAncestorFlag() {
+	if h.objs == nil || h.objs.SockAncestorsActive == nil {
+		return
+	}
+
+	h.flagMu.Lock()
+	defer h.flagMu.Unlock()
+
+	var v uint8
+	if h.ancestorRefs.distinct() > 0 {
+		v = 1
+	}
+
+	_ = h.objs.SockAncestorsActive.Put(uint32(0), v)
+}
+
+// AddSockKnownCgroup registers a cgroup_id with the LSM filter
+// (reference counted). Returns nil if the SockKnownCgroups map is
+// unavailable (defensive — shouldn't happen once the singleton is
+// loaded).
 func (h *linuxLSMHandle) AddSockKnownCgroup(cgroupID uint64) error {
-	if h.objs == nil || h.objs.SockKnownCgroups == nil {
+	first := h.cgroupRefs.acquire(cgroupID)
+
+	if !first || h.objs == nil || h.objs.SockKnownCgroups == nil {
 		return nil
 	}
 
 	err := h.objs.SockKnownCgroups.Put(cgroupID, uint8(1))
 	if err != nil {
+		h.cgroupRefs.release(cgroupID)
+
 		return fmt.Errorf("put sock_known_cgroups: %w", err)
 	}
 
 	return nil
 }
 
-// RemoveSockKnownCgroup unregisters a cgroup_id. Idempotent.
+// RemoveSockKnownCgroup drops one reference to a cgroup_id and deletes
+// the map entry with the last one. Idempotent.
 func (h *linuxLSMHandle) RemoveSockKnownCgroup(cgroupID uint64) {
-	if h.objs == nil || h.objs.SockKnownCgroups == nil {
+	if !h.cgroupRefs.release(cgroupID) || h.objs == nil || h.objs.SockKnownCgroups == nil {
 		return
 	}
 
 	_ = h.objs.SockKnownCgroups.Delete(cgroupID)
+}
+
+// AddSockKnownAncestor registers a subtree root (reference counted).
+func (h *linuxLSMHandle) AddSockKnownAncestor(cgroupID uint64) error {
+	first := h.ancestorRefs.acquire(cgroupID)
+
+	if !first || h.objs == nil || h.objs.SockKnownAncestors == nil {
+		return nil
+	}
+
+	err := h.objs.SockKnownAncestors.Put(cgroupID, uint8(1))
+	if err != nil {
+		h.ancestorRefs.release(cgroupID)
+
+		return fmt.Errorf("put sock_known_ancestors: %w", err)
+	}
+
+	h.syncAncestorFlag()
+
+	return nil
+}
+
+// RemoveSockKnownAncestor drops one reference to a subtree root.
+func (h *linuxLSMHandle) RemoveSockKnownAncestor(cgroupID uint64) {
+	if !h.ancestorRefs.release(cgroupID) || h.objs == nil || h.objs.SockKnownAncestors == nil {
+		return
+	}
+
+	_ = h.objs.SockKnownAncestors.Delete(cgroupID)
+
+	h.syncAncestorFlag()
 }
 
 // Close releases the LSM links and the loaded objects. Production code

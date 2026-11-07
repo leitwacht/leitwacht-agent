@@ -72,9 +72,84 @@ struct {
     __type(value, __u8);
 } sock_known_cgroups SEC(".maps");
 
+/* Cgroup IDs whose whole SUBTREE is monitored. A task is covered when
+ * any ancestor cgroup (strict, by absolute level) is in this set, even
+ * though its own leaf cgroup is not in sock_known_cgroups. Used for the
+ * BuildKit RUN-step parent (/sys/fs/cgroup/buildkit): runc creates a
+ * fresh child cgroup per RUN step and the process is already running
+ * when userspace would learn of it, so per-leaf registration races the
+ * first connect and misses nested sub-cgroups. The owner's cgroup_id
+ * stays the LEAF id, so attribution keys on the RUN cgroup. Per-pod
+ * registrations in sock_known_cgroups keep exact-leaf semantics. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 64);
+    __type(key, __u64);
+    __type(value, __u8);
+} sock_known_ancestors SEC(".maps");
+
+/* One-entry flag, set by userspace while at least one subtree root is
+ * registered. The ancestor probe runs on every socket_connect /
+ * socket_sendmsg host-wide for sockets outside any exact-registered
+ * cgroup; with no subtree configured (the common case) this keeps the
+ * cost at a single array lookup, as before the ancestor fallback. */
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u8);
+} sock_ancestors_active SEC(".maps");
+
+/* Absolute level bound for the ancestor probe (root = 0); same value
+ * and rationale as credwatch.c MAX_ANCESTOR_LEVEL. Probing stops at the
+ * task's own level, so nesting below a registered ancestor cannot
+ * escape. */
+#define MAX_ANCESTOR_LEVEL 16
+
 /* Force clang to emit BTF for sock_owner. The userspace struct-size
  * check at LoadEBPF time depends on this surviving in the .o. */
 volatile const struct sock_owner __sock_owner_btf_hint;
+
+/* in_known_subtree: is any STRICT ancestor of the current task's cgroup
+ * (leaf = cgroup_id) a registered subtree root? Pass 1 finds the task's
+ * own level (two passes: a single "remember the match" pass is
+ * miscompiled by older clang, see credwatch.c). Returns directly from
+ * the probe loop: accumulating the lookup results into a flag makes
+ * clang OR the map-value pointers together, which the verifier
+ * rejects ("R1 pointer |= pointer prohibited"). */
+static __always_inline int in_known_subtree(__u64 leaf)
+{
+    __u32 zero = 0;
+    __u8 *active = bpf_map_lookup_elem(&sock_ancestors_active, &zero);
+
+    if (!active || !*active)
+        return 0;
+
+    int depth = MAX_ANCESTOR_LEVEL;
+
+#pragma unroll
+    for (int lvl = 0; lvl < MAX_ANCESTOR_LEVEL; lvl++) {
+        __u64 anc = bpf_get_current_ancestor_cgroup_id(lvl);
+
+        if (anc == 0 || anc == leaf) {
+            depth = lvl;
+            break;
+        }
+    }
+
+#pragma unroll
+    for (int lvl = 0; lvl < MAX_ANCESTOR_LEVEL; lvl++) {
+        if (lvl >= depth)
+            break;
+
+        __u64 anc = bpf_get_current_ancestor_cgroup_id(lvl);
+
+        if (bpf_map_lookup_elem(&sock_known_ancestors, &anc))
+            return 1;
+    }
+
+    return 0;
+}
 
 static __always_inline int capture_sock_owner(struct sock *sk) {
     if (!sk)
@@ -82,7 +157,7 @@ static __always_inline int capture_sock_owner(struct sock *sk) {
 
     __u64 cgroup_id = bpf_get_current_cgroup_id();
     __u8 *known = bpf_map_lookup_elem(&sock_known_cgroups, &cgroup_id);
-    if (!known)
+    if (!known && !in_known_subtree(cgroup_id))
         return 0;
 
     struct sock_owner *o = bpf_sk_storage_get(&sock_owners, sk, NULL,

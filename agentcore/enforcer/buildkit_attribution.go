@@ -90,7 +90,46 @@ type SessionRegistry struct {
 	// the registry: 0 = no watcher attached (unknown), 1 = connected,
 	// 2 = disconnected (registry is blind to new sessions).
 	historyState atomic.Int32
+
+	// tombs remembers sessions that left the registry (swept after
+	// completedTTL, dropped on a history DELETED event) so the egress
+	// session fallback still counts them as candidates for events from
+	// the time they were open. Without it a flush that runs after the
+	// sweep, or after a build deleted its own history, would see only
+	// the surviving sessions and wrongly attribute the egress to one
+	// of them. Guarded by mu.
+	tombs []sessionTombstone
+
+	// gaps are the recent intervals during which the history watcher
+	// was disconnected (registry blind to new sessions); gapStart is
+	// the start of the current one when disconnected. Guarded by mu.
+	gaps     []timeSpan
+	gapStart time.Time
+
+	// firstConnect is when the history watcher first connected; events
+	// before it (registry creation to first connect) are a blind gap.
+	// lostUntil is the latest time for which the tombstone or gap
+	// records are incomplete because entries were evicted (tombstone
+	// cap, retention, gap-list cap): events at or before it must not be
+	// attributed by session. Guarded by mu.
+	firstConnect time.Time
+	lostUntil    time.Time
 }
+
+type sessionTombstone struct {
+	state     SessionState // without vertices
+	removedAt time.Time
+}
+
+type timeSpan struct{ start, end time.Time }
+
+const (
+	// tombstoneRetention must exceed the longest flush bucket interval
+	// (CE default 5 min) plus clock-skew grace.
+	tombstoneRetention = 30 * time.Minute
+	maxTombstones      = 4096
+	maxGaps            = 16
+)
 
 const (
 	historyUnknown int32 = iota
@@ -102,10 +141,33 @@ const (
 // is established, false when the stream is down. While disconnected the
 // registry cannot see new sessions, so the joiner fails closed.
 func (r *SessionRegistry) SetHistoryConnected(connected bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	now := time.Now()
+
 	if connected {
+		if r.firstConnect.IsZero() {
+			r.firstConnect = now
+		}
+
+		if !r.gapStart.IsZero() {
+			r.gaps = append(r.gaps, timeSpan{start: r.gapStart, end: now})
+			if len(r.gaps) > maxGaps {
+				r.noteLostLocked(r.gaps[len(r.gaps)-maxGaps-1].end)
+				r.gaps = r.gaps[len(r.gaps)-maxGaps:]
+			}
+
+			r.gapStart = time.Time{}
+		}
+
 		r.historyState.Store(historyConnected)
 
 		return
+	}
+
+	if r.gapStart.IsZero() {
+		r.gapStart = now
 	}
 
 	r.historyState.Store(historyDisconnected)
@@ -283,6 +345,35 @@ func LookupBuildKitBinding(cgroupID uint64) (CgroupBinding, bool) {
 	}
 
 	return (*fn)(cgroupID)
+}
+
+// buildKitSessions is the hook the egress attach uses to learn which
+// build sessions were open at an event's time, for the session-level
+// attribution fallback. Installed alongside SetBuildKitLookup.
+//
+//nolint:gochecknoglobals // package-level hook, same rationale as buildKitLookup.
+var buildKitSessions atomic.Pointer[SessionsLookup]
+
+// SetBuildKitSessionLookup installs the active-session resolver. Pass
+// SessionRegistry.SessionsActiveAt from the agent's startup wiring.
+// Passing nil restores the no-op default.
+func SetBuildKitSessionLookup(fn SessionsLookup) {
+	if fn == nil {
+		buildKitSessions.Store(nil)
+
+		return
+	}
+
+	buildKitSessions.Store(&fn)
+}
+
+func lookupBuildKitSessions(at time.Time) ([]SessionState, bool) {
+	fn := buildKitSessions.Load()
+	if fn == nil {
+		return nil, false
+	}
+
+	return (*fn)(at)
 }
 
 // SessionState is the per-build view: a build ref plus the vertices
@@ -643,7 +734,53 @@ func (r *SessionRegistry) CompleteSession(ref string, completedAt time.Time) {
 func (r *SessionRegistry) DropSession(ref string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	if s, ok := r.sessions[ref]; ok {
+		r.entombLocked(s, time.Now())
+	}
+
 	delete(r.sessions, ref)
+}
+
+// noteLostLocked records that session/gap records up to t were evicted.
+func (r *SessionRegistry) noteLostLocked(t time.Time) {
+	if t.After(r.lostUntil) {
+		r.lostUntil = t
+	}
+}
+
+// entombLocked records a session that is leaving the registry. r.mu
+// must be held for writing.
+func (r *SessionRegistry) entombLocked(s *SessionState, now time.Time) {
+	cutoff := now.Add(-tombstoneRetention)
+
+	kept := r.tombs[:0]
+
+	for _, t := range r.tombs {
+		if t.removedAt.After(cutoff) {
+			kept = append(kept, t)
+		} else {
+			r.noteLostLocked(t.removedAt)
+		}
+	}
+
+	r.tombs = kept
+	if len(r.tombs) >= maxTombstones {
+		r.noteLostLocked(r.tombs[0].removedAt)
+		r.tombs = r.tombs[1:]
+	}
+
+	r.tombs = append(r.tombs, sessionTombstone{
+		state: SessionState{
+			Ref:           s.Ref,
+			StartedAt:     s.StartedAt,
+			Completed:     s.Completed,
+			CompletedAt:   s.CompletedAt,
+			FrontendAttrs: cloneStringMap(s.FrontendAttrs),
+			Authorized:    s.Authorized,
+		},
+		removedAt: now,
+	})
 }
 
 // UpsertVertex creates or updates a vertex within a session. Called
@@ -721,6 +858,7 @@ func (r *SessionRegistry) Sweep(cutoff time.Time) int {
 		aged := !s.Completed && !s.lastActivity.IsZero() && s.lastActivity.Before(ageCutoff)
 
 		if expired || aged {
+			r.entombLocked(s, time.Now())
 			delete(r.sessions, ref)
 			dropped++
 		}
@@ -790,6 +928,60 @@ func (r *SessionRegistry) Snapshot() map[string]SessionState {
 	}
 
 	return out
+}
+
+// SessionsActiveAt returns copies (without vertices) of the sessions
+// that may have been open at the given time, within the clock-skew
+// grace: live sessions plus tombstones of sessions removed since. The
+// bool is false when the answer cannot be trusted because the history
+// watcher was disconnected at or around that time (a session may have
+// started unseen); callers must then not attribute by session.
+func (r *SessionRegistry) SessionsActiveAt(at time.Time) ([]SessionState, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	all := make([]SessionState, 0, len(r.sessions)+len(r.tombs))
+
+	for _, s := range r.sessions {
+		all = append(all, SessionState{
+			Ref:           s.Ref,
+			StartedAt:     s.StartedAt,
+			Completed:     s.Completed,
+			CompletedAt:   s.CompletedAt,
+			FrontendAttrs: cloneStringMap(s.FrontendAttrs),
+			Authorized:    s.Authorized,
+		})
+	}
+
+	for _, t := range r.tombs {
+		st := t.state
+		if !st.Completed {
+			// Removed while still open (dropped or aged out): it may
+			// have been live right up to its removal.
+			st.Completed = true
+			st.CompletedAt = t.removedAt
+		}
+
+		all = append(all, st)
+	}
+
+	// Blind before the watcher first connected, and wherever evicted
+	// records mean the candidate set may be incomplete.
+	reliable := !r.firstConnect.IsZero() && !at.Before(r.firstConnect) && at.After(r.lostUntil)
+
+	lo, hi := at.Add(-sessionGrace), at.Add(sessionGrace)
+
+	for _, g := range r.gaps {
+		if g.end.After(lo) && g.start.Before(hi) {
+			reliable = false
+		}
+	}
+
+	if !r.gapStart.IsZero() && r.gapStart.Before(hi) {
+		reliable = false
+	}
+
+	return activeSessionsAt(all, at), reliable
 }
 
 func cloneStringMap(in map[string]string) map[string]string {

@@ -91,6 +91,7 @@ func startBuildKitAttribution(
 	// enforcer's egress path returns (zero, false) from every lookup —
 	// fine, because no cgroup bindings exist yet anyway.
 	enforcer.SetBuildKitLookup(registry.LookupByCgroupID)
+	enforcer.SetBuildKitSessionLookup(registry.SessionsActiveAt)
 
 	rawPatterns := splitTrim(cfg.BuildkitCgroupPaths, ",")
 	if len(rawPatterns) == 0 {

@@ -126,6 +126,10 @@ type fakeEBPFHandle struct {
 	// StartRingbufReader. Tests use this to assert the reader observes the
 	// post-flip mode rather than a value snapshotted at start.
 	ringbufAuditSrc *atomic.Bool
+	// sockKnown records ids registered with the sock_attr filter.
+	sockKnown map[uint64]bool
+	// ancestors records subtree roots (refcounted).
+	ancestors map[uint64]int
 }
 
 func (h *fakeEBPFHandle) AddAllowedIP(ip net.IP, ports []int, _ uint32) error {
@@ -211,8 +215,65 @@ func (h *fakeEBPFHandle) Close() error {
 	return nil
 }
 
-func (h *fakeEBPFHandle) AddSockKnownCgroup(_ uint64) error { return nil }
-func (h *fakeEBPFHandle) RemoveSockKnownCgroup(_ uint64)    {}
+func (h *fakeEBPFHandle) AddSockKnownCgroup(id uint64) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.sockKnown == nil {
+		h.sockKnown = make(map[uint64]bool)
+	}
+
+	h.sockKnown[id] = true
+
+	return nil
+}
+
+func (h *fakeEBPFHandle) RemoveSockKnownCgroup(id uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	delete(h.sockKnown, id)
+}
+
+func (h *fakeEBPFHandle) AddSockKnownAncestor(id uint64) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.ancestors == nil {
+		h.ancestors = make(map[uint64]int)
+	}
+
+	h.ancestors[id]++
+
+	return nil
+}
+
+func (h *fakeEBPFHandle) RemoveSockKnownAncestor(id uint64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.ancestors[id] <= 1 {
+		delete(h.ancestors, id)
+
+		return
+	}
+
+	h.ancestors[id]--
+}
+
+func (h *fakeEBPFHandle) ancestorCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return len(h.ancestors)
+}
+
+func (h *fakeEBPFHandle) sockKnownCount() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return len(h.sockKnown)
+}
 
 // fakeCgroupLink tracks cgroup link closes.
 type fakeCgroupLink struct {

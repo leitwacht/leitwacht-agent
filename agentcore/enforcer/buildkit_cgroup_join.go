@@ -107,6 +107,11 @@ type CgroupJoiner struct {
 	// goroutine that wins its retry after the remove fired can't
 	// re-link a binding for a runc container that's already gone.
 	inflight sync.Map
+
+	// Rate limiting for the join-deadline warning (see logDeadlineDrop).
+	dropMu         sync.Mutex
+	lastDropLog    time.Time
+	dropSuppressed int
 }
 
 // pendingDeferredMatch is the handle on one in-flight deferred-match
@@ -313,6 +318,12 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 	pending := j.registry.PendingVertices()
 	matches := matchPendingByArgv(pending, argv)
 
+	if len(matches) == 0 {
+		if weak := matchPendingByTail(pending, argv); len(weak) > 0 {
+			return j.tryWeakMatch(ctx, cgroupID, evt, weak, final)
+		}
+	}
+
 	// Final check just before committing: if a remove event for this
 	// container fired during the retry window, ctx is now cancelled and
 	// we must NOT write a binding. handleRemove will have run its
@@ -427,6 +438,39 @@ func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt Cgroup
 
 		return true
 	}
+}
+
+// tryWeakMatch handles candidates found only through the last-simple-
+// command tier. That evidence is forgeable (argv and environ are both
+// controlled by the RUN), so it is never single-linked: the cgroup is
+// bound ambiguous over the weak candidates, or treated as unmatched
+// under a policy.
+func (j *CgroupJoiner) tryWeakMatch(ctx context.Context, cgroupID uint64, evt CgroupCreateEvent, weak []PendingVertex, final bool) bool {
+	if !final {
+		return false
+	}
+
+	if ctx.Err() != nil {
+		return true
+	}
+
+	if j.registry.EnforcementEnabled() {
+		return j.noMatch(ctx, cgroupID, evt, true)
+	}
+
+	j.registry.LinkCgroup(cgroupID, CgroupBinding{
+		ContainerID:         evt.ContainerID,
+		CgroupPath:          evt.CgroupPath,
+		Ambiguous:           true,
+		AmbiguousCandidates: candidatesFromMatches(weak),
+	})
+
+	j.logger.Info("cgroup-to-vertex join is ambiguous (last-command match only)",
+		"container_id", evt.ContainerID,
+		"candidates", len(weak),
+	)
+
+	return true
 }
 
 // distrustArgvMatch implements the fail-closed rule for argv-derived
@@ -584,15 +628,44 @@ func (j *CgroupJoiner) deferredMatch(ctx context.Context, cgroupID uint64, evt C
 		}
 
 		if final {
-			j.logger.Debug("cgroup-to-vertex join deadline; dropped",
-				"container_id", evt.ContainerID,
-				"cgroup_id", cgroupID,
-				"path", evt.CgroupPath,
-			)
+			j.logDeadlineDrop(cgroupID, evt)
 
 			return
 		}
 	}
+}
+
+// dropLogInterval rate-limits the join-deadline warning: a burst of
+// unmatched RUN containers logs once per interval with a suppressed count.
+const dropLogInterval = 10 * time.Second
+
+// logDeadlineDrop reports a RUN cgroup left unattributed because no
+// pending vertex matched before the join deadline. Its egress is
+// reported without build attribution, so this must not be silent.
+func (j *CgroupJoiner) logDeadlineDrop(cgroupID uint64, evt CgroupCreateEvent) {
+	j.dropMu.Lock()
+
+	now := time.Now()
+	if !j.lastDropLog.IsZero() && now.Sub(j.lastDropLog) < dropLogInterval {
+		j.dropSuppressed++
+		j.dropMu.Unlock()
+
+		return
+	}
+
+	suppressed := j.dropSuppressed
+	j.dropSuppressed = 0
+	j.lastDropLog = now
+	j.dropMu.Unlock()
+
+	j.logger.Warn("buildkit cgroup not attributed: no pending vertex matched before the join deadline",
+		"container_id", evt.ContainerID,
+		"cgroup_id", cgroupID,
+		"path", evt.CgroupPath,
+		"pending_vertices", len(j.registry.PendingVertices()),
+		"history_disconnected", j.registry.HistoryDisconnected(),
+		"suppressed_since_last", suppressed,
+	)
 }
 
 func (j *CgroupJoiner) handleRemove(evt CgroupRemoveEvent) {
@@ -779,6 +852,24 @@ func argvMatchesRunLoose(argv []string, runCmd string) bool {
 	return tailMatchesCommand(argv, runCmd)
 }
 
+// matchPendingByTail is the weakest tier: it matches only the last
+// simple command of a compound RUN (see lastSimpleCommandMatches). Used
+// only when matchPendingByArgv found nothing, and never trusted on its
+// own: a short common command (`make`, `sleep 3`) is easy to guess, so a
+// process can shape its argv to claim another session's RUN.
+func matchPendingByTail(pending []PendingVertex, argv []string) []PendingVertex {
+	var out []PendingVertex
+
+	for _, v := range pending {
+		cmd := extractRunCommand(v.VertexName)
+		if cmd != "" && lastSimpleCommandMatches(argv, cmd) {
+			out = append(out, v)
+		}
+	}
+
+	return out
+}
+
 func execFormMatches(argv, elems []string) bool {
 	if len(argv) == len(elems) {
 		eq := true
@@ -903,7 +994,7 @@ func tailMatchesCommand(argv []string, runCmd string) bool {
 	}
 
 	off := len(argv) - n
-	if path.Base(argv[off]) != path.Base(tokens[0]) {
+	if strings.ContainsAny(argv[off], " \t\n") || path.Base(argv[off]) != path.Base(tokens[0]) {
 		return false
 	}
 
@@ -914,6 +1005,168 @@ func tailMatchesCommand(argv []string, runCmd string) bool {
 	}
 
 	return true
+}
+
+// lastSimpleCommandMatches matches argv against the final simple command
+// of a compound RUN (`a && (b; c) && d`). The shell exec-replaces itself
+// with that command, so a process sampled after the earlier steps ran
+// shows only its argv. The whole line must be free of anything the
+// shell would expand or re-parse ($, backticks, globs, braces, comments,
+// heredocs); otherwise it is not matched.
+func lastSimpleCommandMatches(argv []string, runCmd string) bool {
+	last, ok := lastSimpleCommand(runCmd)
+	if !ok || len(last) == 0 || len(argv) < len(last) {
+		return false
+	}
+
+	off := len(argv) - len(last)
+	if strings.ContainsAny(argv[off], " \t\n") || path.Base(argv[off]) != path.Base(last[0]) {
+		return false
+	}
+
+	for i := 1; i < len(last); i++ {
+		if argv[off+i] != last[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// lastSimpleCommand returns the words of the last top-level simple
+// command of a shell command line, with quotes removed and unquoted
+// redirections dropped. ok is false when the line is not simple enough to
+// tokenise safely (expansions, comments, heredocs, glued redirections).
+//
+//nolint:gocognit,cyclop,funlen // single-pass shell tokenizer; splitting it hurts readability
+func lastSimpleCommand(line string) ([]string, bool) {
+	type word struct {
+		text   string
+		quoted bool
+	}
+
+	var (
+		words   []word
+		cur     strings.Builder
+		inWord  bool
+		wordQ   bool
+		quote   rune
+		depth   int
+		escaped bool
+	)
+
+	endWord := func() {
+		if inWord {
+			words = append(words, word{cur.String(), wordQ})
+			cur.Reset()
+
+			inWord, wordQ = false, false
+		}
+	}
+
+	reset := func() {
+		words, inWord, wordQ = nil, false, false
+
+		cur.Reset()
+	}
+
+	rs := []rune(line)
+
+	for i, c := range rs {
+		switch {
+		case escaped:
+			cur.WriteRune(c)
+
+			inWord, wordQ = true, true
+			escaped = false
+		case quote == '\'':
+			if c == '\'' {
+				quote = 0
+			} else {
+				cur.WriteRune(c)
+			}
+		case quote == '"':
+			switch c {
+			case '"':
+				quote = 0
+			case '\\':
+				escaped = true
+			case '$', '`':
+				if depth == 0 {
+					return nil, false
+				}
+			default:
+				cur.WriteRune(c)
+			}
+		case c == '\\':
+			escaped = true
+		case c == '\'' || c == '"':
+			quote = c
+			inWord, wordQ = true, true
+		case c == '(':
+			depth++
+
+			reset()
+		case c == ')':
+			if depth == 0 {
+				return nil, false
+			}
+
+			depth--
+
+			reset()
+		case depth > 0:
+			// Inside a subshell: only its closing paren matters.
+		case c == '$' || c == '`' || c == '*' || c == '?' || c == '[' || c == '{' || c == '}' || c == '~' || c == '#':
+			return nil, false
+		case c == '<' && i+1 < len(rs) && rs[i+1] == '<':
+			return nil, false
+		case (c == '>' || c == '<') && inWord && !wordQ && strings.Trim(cur.String(), "0123456789") != "":
+			// `hi>/dev/null`: the redirection is glued to a word.
+			return nil, false
+		case c == '&' && (i > 0 && (rs[i-1] == '>' || rs[i-1] == '<') || i+1 < len(rs) && rs[i+1] == '>'):
+			// Redirection (2>&1, &>f), not a list separator.
+			cur.WriteRune(c)
+
+			inWord = true
+		case c == '&' || c == '|' || c == ';' || c == '\n':
+			endWord()
+
+			words = nil
+		case c == ' ' || c == '\t':
+			endWord()
+		default:
+			cur.WriteRune(c)
+
+			inWord = true
+		}
+	}
+
+	if quote != 0 || escaped || depth != 0 {
+		return nil, false
+	}
+
+	endWord()
+
+	out := make([]string, 0, len(words))
+
+	for i := 0; i < len(words); i++ {
+		w := words[i]
+		t := strings.TrimLeft(w.text, "0123456789")
+
+		if !w.quoted && (strings.HasPrefix(t, ">") || strings.HasPrefix(t, "<")) {
+			// Bare operator: the target is the next word.
+			if strings.Trim(t, "<>") == "" && i+1 < len(words) {
+				i++
+			}
+
+			continue
+		}
+
+		out = append(out, w.text)
+	}
+
+	return out, len(out) > 0
 }
 
 func normalizeWS(s string) string {
@@ -956,6 +1209,8 @@ func extractRunCommand(vertexName string) string {
 // /proc/<pid>/environ; a candidate survives if all its attrs match.
 // When no candidate has FrontendAttrs, all candidates survive
 // (degraded — caller treats the result as still-ambiguous).
+// TODO: forgeable — a RUN controls its own environ and build-arg values
+// are guessable CI metadata; do not treat this as authorization.
 func tiebreakByEnviron(matches []PendingVertex, environ map[string]string) []PendingVertex {
 	if len(environ) == 0 {
 		return matches

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -28,6 +29,15 @@ type fakeDP struct {
 
 	hold      bool
 	holdCalls int
+
+	// DNS: seeds per slot (ip:port -> prio), redirect state.
+	seeds        map[uint32]map[string]uint32
+	redirect     bool
+	redirectIP   net.IP
+	redirectPort uint16
+	redirectCall int
+	redirectLog  []bool
+	noRedirect   bool // DNSRedirectAvailable() == false
 
 	cfg       BKConfig
 	attached  []string
@@ -110,6 +120,56 @@ func (f *fakeDP) RemoveSlot(slot uint32) error {
 	f.removed = append(f.removed, slot)
 
 	return nil
+}
+
+func (f *fakeDP) SeedDNS(slot uint32, ip net.IP, ports []int, prio uint32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if _, ok := f.slots[slot]; !ok {
+		return errors.New("slot not published") //nolint:err113 // test fake
+	}
+
+	if f.seeds == nil {
+		f.seeds = map[uint32]map[string]uint32{}
+	}
+
+	if f.seeds[slot] == nil {
+		f.seeds[slot] = map[string]uint32{}
+	}
+
+	for _, p := range ports {
+		f.seeds[slot][net.JoinHostPort(ip.String(), strconv.Itoa(p))] = prio
+	}
+
+	return nil
+}
+
+func (f *fakeDP) seed(slot uint32, ipport string) (uint32, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	p, ok := f.seeds[slot][ipport]
+
+	return p, ok
+}
+
+func (f *fakeDP) SetDNSRedirect(ip net.IP, port uint16, _ uint64, enabled bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.redirect, f.redirectIP, f.redirectPort = enabled, ip, port
+	f.redirectCall++
+	f.redirectLog = append(f.redirectLog, enabled)
+
+	return nil
+}
+
+func (f *fakeDP) DNSRedirectAvailable() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return !f.noRedirect
 }
 
 func (f *fakeDP) SetCgroupPolicy(id uint64, p BKCgroupPolicy) error {

@@ -271,6 +271,7 @@ func loadWithoutLSM(objs *dnspidObjects) error {
 	objs.DnsPidExec = coll.Programs["dns_pid_exec"]
 	objs.DnsPidExit = coll.Programs["dns_pid_exit"]
 	objs.DnsKnownCgroups = coll.Maps["dns_known_cgroups"]
+	objs.DnsRunParents = coll.Maps["dns_run_parents"]
 	objs.DnsPidAttribution = coll.Maps["dns_pid_attribution"]
 	objs.ProcessInfo = coll.Maps["process_info"]
 
@@ -378,6 +379,24 @@ func (t *DNSPIDTracker) AddCgroup(cgroupPath string) (uint64, error) {
 // RemoveCgroup unregisters a container's cgroup ID.
 func (t *DNSPIDTracker) RemoveCgroup(cgroupID uint64) {
 	_ = t.objs.DnsKnownCgroups.Delete(cgroupID)
+}
+
+// AddRunParent registers a BuildKit parent cgroup: DNS queries from any
+// task below it are tracked and attributed to the RUN cgroup (the
+// parent's child on the task's path), which Lookup then returns as the
+// cgroup id. dns_known_cgroups holds exact ids only, so RUN cgroups that
+// come and go per build step need this subtree form.
+func (t *DNSPIDTracker) AddRunParent(cgroupID uint64) error {
+	if err := t.objs.DnsRunParents.Put(cgroupID, uint8(1)); err != nil {
+		return fmt.Errorf("put dns_run_parents: %w", err)
+	}
+
+	return nil
+}
+
+// RemoveRunParent unregisters a BuildKit parent cgroup (idempotent).
+func (t *DNSPIDTracker) RemoveRunParent(cgroupID uint64) {
+	_ = t.objs.DnsRunParents.Delete(cgroupID)
 }
 
 // Lookup returns the PID, comm, parent comm, and cgroup ID for a DNS

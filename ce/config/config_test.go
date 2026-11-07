@@ -173,3 +173,21 @@ func TestLoadBuildkitEnforcement(t *testing.T) {
 		t.Fatalf("invalid mode accepted: %v", err)
 	}
 }
+
+func TestLoadBuildkitDNSProxy(t *testing.T) {
+	t.Setenv("LEITWACHT_CE_DNS_UPSTREAM", "10.0.0.2:53")
+
+	c, err := Load()
+	if err != nil || c.BuildkitDNSProxy || c.BuildkitDNSProc != "buildkitd" || c.BuildkitDNSListen != "127.0.0.153:15354" {
+		t.Fatalf("defaults = %v %q %q, err %v; want off, buildkitd, 127.0.0.153:15354",
+			c.BuildkitDNSProxy, c.BuildkitDNSProc, c.BuildkitDNSListen, err)
+	}
+
+	t.Setenv("LEITWACHT_CE_BUILDKIT_DNS_PROXY", "true")
+	t.Setenv("LEITWACHT_CE_BUILDKIT_DNS_PROC", "bk")
+	t.Setenv("LEITWACHT_CE_BUILDKIT_DNS_LISTEN", "127.0.0.9:5300")
+
+	if c, err = Load(); err != nil || !c.BuildkitDNSProxy || c.BuildkitDNSProc != "bk" || c.BuildkitDNSListen != "127.0.0.9:5300" {
+		t.Fatalf("set = %v %q %q, err %v", c.BuildkitDNSProxy, c.BuildkitDNSProc, c.BuildkitDNSListen, err)
+	}
+}

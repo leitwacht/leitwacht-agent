@@ -50,6 +50,10 @@ type BuildKitEgressAttach struct {
 
 	unhook func()
 
+	// dnsSvc is the build DNS proxy (nil when not enabled or not
+	// startable).
+	dnsSvc *buildDNS
+
 	cancel   context.CancelFunc
 	stopRing func()
 
@@ -95,6 +99,7 @@ type buildKitAttachConfig struct {
 	holdWindow time.Duration
 
 	policySrc  BuildPolicySource
+	dnsProxy   *BuildDNSConfig
 	registry   *SessionRegistry
 	trusted    []net.IPNet
 	runLevel   int // >0 fixes the RUN-cgroup level (tests only)
@@ -350,6 +355,10 @@ func (b *BuildKitEgressAttach) runFlusher(
 	flush := func(bucketTS time.Time, final bool) {
 		violations, dns, overflow := b.collect(final, interval)
 
+		if b.dnsSvc != nil {
+			dns = append(dns, b.dnsSvc.DrainDNS()...)
+		}
+
 		if len(violations) == 0 && len(dns) == 0 {
 			return
 		}
@@ -359,6 +368,10 @@ func (b *BuildKitEgressAttach) runFlusher(
 
 		if b.binder != nil {
 			b.binder.Annotate(violations)
+		}
+
+		if b.dnsSvc != nil {
+			b.dnsSvc.StampDomains(violations)
 		}
 
 		if b.dp != nil {
@@ -419,6 +432,10 @@ func (b *BuildKitEgressAttach) Close() error {
 		b.stopRing()
 		b.cancel()
 		<-b.flusherDone
+
+		if b.dnsSvc != nil {
+			b.dnsSvc.Close()
+		}
 
 		if b.unhook != nil {
 			b.unhook()
@@ -859,11 +876,29 @@ func startBuildKitSlotAttach(
 		b.binder.RefreshHold()
 
 		go b.binder.Run(ctx)
+
+		if cfg.dnsProxy != nil {
+			svc, dnsErr := startBuildDNS(ctx, *cfg.dnsProxy, log, platform, dp, b.binder, recorder,
+				parentIDs, paths, cfg.dns)
+			if dnsErr != nil {
+				// A misconfigured proxy must not take the attach (and
+				// with it all build egress observation) down.
+				log.Error("buildkit dns proxy not started; domain rules are not enforced for build steps", "error", dnsErr)
+			}
+
+			b.dnsSvc = svc
+		}
+	} else if cfg.dnsProxy != nil {
+		log.Warn("buildkit dns proxy not started: no session registry; domain rules are not enforced for build steps")
 	}
 
 	stopRing, err := dp.StartRingbufReader(ctx, func(_ uint64) *ViolationRecorder { return recorder })
 	if err != nil {
 		cancel()
+
+		if b.dnsSvc != nil {
+			b.dnsSvc.Close()
+		}
 
 		if b.unhook != nil {
 			b.unhook()

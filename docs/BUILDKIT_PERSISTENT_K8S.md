@@ -179,6 +179,123 @@ you wrap your pipelines, then flip to `true` once the
 `leitwacht_buildkit_session_attribution_total{result="no_session_meta"}`
 metric stays flat.
 
+### 5. (Optional) Domain rules for RUN steps: the build DNS proxy
+
+IP/CIDR rules reach RUN steps through the egress filter. Domain (fqdn)
+rules need name resolution to pass through the agent, which is what the
+build DNS proxy does. It is off by default
+(`buildkit.dnsProxy.enabled`, `LEITWACHT_CE_BUILDKIT_DNS_PROXY=true`);
+without it, shadow/enforce policies with domain allow rules log an Error
+once per policy version and rows carry `fqdn_rules_inactive`.
+
+> **Read before enabling enforce.** With the proxy on, every name a RUN
+> step resolves is judged by fqdn rules. Names that were only reachable
+> through IP/CIDR rules or trusted networks (registry mirrors, `*.svc`
+> names) are **sinkholed in enforce mode** unless an fqdn allow rule names
+> them. Run in shadow first and add fqdn allows for every
+> `dns_would_block` name.
+
+How it works, and what you do **not** have to change:
+
+- RUN steps of a default-network buildkitd share the buildkitd pod's
+  network namespace and resolve through the cluster DNS. BuildKit removes
+  loopback nameservers from RUN steps' `resolv.conf`, so overriding the
+  resolver cannot reach them. The agent therefore leaves `resolv.conf` and
+  `buildkitd.toml` alone and redirects instead: cgroup `sock_addr`
+  programs (`connect4`, `sendmsg4`, `recvmsg4`) attached at the
+  `cgroupPaths` rewrite UDP/TCP port-53 destinations of RUN cgroups to a
+  proxy the agent binds inside the buildkitd netns
+  (`127.0.0.153:15354` by default), and rewrite the source of UDP replies
+  back to the address the step asked, so every resolver accepts them.
+- The agent finds that netns from a live process inside a RUN cgroup
+  under `cgroupPaths` (they share buildkitd's netns in host mode; the
+  agent needs `hostPID`, which the chart sets). A process name is never
+  trusted alone, since CI jobs control theirs; set
+  `buildkit.dnsProxy.procCgroup` (a substring of buildkitd's cgroup path)
+  to let the proxy bind before the first RUN step (a full pod UID or an
+  absolute cgroup path; it breaks when the pod is recreated unless
+  updated, so prefer leaving it unset). The redirect turns on only after
+  a RUN process was seen in the proxy's netns and then **stays on between
+  steps** (the proxy's sockets keep the netns alive); a RUN process that
+  proves a different netns alone is treated as a buildkitd restart and
+  the proxy rebinds. RUN processes in several netns at once, or a netns
+  that changes every step, latch the redirect off for 10 minutes. The
+  redirect programs also check the socket's netns in the kernel, so
+  sockets in other netns are never rewritten. Until a trusted netns is
+  known (the first build after an agent or buildkitd start) domain rules
+  are not enforced. The agent watches the proxy's serving goroutines: if
+  one dies the redirect is cleared first (DNS fails open to the upstream)
+  and the proxy is rebound. When buildkitd
+  restarts into a new pod netns the proxy is rebound. While it is not
+  bound the redirect is off, DNS goes straight to `dnsUpstream` (the
+  port-53 pin allows it), build rows of policies with domain rules are
+  flagged `fqdn_rules_inactive`, and the agent logs why. Builds never
+  break because the proxy is down.
+- Each query is attributed to its RUN cgroup (the DNS PID tracker records
+  every task below a BuildKit parent against its RUN cgroup) and answered
+  by that step's policy: **enforce**: allowed names are resolved and their
+  addresses added to the step's allow set (ports from the rule, 443/80
+  when it has none); denied names get the rule's resolution (sinkhole or
+  NXDOMAIN) and names no rule matches get the sinkhole; **shadow**: every
+  name is answered normally and would-be denials are recorded as
+  `dns_would_block`; **audit**, unattributed or ambiguous steps and
+  queries from outside any RUN cgroup: answered normally, recorded as
+  `dns_observed`.
+- While an enforce policy is in play, the first name a still-unbound RUN
+  step asks is held until the step is bound or the join deadline
+  (2 s) passes, then answered per policy (or normally when it was never
+  bound). On a policy update, names a step already resolved are carried
+  into the new policy when they still match an allow rule, so builds do
+  not stall on a re-resolve.
+- Rows whose address the same RUN step resolved through the proxy carry
+  that `domain` (`domain_source = build_dns_proxy`); DNS activity of bound
+  steps carries `build_project_path`, `build_job_name` and `policy_key`.
+- While the proxy is on, port 53 from RUN steps to anything but the proxy
+  is dropped (enforce) or recorded `would_block` (shadow): other
+  resolvers, v4-mapped addresses on IPv6 sockets and raw sockets cannot
+  bypass it. The flag is cleared before the redirect is detached.
+- One RUN step cannot starve the others: per step, at most 8 held and 32
+  in-flight queries and about 200 queries/s; over the limit that step gets
+  REFUSED. A step whose hold timed out and which binds later has the names
+  it already resolved re-seeded against its policy.
+- Seeded addresses have no TTL: they stay until evicted (LRU), as for job
+  pods.
+- Rows' `fqdn_rules_inactive` reflects whether the proxy was up when the
+  row was recorded, not when it was flushed.
+- `dnsUpstream` must be the resolver the RUN steps use; the proxy
+  forwards to it.
+
+Load note: every RUN-step name lookup that is not served from the proxy's
+cache becomes a query from the agent to `dnsUpstream` (the cluster DNS), so
+expect the cluster DNS to see the builds' full lookup rate; size its
+replicas accordingly. The proxy bounds the damage a single tenant can do:
+per step 32 in-flight queries and about 1000 queries/s, per project 64
+in-flight, out of the proxy's shared 256. At least four projects acting
+together are needed to exhaust the shared budget.
+
+Liveness: every 5 s the agent queries the proxy through a socket inside its
+own netns; if it does not answer, the redirect is cleared first (DNS fails
+open to the upstream), an Error is logged and the proxy is rebound at the
+next RUN step. A RUN step that moves into another netns (`unshare -n`) does
+not cause a rebind while processes remain in the bound netns; only a
+netns with no process left (a buildkitd restart) is replaced.
+
+Kernel note: the port-53 bypass pin uses `bpf_get_netns_cookie` in
+cgroup_skb programs. On kernels without it the agent loads an object
+variant that never references the helper and logs a Warn; the bypass pin
+is then only the upstream-only port-53 pin (this variant has not yet been
+verified on an older kernel), so a v4-mapped or raw-socket
+query to the configured upstream is not caught. Security note: a RUN step
+granted `security.insecure` can `unshare -n`/escape cgroups and is outside
+this enforcement (the agent cannot see it).
+
+Limits: the RUN steps must share buildkitd's netns (BuildKit's default
+host network mode). With a CNI/bridge-mode buildkitd each RUN step has its
+own netns; the agent detects a RUN step outside the proxy's netns, turns
+the redirect off and logs an Error, and domain rules stay inactive (IP
+rules still apply). Daemon-side egress (`ADD <url>`, git contexts, cache
+import/export, image pulls) is not RUN-cgroup egress and is not covered.
+
 ## Operations
 
 ### Verifying attribution end-to-end

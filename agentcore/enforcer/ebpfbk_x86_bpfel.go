@@ -43,6 +43,22 @@ type ebpfBKBkCgVal struct {
 	Gen   uint32
 }
 
+type ebpfBKBkDnsOrigVal struct {
+	_    structs.HostLayout
+	Ip   uint32
+	Port uint16
+	Pad  uint16
+}
+
+type ebpfBKBkDnsredirCfgVal struct {
+	_           structs.HostLayout
+	Enabled     uint32
+	Ip          uint32
+	NetnsCookie uint64
+	Port        uint16
+	Pad         [3]uint16
+}
+
 type ebpfBKDedupKey struct {
 	_        structs.HostLayout
 	Ip       uint32
@@ -85,24 +101,30 @@ type ebpfBKSockOwner struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	ebpfBKMapBkAllowDedup      = "bk_allow_dedup"
-	ebpfBKMapBkCfg             = "bk_cfg"
-	ebpfBKMapBkCgroupPolicy    = "bk_cgroup_policy"
-	ebpfBKMapBkDenySets        = "bk_deny_sets"
-	ebpfBKMapBkDnsSets         = "bk_dns_sets"
-	ebpfBKMapBkHostSets        = "bk_host_sets"
-	ebpfBKMapBkPendingSince    = "bk_pending_since"
-	ebpfBKMapDropDedup         = "drop_dedup"
-	ebpfBKMapDropEvents        = "drop_events"
-	ebpfBKMapReserveFailures   = "reserve_failures"
-	ebpfBKMapSockOwners        = "sock_owners"
-	ebpfBKMapStats             = "stats"
-	ebpfBKMapTrustedNets       = "trusted_nets"
-	ebpfBKProgEgressFilter     = "egress_filter"
-	ebpfBKVarBkAllowKeyBtfHint = "__bk_allow_key_btf_hint"
-	ebpfBKVarBkCgValBtfHint    = "__bk_cg_val_btf_hint"
-	ebpfBKVarDropEventBtfHint  = "__drop_event_btf_hint"
-	ebpfBKVarSockOwnerBtfHint  = "__sock_owner_btf_hint"
+	ebpfBKMapBkAllowDedup         = "bk_allow_dedup"
+	ebpfBKMapBkCfg                = "bk_cfg"
+	ebpfBKMapBkCgroupPolicy       = "bk_cgroup_policy"
+	ebpfBKMapBkDenySets           = "bk_deny_sets"
+	ebpfBKMapBkDnsOrig            = "bk_dns_orig"
+	ebpfBKMapBkDnsSets            = "bk_dns_sets"
+	ebpfBKMapBkDnsredirCfg        = "bk_dnsredir_cfg"
+	ebpfBKMapBkHostSets           = "bk_host_sets"
+	ebpfBKMapBkPendingSince       = "bk_pending_since"
+	ebpfBKMapDropDedup            = "drop_dedup"
+	ebpfBKMapDropEvents           = "drop_events"
+	ebpfBKMapReserveFailures      = "reserve_failures"
+	ebpfBKMapSockOwners           = "sock_owners"
+	ebpfBKMapStats                = "stats"
+	ebpfBKMapTrustedNets          = "trusted_nets"
+	ebpfBKProgBkDnsConnect4       = "bk_dns_connect4"
+	ebpfBKProgBkDnsRecvmsg4       = "bk_dns_recvmsg4"
+	ebpfBKProgBkDnsSendmsg4       = "bk_dns_sendmsg4"
+	ebpfBKProgEgressFilter        = "egress_filter"
+	ebpfBKVarBkAllowKeyBtfHint    = "__bk_allow_key_btf_hint"
+	ebpfBKVarBkCgValBtfHint       = "__bk_cg_val_btf_hint"
+	ebpfBKVarBkDnsredirCfgBtfHint = "__bk_dnsredir_cfg_btf_hint"
+	ebpfBKVarDropEventBtfHint     = "__drop_event_btf_hint"
+	ebpfBKVarSockOwnerBtfHint     = "__sock_owner_btf_hint"
 )
 
 // loadEbpfBK returns the embedded CollectionSpec for ebpfBK.
@@ -147,7 +169,10 @@ type ebpfBKSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type ebpfBKProgramSpecs struct {
-	EgressFilter *ebpf.ProgramSpec `ebpf:"egress_filter"`
+	BkDnsConnect4 *ebpf.ProgramSpec `ebpf:"bk_dns_connect4"`
+	BkDnsRecvmsg4 *ebpf.ProgramSpec `ebpf:"bk_dns_recvmsg4"`
+	BkDnsSendmsg4 *ebpf.ProgramSpec `ebpf:"bk_dns_sendmsg4"`
+	EgressFilter  *ebpf.ProgramSpec `ebpf:"egress_filter"`
 }
 
 // ebpfBKMapSpecs contains maps before they are loaded into the kernel.
@@ -158,7 +183,9 @@ type ebpfBKMapSpecs struct {
 	BkCfg           *ebpf.MapSpec `ebpf:"bk_cfg"`
 	BkCgroupPolicy  *ebpf.MapSpec `ebpf:"bk_cgroup_policy"`
 	BkDenySets      *ebpf.MapSpec `ebpf:"bk_deny_sets"`
+	BkDnsOrig       *ebpf.MapSpec `ebpf:"bk_dns_orig"`
 	BkDnsSets       *ebpf.MapSpec `ebpf:"bk_dns_sets"`
+	BkDnsredirCfg   *ebpf.MapSpec `ebpf:"bk_dnsredir_cfg"`
 	BkHostSets      *ebpf.MapSpec `ebpf:"bk_host_sets"`
 	BkPendingSince  *ebpf.MapSpec `ebpf:"bk_pending_since"`
 	DropDedup       *ebpf.MapSpec `ebpf:"drop_dedup"`
@@ -173,10 +200,11 @@ type ebpfBKMapSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type ebpfBKVariableSpecs struct {
-	BkAllowKeyBtfHint *ebpf.VariableSpec `ebpf:"__bk_allow_key_btf_hint"`
-	BkCgValBtfHint    *ebpf.VariableSpec `ebpf:"__bk_cg_val_btf_hint"`
-	DropEventBtfHint  *ebpf.VariableSpec `ebpf:"__drop_event_btf_hint"`
-	SockOwnerBtfHint  *ebpf.VariableSpec `ebpf:"__sock_owner_btf_hint"`
+	BkAllowKeyBtfHint    *ebpf.VariableSpec `ebpf:"__bk_allow_key_btf_hint"`
+	BkCgValBtfHint       *ebpf.VariableSpec `ebpf:"__bk_cg_val_btf_hint"`
+	BkDnsredirCfgBtfHint *ebpf.VariableSpec `ebpf:"__bk_dnsredir_cfg_btf_hint"`
+	DropEventBtfHint     *ebpf.VariableSpec `ebpf:"__drop_event_btf_hint"`
+	SockOwnerBtfHint     *ebpf.VariableSpec `ebpf:"__sock_owner_btf_hint"`
 }
 
 // ebpfBKObjects contains all objects after they have been loaded into the kernel.
@@ -203,7 +231,9 @@ type ebpfBKMaps struct {
 	BkCfg           *ebpf.Map `ebpf:"bk_cfg"`
 	BkCgroupPolicy  *ebpf.Map `ebpf:"bk_cgroup_policy"`
 	BkDenySets      *ebpf.Map `ebpf:"bk_deny_sets"`
+	BkDnsOrig       *ebpf.Map `ebpf:"bk_dns_orig"`
 	BkDnsSets       *ebpf.Map `ebpf:"bk_dns_sets"`
+	BkDnsredirCfg   *ebpf.Map `ebpf:"bk_dnsredir_cfg"`
 	BkHostSets      *ebpf.Map `ebpf:"bk_host_sets"`
 	BkPendingSince  *ebpf.Map `ebpf:"bk_pending_since"`
 	DropDedup       *ebpf.Map `ebpf:"drop_dedup"`
@@ -220,7 +250,9 @@ func (m *ebpfBKMaps) Close() error {
 		m.BkCfg,
 		m.BkCgroupPolicy,
 		m.BkDenySets,
+		m.BkDnsOrig,
 		m.BkDnsSets,
+		m.BkDnsredirCfg,
 		m.BkHostSets,
 		m.BkPendingSince,
 		m.DropDedup,
@@ -236,21 +268,28 @@ func (m *ebpfBKMaps) Close() error {
 //
 // It can be passed to loadEbpfBKObjects or ebpf.CollectionSpec.LoadAndAssign.
 type ebpfBKVariables struct {
-	BkAllowKeyBtfHint *ebpf.Variable `ebpf:"__bk_allow_key_btf_hint"`
-	BkCgValBtfHint    *ebpf.Variable `ebpf:"__bk_cg_val_btf_hint"`
-	DropEventBtfHint  *ebpf.Variable `ebpf:"__drop_event_btf_hint"`
-	SockOwnerBtfHint  *ebpf.Variable `ebpf:"__sock_owner_btf_hint"`
+	BkAllowKeyBtfHint    *ebpf.Variable `ebpf:"__bk_allow_key_btf_hint"`
+	BkCgValBtfHint       *ebpf.Variable `ebpf:"__bk_cg_val_btf_hint"`
+	BkDnsredirCfgBtfHint *ebpf.Variable `ebpf:"__bk_dnsredir_cfg_btf_hint"`
+	DropEventBtfHint     *ebpf.Variable `ebpf:"__drop_event_btf_hint"`
+	SockOwnerBtfHint     *ebpf.Variable `ebpf:"__sock_owner_btf_hint"`
 }
 
 // ebpfBKPrograms contains all programs after they have been loaded into the kernel.
 //
 // It can be passed to loadEbpfBKObjects or ebpf.CollectionSpec.LoadAndAssign.
 type ebpfBKPrograms struct {
-	EgressFilter *ebpf.Program `ebpf:"egress_filter"`
+	BkDnsConnect4 *ebpf.Program `ebpf:"bk_dns_connect4"`
+	BkDnsRecvmsg4 *ebpf.Program `ebpf:"bk_dns_recvmsg4"`
+	BkDnsSendmsg4 *ebpf.Program `ebpf:"bk_dns_sendmsg4"`
+	EgressFilter  *ebpf.Program `ebpf:"egress_filter"`
 }
 
 func (p *ebpfBKPrograms) Close() error {
 	return _EbpfBKClose(
+		p.BkDnsConnect4,
+		p.BkDnsRecvmsg4,
+		p.BkDnsSendmsg4,
 		p.EgressFilter,
 	)
 }

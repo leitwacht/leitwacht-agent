@@ -58,13 +58,17 @@ type BuildIPRule struct {
 	Prio  uint32
 }
 
-// BuildFQDNRule is a name rule, carried for the (later) build DNS proxy.
-// Unused by the datapath until build DNS lands.
+// BuildFQDNRule is a name rule, enforced by the build DNS proxy: an
+// allow match seeds the slot's DNS-derived allow map (Ports, Prio); a
+// deny match answers per Resolution in enforce mode.
 type BuildFQDNRule struct {
 	Pattern string
 	Ports   []int
 	Allow   bool
 	Prio    uint32
+	// Resolution is the deny answer: policy.DenyResolutionSinkhole (the
+	// default, also for "") or policy.DenyResolutionNXDomain.
+	Resolution string
 }
 
 // BuildPolicy is the rendered egress policy a build step runs under.
@@ -150,6 +154,8 @@ func RenderBuildPolicy(pol *policy.ResolvedPolicy, jobName string, mode BuildPol
 			Ports:   r.Ports,
 			Allow:   r.Action != policy.ActionDeny,
 			Prio:    policy.RulePriority(i),
+
+			Resolution: r.Resolution,
 		})
 	}
 

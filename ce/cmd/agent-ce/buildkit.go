@@ -157,6 +157,19 @@ func startBuildKitAttribution(
 				enforcer.WithBuildKitDNSUpstreams(splitTrim(cfg.DNSUpstream, ",")),
 			}
 
+			if cfg.BuildkitDNSProxy {
+				opts = append(opts, enforcer.WithBuildKitDNSProxy(enforcer.BuildDNSConfig{
+					Tracker:              mgr.DNSPIDTracker(),
+					ProcName:             cfg.BuildkitDNSProc,
+					ProcCgroupContains:   cfg.BuildkitDNSProcCgroup,
+					ListenAddr:           cfg.BuildkitDNSListen,
+					Upstreams:            splitTrim(cfg.DNSUpstream, ","),
+					ClusterDomain:        cfg.ClusterDomain,
+					ExpansionSuppression: cfg.DNSExpansionSuppression,
+					CacheSize:            mgr.DNSCacheSize,
+				}))
+			}
+
 			// Shadow/enforce need the operator's trusted networks (cluster
 			// DNS, registry mirrors) or every build connection to them
 			// would be judged by rules. In audit they stay unlisted so

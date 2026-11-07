@@ -44,6 +44,7 @@ type dnspidProcessInfo struct {
 const (
 	dnspidMapDnsKnownCgroups   = "dns_known_cgroups"
 	dnspidMapDnsPidAttribution = "dns_pid_attribution"
+	dnspidMapDnsRunParents     = "dns_run_parents"
 	dnspidMapProcessInfo       = "process_info"
 	dnspidProgDnsPidBprm       = "dns_pid_bprm"
 	dnspidProgDnsPidExec       = "dns_pid_exec"
@@ -107,6 +108,7 @@ type dnspidProgramSpecs struct {
 type dnspidMapSpecs struct {
 	DnsKnownCgroups   *ebpf.MapSpec `ebpf:"dns_known_cgroups"`
 	DnsPidAttribution *ebpf.MapSpec `ebpf:"dns_pid_attribution"`
+	DnsRunParents     *ebpf.MapSpec `ebpf:"dns_run_parents"`
 	ProcessInfo       *ebpf.MapSpec `ebpf:"process_info"`
 }
 
@@ -138,6 +140,7 @@ func (o *dnspidObjects) Close() error {
 type dnspidMaps struct {
 	DnsKnownCgroups   *ebpf.Map `ebpf:"dns_known_cgroups"`
 	DnsPidAttribution *ebpf.Map `ebpf:"dns_pid_attribution"`
+	DnsRunParents     *ebpf.Map `ebpf:"dns_run_parents"`
 	ProcessInfo       *ebpf.Map `ebpf:"process_info"`
 }
 
@@ -145,6 +148,7 @@ func (m *dnspidMaps) Close() error {
 	return _DnspidClose(
 		m.DnsKnownCgroups,
 		m.DnsPidAttribution,
+		m.DnsRunParents,
 		m.ProcessInfo,
 	)
 }

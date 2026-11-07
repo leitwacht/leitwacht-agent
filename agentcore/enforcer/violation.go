@@ -11,6 +11,11 @@ import (
 // here so the enforcer has no store-layer dependency.
 const DomainSourceAgentDNS = "agent_dns"
 
+// DomainSourceBuildDNSProxy tags violations of BuildKit RUN steps whose
+// Domain came from the build DNS proxy: the IP was resolved by that very
+// RUN cgroup through the proxy.
+const DomainSourceBuildDNSProxy = "build_dns_proxy"
+
 // Violation represents a single egress event.
 type Violation struct {
 	Domain     string `json:"domain"`
@@ -114,7 +119,7 @@ type DNSActivityEntry struct {
 	// ResolvedIPsDropped counts resolved-IP sightings not recorded in
 	// ResolvedIPs because the per-entry cap was reached.
 	ResolvedIPsDropped int64  `json:"resolved_ips_dropped,omitempty"` //nolint:tagliatelle // IPs is a well-known abbreviation
-	Action             string `json:"action"`                         // dns_allowed, dns_blocked, dns_observed, dns_denied
+	Action             string `json:"action"`                         // dns_allowed, dns_blocked, dns_observed, dns_denied, dns_would_block
 	PID                uint32 `json:"pid,omitempty"`
 	Comm               string `json:"comm,omitempty"`
 	ParentComm         string `json:"parent_comm,omitempty"`
@@ -125,6 +130,14 @@ type DNSActivityEntry struct {
 	EnvNames  []string  `json:"env_names,omitempty"`
 	FirstSeen time.Time `json:"first_seen"`
 	LastSeen  time.Time `json:"last_seen"`
+
+	// Build-step attribution, set only on DNS activity of BuildKit RUN
+	// steps bound to a policy by the build DNS proxy (the report carries
+	// the buildkitd identity, so the project has to ride on the entry).
+	// PolicyKey is project@version/job.
+	BuildProjectPath string `json:"build_project_path,omitempty"`
+	BuildJobName     string `json:"build_job_name,omitempty"`
+	PolicyKey        string `json:"policy_key,omitempty"`
 }
 
 // EgressStats is the complete stats collected during container enforcement.
@@ -151,7 +164,7 @@ const (
 // isEnforcementDNSAction reports whether a DNS action is a block/deny event
 // (as opposed to allowed/observed), which gets reserved capacity.
 func isEnforcementDNSAction(action string) bool {
-	return action == "dns_blocked" || action == "dns_denied"
+	return action == "dns_blocked" || action == "dns_denied" || action == "dns_would_block"
 }
 
 // ViolationRecorder collects violations and DNS activity for a single container.

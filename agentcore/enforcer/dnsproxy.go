@@ -151,6 +151,20 @@ type DNSProxyConfig struct {
 	// path are cached; see dnsCache. Applied by NewDNSProxy.
 	CacheSize int
 
+	// Shadow turns the block-mode outcomes (a matching deny rule, or no
+	// matching rule under a block policy) into observations: the query is
+	// forwarded and answered normally and recorded as "dns_would_block".
+	// Allow rules behave as in block mode. Used by the build DNS proxy for
+	// shadow-mode RUN steps.
+	Shadow bool
+
+	// QueryHandler, when set, replaces the per-query policy evaluation of
+	// DNSProxy: the proxy still attributes the query (LookupDNSPID) and
+	// then calls it with the result. The build DNS proxy uses it to pick
+	// the policy per RUN cgroup. Nil means HandleDNSQuery under the
+	// proxy's own policy.
+	QueryHandler func(msg *dns.Msg, q DNSQueryContext) *dns.Msg
+
 	// cache is nil when disabled. Policy decision, event recording and
 	// allow-map seeding still run on every query; the cache replaces only
 	// the upstream round trip.
@@ -161,6 +175,18 @@ type DNSProxyConfig struct {
 	// and how many lines were swallowed since).
 	upstreamFailLast       atomic.Int64
 	upstreamFailSuppressed atomic.Int64
+}
+
+// DNSQueryContext is the attribution of one query handed to a
+// DNSProxyConfig.QueryHandler.
+type DNSQueryContext struct {
+	PID        uint32
+	Comm       string
+	ParentComm string
+	BinaryPath string
+	// CgroupID is the cgroup the DNS PID tracker attributed the query to
+	// (0 when unattributed). For the build DNS proxy it is the RUN cgroup.
+	CgroupID uint64
 }
 
 // HandleDNSQuery processes a single DNS query under ordered-rule policy.
@@ -266,6 +292,12 @@ func HandleDNSQuery(
 				return forwardAndObserve(msg, cfg, qname, qtype, recorder, pid, comm, parentComm, binaryPath, pre)
 			}
 
+			if cfg.Shadow {
+				cfg.Logger.Debug("dns would deny (shadow)", "domain", qname, "pattern", match.Pattern, "resolution", match.Resolution)
+
+				return forwardAndRecord(msg, cfg, qname, qtype, recorder, pid, comm, parentComm, binaryPath, pre, "dns_would_block")
+			}
+
 			return handleDenyRule(msg, cfg, qname, qtype, match, recorder, pid, comm, parentComm, binaryPath, cgroupID)
 		}
 
@@ -273,6 +305,12 @@ func HandleDNSQuery(
 	}
 
 	isAudit := pol.Action == policy.ActionAudit
+
+	if !isAudit && cfg.Shadow && !outside {
+		cfg.Logger.Debug("dns would block (shadow)", "domain", qname)
+
+		return forwardAndRecord(msg, cfg, qname, qtype, recorder, pid, comm, parentComm, binaryPath, pre, "dns_would_block")
+	}
 
 	if !isAudit {
 		// An expansion outside the cluster domain gets a local NXDOMAIN (no
@@ -410,6 +448,16 @@ func forwardAndObserve(
 	recorder *ViolationRecorder, pid uint32, comm, parentComm, binaryPath string,
 	pre *preForward,
 ) *dns.Msg {
+	return forwardAndRecord(msg, cfg, qname, qtype, recorder, pid, comm, parentComm, binaryPath, pre, "dns_observed")
+}
+
+// forwardAndRecord is forwardAndObserve with the recorded action chosen
+// by the caller ("dns_observed", or "dns_would_block" in shadow mode).
+func forwardAndRecord(
+	msg *dns.Msg, cfg *DNSProxyConfig, qname string, qtype uint16,
+	recorder *ViolationRecorder, pid uint32, comm, parentComm, binaryPath string,
+	pre *preForward, action string,
+) *dns.Msg {
 	var (
 		resp *dns.Msg
 		ips  []string
@@ -428,10 +476,10 @@ func forwardAndObserve(
 	}
 
 	if recorder != nil {
-		recorder.RecordDNS(qname, dns.TypeToString[qtype], "dns_observed", ips, pid, comm, parentComm, binaryPath)
+		recorder.RecordDNS(qname, dns.TypeToString[qtype], action, ips, pid, comm, parentComm, binaryPath)
 	}
 
-	cfg.Logger.Debug("dns observed (audit)", "domain", qname, "type", dns.TypeToString[qtype])
+	cfg.Logger.Debug("dns forwarded unfiltered", "domain", qname, "type", dns.TypeToString[qtype], "action", action)
 
 	return resp
 }
@@ -583,21 +631,7 @@ func seedAllowMap(cfg *DNSProxyConfig, ips []string, rulePorts []int, prio uint3
 		return
 	}
 
-	ports := make([]int, 0, len(rulePorts))
-	for _, p := range rulePorts {
-		if p < 0 || p > 65535 { // PackAllowKey truncates to uint16
-			cfg.Logger.Warn("skip allow-map port: out of range", "port", p)
-
-			continue
-		}
-
-		ports = append(ports, p)
-	}
-
-	if len(rulePorts) == 0 {
-		ports = []int{443, 80}
-	}
-
+	ports := allowSeedPorts(rulePorts, cfg.Logger)
 	if len(ports) == 0 {
 		return
 	}
@@ -613,6 +647,28 @@ func seedAllowMap(cfg *DNSProxyConfig, ips []string, rulePorts []int, prio uint3
 			cfg.Logger.Error("add to allow map", "ip", ipStr, "error", addErr)
 		}
 	}
+}
+
+// allowSeedPorts is the port set a resolution seeds for a rule: its
+// ports (out-of-range ones skipped), or 443 and 80 when it has none.
+func allowSeedPorts(rulePorts []int, log *slog.Logger) []int {
+	ports := make([]int, 0, len(rulePorts))
+
+	for _, p := range rulePorts {
+		if p < 0 || p > 65535 { // PackAllowKey truncates to uint16
+			log.Warn("skip allow-map port: out of range", "port", p)
+
+			continue
+		}
+
+		ports = append(ports, p)
+	}
+
+	if len(rulePorts) == 0 {
+		ports = []int{443, 80}
+	}
+
+	return ports
 }
 
 func forwardQuery(msg *dns.Msg, cfg *DNSProxyConfig) (*dns.Msg, error) {
@@ -921,6 +977,16 @@ type DNSProxy struct {
 	// so a zero userspace cookie simply misses every lookup, which
 	// degrades to no-attribution rather than wrong attribution.
 	netnsCookie uint64
+
+	// serveExited is set when either serving goroutine returned (the
+	// listener died); see Alive.
+	serveExited atomic.Bool
+}
+
+// Alive reports whether both serving goroutines are still running. It is
+// false before Start and after the sockets died or Stop was called.
+func (p *DNSProxy) Alive() bool {
+	return p.udpServer != nil && !p.serveExited.Load()
 }
 
 // NewDNSProxy creates a proxy with the given config.
@@ -1003,6 +1069,17 @@ func (p *DNSProxy) Start(udpConn net.PacketConn, tcpListener net.Listener) {
 			recorder = p.cfg.LookupRecorder(cgroupID)
 		}
 
+		if p.cfg.QueryHandler != nil {
+			resp := p.cfg.QueryHandler(r, DNSQueryContext{
+				PID: pid, Comm: comm, ParentComm: parentComm, BinaryPath: binaryPath, CgroupID: cgroupID,
+			})
+			if resp != nil {
+				_ = w.WriteMsg(resp)
+			}
+
+			return
+		}
+
 		pol := p.policy.Load()
 
 		resp := HandleDNSQuery(r, p.cfg, pol, recorder, pid, comm, parentComm, binaryPath, cgroupID)
@@ -1027,12 +1104,14 @@ func (p *DNSProxy) Start(udpConn net.PacketConn, tcpListener net.Listener) {
 
 	go func() {
 		defer p.wg.Done()
+		defer p.serveExited.Store(true)
 
 		_ = p.udpServer.ActivateAndServe()
 	}()
 
 	go func() {
 		defer p.wg.Done()
+		defer p.serveExited.Store(true)
 
 		_ = p.tcpServer.ActivateAndServe()
 	}()

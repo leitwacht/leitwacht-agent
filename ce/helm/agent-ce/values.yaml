@@ -212,10 +212,11 @@ buildkit:
   # scopes whose effective action is block. A RUN step that cannot be
   # tied to exactly one project is always audit.
   #
-  # Limits of shadow/enforce until the build DNS proxy exists:
-  #  - only IP/CIDR rules are enforced. Domain (fqdn) allow rules are NOT:
-  #    the agent logs an Error once per policy version and flags rows
-  #    fqdn_rules_inactive. Allow build destinations by address.
+  # Limits of shadow/enforce:
+  #  - domain (fqdn) rules are enforced only with dnsProxy.enabled (below);
+  #    without it only IP/CIDR rules are, the agent logs an Error once per
+  #    policy version and flags rows fqdn_rules_inactive. Allow build
+  #    destinations by address or enable the proxy.
   #  - port 53 from a RUN step is allowed only to the agent's DNS upstream
   #    (dnsUpstream); any other resolver is dropped (enforce) or recorded
   #    as would_block (shadow), regardless of rules or trusted networks
@@ -227,6 +228,48 @@ buildkit:
   #    cgroup level is found in the kernel from cgroupPaths; a layout that
   #    does not match runs in audit with run_level_mismatch on the rows.
   enforcement: audit
+
+  # Build DNS proxy: enforces domain (fqdn) rules for RUN steps.
+  #
+  # WARNING: with the proxy on, names that were only reachable through IP
+  # or trusted-network rules (registry mirrors, *.svc names, ...) are
+  # sinkholed in enforce mode unless an fqdn allow rule names them. Add
+  # fqdn allows for every name the builds resolve before enabling enforce
+  # (shadow records dns_would_block for the gaps).
+  # An agent
+  # DNS proxy bound inside the buildkitd pod's netns answers the RUN
+  # steps' DNS; a cgroup sock_addr redirect at the cgroupPaths sends their
+  # port-53 traffic to it, so buildkitd's resolv.conf / [dns] and the RUN
+  # steps stay untouched (BuildKit drops loopback nameservers from RUN
+  # steps, so a resolver override could not reach them anyway).
+  # Queries are forwarded to dnsUpstream (it must be the resolver the RUN
+  # steps use), attributed to their RUN step through the DNS PID tracker,
+  # and answered per that step's policy (enforce: allowed names open the
+  # step's allow set, others are sinkholed / NXDOMAIN; shadow: answered,
+  # recorded dns_would_block; audit, unattributed and unbound: answered
+  # normally). Seeded addresses have no TTL (LRU eviction only), as for
+  # pods. While the proxy is on, port 53 from RUN steps to anything but
+  # the proxy (v4-mapped, raw sockets, other resolvers) is dropped
+  # (enforce) / would_block (shadow). The proxy rebinds when buildkitd
+  # restarts; while unbound DNS passes straight to dnsUpstream and rows
+  # are flagged fqdn_rules_inactive. Requires hostPID (already set)
+  # and RUN steps that share buildkitd's netns (BuildKit's default host
+  # network mode); CNI/bridge-mode buildkitd stays IP-rules-only.
+  dnsProxy:
+    enabled: false
+    # The proxy's netns is taken from a live process inside a RUN cgroup
+    # (a process name alone is never trusted: CI jobs control theirs).
+    # The proxy binds at the first RUN step and then stays bound between
+    # steps, so leave procCgroup empty. To bind before the first RUN step
+    # set it to buildkitd's full pod UID or an absolute cgroup path
+    # (other values are rejected); it breaks when the pod is recreated
+    # unless updated. The redirect only turns on after a RUN process was
+    # seen in the proxy's netns; RUN processes in several netns latch it
+    # off.
+    process: buildkitd
+    procCgroup: ""
+    # Proxy address inside that netns (IPv4:port, default loopback).
+    listen: "127.0.0.153:15354"
 
   # Opt in to the fail-closed kill switch: with requireCIMetadata or
   # denyVertexPatterns set, RUN cgroups that cannot be attributed are

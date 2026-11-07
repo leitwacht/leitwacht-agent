@@ -115,6 +115,23 @@ type BuildKitDatapath interface {
 	InstallSlot(slot uint32, rules BKSlotRules) error
 	// RemoveSlot unpublishes slot and frees its inner maps.
 	RemoveSlot(slot uint32) error
+	// SeedDNS adds {ip, port} for every port to slot's DNS-derived allow
+	// map (bk_dns_sets) at priority prio, the semantics of seedAllowMap
+	// for the per-pod object. It fails when the slot is not published.
+	SeedDNS(slot uint32, ip net.IP, ports []int, prio uint32) error
+	// SetDNSRedirect enables or disables the sock_addr redirect that
+	// sends UDP/TCP port-53 traffic of RUN cgroups to the build DNS
+	// proxy at ip:port, an address inside the netns identified by
+	// netnsCookie (only sockets of that netns are redirected). While it is
+	// enabled the egress filter also drops (enforce) / would_block
+	// (shadow) port-53 traffic of that netns to anything but loopback, so
+	// v4-mapped and raw-socket queries cannot bypass the proxy. Enable it
+	// only once the proxy is serving, and disable it before stopping it.
+	SetDNSRedirect(ip net.IP, port uint16, netnsCookie uint64, enabled bool) error
+	// DNSRedirectAvailable reports whether the redirect programs are
+	// attached at every cgroup parent (false on kernels or cgroup
+	// layouts without cgroup sock_addr support).
+	DNSRedirectAvailable() bool
 	// SetCgroupPolicy writes (or replaces, atomically) a cgroup's entry.
 	SetCgroupPolicy(cgroupID uint64, p BKCgroupPolicy) error
 	// DeleteCgroupPolicy removes a cgroup's entry (idempotent).

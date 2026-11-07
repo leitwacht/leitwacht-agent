@@ -80,6 +80,14 @@ type slotState struct {
 	policy    BuildPolicy
 	refs      int
 	idleSince time.Time
+
+	// dns records what the build DNS proxy seeded into the slot's DNS-derived
+	// allow map (bk_dns_sets), so a policy update can carry the entries
+	// that still match forward instead of making the next connect wait for
+	// a re-resolve, and so pre-bind rows are not flagged for IPs a name
+	// rule allowed. Guarded by dnsMu (the proxy goroutines write it).
+	dnsMu sync.Mutex
+	dns   map[dnsSeedKey]dnsSeed
 }
 
 // cgDecision is the binder's immutable verdict for one RUN cgroup.
@@ -106,9 +114,10 @@ type cgDecision struct {
 	path string
 	// fromRegistry marks decisions backed by a registry binding.
 	fromRegistry bool
-	// fqdnInactive: the bound policy has name rules the datapath does not
-	// enforce yet (no build DNS proxy), only its IP rules apply.
-	fqdnInactive bool
+	// hasFQDN: the bound policy has allow name rules. They are enforced
+	// only while the build DNS proxy is active (see Annotate); otherwise
+	// just the IP rules apply and rows say so.
+	hasFQDN bool
 }
 
 type retiredDecision struct {
@@ -172,6 +181,17 @@ type BuildPolicyBinder struct {
 
 	dnsUpstreams []net.IP
 	fqdnLogged   map[slotKey]bool
+
+	// dnsActive is true while the build DNS proxy is bound and the
+	// redirect is on: only then are name rules enforced.
+	dnsActive atomic.Bool
+	// dnsTrans is the on/off history of dnsActive (guarded by dnsTimeMu).
+	dnsTimeMu sync.Mutex
+	dnsTrans  []dnsTransition
+
+	// changed is closed and replaced whenever a cgroup entry is written
+	// (guarded by mu); the DNS hold waits on it for the join.
+	changed chan struct{}
 
 	// Pre-bind SYN hold: the datapath flag follows "is any enforce
 	// policy in play". enforceSeen records when a session registration
@@ -261,6 +281,7 @@ func NewBuildPolicyBinder(src BuildPolicySource, dp BuildKitDatapath, log *slog.
 
 		fqdnLogged:  map[slotKey]bool{},
 		enforceSeen: map[PolicyKey]time.Time{},
+		changed:     make(chan struct{}),
 	}
 
 	for _, o := range opts {
@@ -794,6 +815,8 @@ func (b *BuildPolicyBinder) commitLocked(id uint64, nd *cgDecision, entry BKCgro
 	if old != nil {
 		b.releaseLocked(old.slot)
 	}
+
+	b.notifyLocked()
 }
 
 // applyNonBoundLocked records an audit decision and writes the entry so
@@ -840,7 +863,7 @@ func (b *BuildPolicyBinder) applyBoundLocked(id uint64, bd CgroupBinding, out bi
 		policyID:     policyID(out.key, slot.policy.Version),
 		path:         bd.CgroupPath,
 		fromRegistry: !bd.LinkedAt.IsZero(),
-		fqdnInactive: b.noteFQDNLocked(slot),
+		hasFQDN:      b.noteFQDNLocked(slot),
 	}
 
 	if old := b.cgs[id]; old != nil && old.gen > 0 && old.slot == slot {
@@ -860,8 +883,9 @@ func (b *BuildPolicyBinder) applyBoundLocked(id uint64, bd CgroupBinding, out bi
 	}
 }
 
-// noteFQDNLocked reports (and logs once per slot version) that the
-// slot's policy has name rules the datapath does not enforce yet.
+// noteFQDNLocked reports whether the slot's policy has allow name rules
+// and, while the build DNS proxy is not active, logs once per slot
+// version that only the IP rules apply.
 func (b *BuildPolicyBinder) noteFQDNLocked(s *slotState) bool {
 	if s.policy.Mode == BuildModeAudit {
 		return false
@@ -881,7 +905,7 @@ func (b *BuildPolicyBinder) noteFQDNLocked(s *slotState) bool {
 		return false
 	}
 
-	if !b.fqdnLogged[s.key] {
+	if !b.dnsActive.Load() && !b.fqdnLogged[s.key] {
 		b.fqdnLogged[s.key] = true
 
 		lvl := slog.LevelWarn
@@ -1074,6 +1098,8 @@ func (b *BuildPolicyBinder) flip(k PolicyKey, pol BuildPolicy) {
 
 	var target *slotState
 
+	carried := map[*slotState]bool{}
+
 	for id, dec := range b.cgs {
 		if dec.state != bkStateBound || dec.slot == nil || dec.slot.key.Project != k.Project || dec.slot.key.Job != k.Job {
 			continue
@@ -1107,6 +1133,14 @@ func (b *BuildPolicyBinder) flip(k PolicyKey, pol BuildPolicy) {
 			target = s
 		}
 
+		// Carry the name-seeded allows that still match into the new slot
+		// before any cgroup points at it.
+		if !carried[dec.slot] {
+			carried[dec.slot] = true
+
+			b.carryDNSLocked(dec.slot, target)
+		}
+
 		target.refs++
 		b.writeFlipLocked(id, dec, target)
 	}
@@ -1125,7 +1159,7 @@ func (b *BuildPolicyBinder) writeFlipLocked(id uint64, dec *cgDecision, s *slotS
 	nd.mode = modeByte(s.policy.Mode)
 	nd.gen = dec.gen + 1
 	nd.policyID = policyID(dec.key, s.policy.Version)
-	nd.fqdnInactive = b.noteFQDNLocked(s)
+	nd.hasFQDN = b.noteFQDNLocked(s)
 
 	err := b.dp.SetCgroupPolicy(id, BKCgroupPolicy{Slot: s.idx, State: bkStateBound, Mode: nd.mode, Gen: nd.gen})
 	if err != nil {
@@ -1191,7 +1225,7 @@ func (b *BuildPolicyBinder) annotateLocked(v *Violation, dec *cgDecision) {
 
 	if dec.state != bkStateBound {
 		v.DegradedReason = degradedReasonFor(dec.reason)
-	} else if dec.fqdnInactive && v.DegradedReason == "" {
+	} else if dec.hasFQDN && !b.dnsActiveAt(v.Timestamp) && v.DegradedReason == "" {
 		v.DegradedReason = DegradedFQDNInactive
 	}
 
@@ -1207,6 +1241,7 @@ func (b *BuildPolicyBinder) annotateLocked(v *Violation, dec *cgDecision) {
 		// Recorded before the cgroup had an entry, so nothing was
 		// enforced. Evaluate what the bound policy would have done.
 		if dec.state == bkStateBound && dec.policy != nil && dec.policy.Mode != BuildModeAudit &&
+			!(dec.slot != nil && dec.slot.dnsAllows(v.IP, v.Port)) &&
 			wouldDeny(dec.policy, v.IP, v.Port, b.trusted, b.dnsUpstreams) {
 			v.WouldBlock = true
 		}

@@ -80,6 +80,50 @@ struct {
     __type(value, __u8);
 } dns_known_cgroups SEC(".maps");
 
+/* BuildKit parent cgroups (the cgroup whose children are the RUN-step
+   cgroups). dns_known_cgroups holds exact ids only (256), which cannot
+   cover RUN cgroups that come and go per build step, so a query from
+   ANY task below one of these parents is also tracked, and recorded
+   against the RUN cgroup (the parent's child on the task's path), the
+   unit build policy is bound to. A task sitting in the parent itself has
+   no RUN level and is not tracked. */
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 8);
+    __type(key, __u64);
+    __type(value, __u8);
+} dns_run_parents SEC(".maps");
+
+#define DNS_MAX_LEVEL 16
+
+/* Ports a tracked query may be addressed to: 53 (as the app asked),
+   15353 (per-pod proxy) and 15354 (build proxy, after the sock_addr
+   redirect rewrote the destination). */
+static __always_inline int dns_port_ok(__u16 p)
+{
+    return p == 53 || p == 15353 || p == 15354;
+}
+
+/* dns_run_cgroup: the RUN cgroup id of the current task when one of its
+   ancestors is a registered BuildKit parent, else 0. Returns directly
+   from the probe loop (accumulating map-value pointers is rejected by
+   the verifier, see sock_attr.c in_known_subtree). */
+static __always_inline __u64 dns_run_cgroup(void)
+{
+#pragma unroll
+    for (int lvl = 0; lvl < DNS_MAX_LEVEL; lvl++) {
+        __u64 anc = bpf_get_current_ancestor_cgroup_id(lvl);
+
+        if (!anc)
+            return 0;
+
+        if (bpf_map_lookup_elem(&dns_run_parents, &anc))
+            return bpf_get_current_ancestor_cgroup_id(lvl + 1);
+    }
+
+    return 0;
+}
+
 static __always_inline void record_dns_attribution(struct sock *sk, __u64 cgroup_id, __u16 src_port, __u8 flags)
 {
     if (src_port == 0)
@@ -156,8 +200,11 @@ int BPF_PROG(dns_pid_sendmsg, struct sock *sk, struct msghdr *msg, size_t len, i
 
     __u64 cgroup_id = bpf_get_current_cgroup_id();
     __u8 *found = bpf_map_lookup_elem(&dns_known_cgroups, &cgroup_id);
-    if (!found)
-        return 0;
+    if (!found) {
+        cgroup_id = dns_run_cgroup();
+        if (!cgroup_id)
+            return 0;
+    }
 
     /* Destination port: connected socket fills skc_dport; unconnected
        sendto() (musl, glibc) passes it via msghdr->msg_name. The
@@ -177,7 +224,7 @@ int BPF_PROG(dns_pid_sendmsg, struct sock *sk, struct msghdr *msg, size_t len, i
         }
     }
 
-    if (dport_h != 53 && dport_h != 15353)
+    if (!dns_port_ok(dport_h))
         return 0;
 
     __u16 sport = BPF_CORE_READ(sk, __sk_common.skc_num);
@@ -194,11 +241,15 @@ int BPF_KPROBE(dns_pid_tcp_connect, struct sock *sk)
 {
     __u64 cgroup_id = bpf_get_current_cgroup_id();
     __u8 *found = bpf_map_lookup_elem(&dns_known_cgroups, &cgroup_id);
-    if (!found)
-        return 0;
+    if (!found) {
+        cgroup_id = dns_run_cgroup();
+        if (!cgroup_id)
+            return 0;
+    }
 
     __u16 dport = BPF_CORE_READ(sk, __sk_common.skc_dport);
-    if (bpf_ntohs(dport) != 53)
+    __u16 dport_h = bpf_ntohs(dport);
+    if (dport_h != 53 && dport_h != 15354)
         return 0;
 
     __u16 sport = BPF_CORE_READ(sk, __sk_common.skc_num);

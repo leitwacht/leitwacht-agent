@@ -29,6 +29,12 @@ func (*DNSPIDTracker) AddCgroup(_ string) (uint64, error) { return 0, nil }
 // RemoveCgroup is a no-op on non-Linux.
 func (*DNSPIDTracker) RemoveCgroup(_ uint64) {}
 
+// AddRunParent is a no-op on non-Linux.
+func (*DNSPIDTracker) AddRunParent(_ uint64) error { return nil }
+
+// RemoveRunParent is a no-op on non-Linux.
+func (*DNSPIDTracker) RemoveRunParent(_ uint64) {}
+
 // Close is a no-op on non-Linux.
 func (*DNSPIDTracker) Close() {}
 

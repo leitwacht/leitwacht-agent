@@ -25,3 +25,14 @@ func (m *Manager) StopDNSPIDTracker() {
 		m.logger.Info("dns pid tracker stopped")
 	}
 }
+
+// DNSPIDTracker returns the DNS attribution tracker as the build DNS
+// proxy's tracker, or nil when it is not running (StartDNSPIDTracker
+// failed or was not called). Pass it as BuildDNSConfig.Tracker.
+func (m *Manager) DNSPIDTracker() BuildDNSTracker {
+	if m.dnsPIDTracker == nil {
+		return nil
+	}
+
+	return m.dnsPIDTracker
+}

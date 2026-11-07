@@ -142,10 +142,12 @@ type Config struct {
 	//           project's rules would deny
 	//   enforce drop connections the project's rules deny
 	//
-	// shadow and enforce limitations until the build DNS proxy exists:
-	//   - only IP/CIDR rules are enforced; fqdn allow rules are NOT (the
-	//     agent logs an Error once per policy version and flags the rows
-	//     fqdn_rules_inactive), so allow the destinations by address;
+	// shadow and enforce limitations:
+	//   - domain (fqdn) rules are enforced only while the build DNS proxy
+	//     is active (BuildkitDNSProxy); otherwise just the IP/CIDR rules
+	//     apply (the agent logs an Error once per policy version and flags
+	//     the rows fqdn_rules_inactive), so allow the destinations by
+	//     address or enable the proxy;
 	//   - port 53 from a RUN step is allowed only to LEITWACHT_CE_DNS_UPSTREAM
 	//     (any other resolver is dropped / would_block as a DNS bypass),
 	//     independent of trusted networks and rules (the pin precedes the
@@ -164,6 +166,63 @@ type Config struct {
 	// projects) is always audit, never blocked, never killed (see
 	// BuildkitKillOnUnattributed).
 	BuildkitEnforcement string
+
+	// BuildkitDNSProxy enables the build DNS proxy
+	// (LEITWACHT_CE_BUILDKIT_DNS_PROXY, default false) so domain (fqdn)
+	// rules apply to BuildKit RUN steps. A proxy bound inside the
+	// buildkitd pod's network namespace answers the RUN steps' DNS; a
+	// cgroup sock_addr redirect (connect4/sendmsg4/recvmsg4 at the
+	// BuildKit cgroup parents) sends their port-53 traffic to it without
+	// changing buildkitd's or the RUN steps' resolver configuration.
+	//
+	//   - allowed names seed the step's allow set, denied/unmatched names
+	//     are answered by the rule's resolution (enforce) or recorded as
+	//     dns_would_block (shadow); audit and unbound steps are answered
+	//     normally. Never fail-closed.
+	//   - WARNING: once it is on, names that were only reachable through IP
+	//     or trusted-network rules (registry mirrors, *.svc names) are
+	//     sinkholed in enforce unless an fqdn allow rule names them.
+	//   - the proxy's netns is taken from a live process inside a RUN
+	//     cgroup (never from a process name alone: CI jobs control theirs);
+	//     BuildkitDNSProcCgroup additionally lets it bind before the first
+	//     RUN step. The redirect is enabled only after a RUN process was
+	//     seen in that netns, then stays on between steps; RUN processes
+	//     in several netns, or a netns that keeps changing, latch it off
+	//     (retried after 10 minutes). Kernels without bpf_get_netns_cookie
+	//     for cgroup_skb (a Warn is logged) only keep the upstream-only
+	//     port-53 pin: v4-mapped and raw-socket queries to the configured
+	//     upstream are then not caught. When buildkitd restarts the proxy is rebound; while
+	//     unbound DNS goes to LEITWACHT_CE_DNS_UPSTREAM directly and rows
+	//     carry fqdn_rules_inactive. While it is on, port 53 from RUN
+	//     steps to anything but the proxy is dropped (enforce) /
+	//     would_block (shadow), including v4-mapped and raw-socket queries.
+	//   - seeded addresses have no TTL (LRU eviction only), as for pods.
+	//   - needs the agent to see buildkitd (hostPID) and the DNS PID
+	//     tracker; RUN steps must share buildkitd's netns (BuildKit's
+	//     default host network mode). CNI/bridge-mode buildkitd is
+	//     IP-rules-only.
+	//   - LEITWACHT_CE_DNS_UPSTREAM must be the resolver buildkitd's RUN
+	//     steps use; queries are forwarded to it.
+	BuildkitDNSProxy bool
+
+	// BuildkitDNSProc is the process name used, together with
+	// BuildkitDNSProcCgroup, to find buildkitd before a RUN step exists
+	// (LEITWACHT_CE_BUILDKIT_DNS_PROC, default "buildkitd"). Never trusted
+	// alone.
+	BuildkitDNSProc string
+
+	// BuildkitDNSProcCgroup identifies buildkitd's pod so the proxy can
+	// bind before the first RUN step: a full pod UID or an absolute cgroup
+	// path (LEITWACHT_CE_BUILDKIT_DNS_PROC_CGROUP; other values are
+	// rejected). Default empty, recommended: the proxy binds at the first
+	// RUN step and then stays bound between steps. It breaks when the pod
+	// is recreated unless updated.
+	BuildkitDNSProcCgroup string
+
+	// BuildkitDNSListen is the proxy's IPv4 address:port inside the
+	// buildkitd netns (LEITWACHT_CE_BUILDKIT_DNS_LISTEN, default
+	// 127.0.0.153:15354).
+	BuildkitDNSListen string
 
 	// BuildkitKillOnUnattributed opts in to the fail-closed kill switch
 	// (LEITWACHT_CE_BUILDKIT_KILL_ON_UNATTRIBUTED, default false): with
@@ -256,6 +315,13 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.BuildkitDNSProxy, err = envBool("LEITWACHT_CE_BUILDKIT_DNS_PROXY", false)
+	if err != nil {
+		return nil, err
+	}
+	c.BuildkitDNSProc = envOr("LEITWACHT_CE_BUILDKIT_DNS_PROC", "buildkitd")
+	c.BuildkitDNSProcCgroup = os.Getenv("LEITWACHT_CE_BUILDKIT_DNS_PROC_CGROUP")
+	c.BuildkitDNSListen = envOr("LEITWACHT_CE_BUILDKIT_DNS_LISTEN", "127.0.0.153:15354")
 	c.BuildkitMaxSessionAge, err = envDuration("LEITWACHT_CE_BUILDKIT_MAX_SESSION_AGE", 6*time.Hour)
 	if err != nil {
 		return nil, err

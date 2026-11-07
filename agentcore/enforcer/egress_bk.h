@@ -160,6 +160,46 @@ struct {
     __uint(max_entries, 8192);
 } bk_allow_dedup SEC(".maps");
 
+/* Build DNS redirect state (see the redirect programs at the end). */
+#define BK_AF_INET 2
+#define BK_SOCK_STREAM 1
+#define BK_SOCK_DGRAM 2
+
+struct bk_dnsredir_cfg_val {
+    __u32 enabled;
+    __u32 ip;            /* proxy address, network byte order */
+    __u64 netns_cookie;  /* netns the proxy lives in: only sockets there are redirected / pinned */
+    __u16 port;          /* proxy port, network byte order */
+    __u16 _pad[3];
+};
+
+struct bk_dns_orig_val {
+    __u32 ip;   /* original destination, network byte order */
+    __u16 port; /* original destination port, network byte order */
+    __u16 _pad;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct bk_dnsredir_cfg_val);
+} bk_dnsredir_cfg SEC(".maps");
+
+/* socket cookie -> the destination the application asked for (UDP). The
+   last one per socket wins: a reply-source mismatch can only happen for
+   one socket that talks to several nameservers at once, and the
+   resolver then retries; entries age out through the LRU (no socket
+   close hook is needed). */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 16384);
+    __type(key, __u64);
+    __type(value, struct bk_dns_orig_val);
+} bk_dns_orig SEC(".maps");
+
+volatile const struct bk_dnsredir_cfg_val __bk_dnsredir_cfg_btf_hint;
+
 /* Same variable-liveness trick as the per-pod hints. allow_key needs one
    too: it is otherwise only reached through pointers inside the inner-map
    templates, which clang then emits as a forward declaration (unsized). */
@@ -519,8 +559,31 @@ int egress_filter(struct __sk_buff *skb) {
        upstream(s), whatever the rules or trusted networks say, so a RUN
        step cannot tunnel through (or pick) another resolver. Disabled
        when no upstream is configured. Evaluated before trusted_nets. --- */
+    /* While the build DNS redirect is on for this netns, port 53 to
+       anything that is not loopback (the proxy) is a bypass: a v4-mapped
+       address on an AF_INET6 socket never reaches connect4, and raw
+       sockets skip the sock_addr hooks, but both end up here as IPv4
+       packets. userspace sets `enabled` after the redirect is attached
+       and clears it before detaching, so the pin can never outlive the
+       redirect it relies on. */
+    int proxy_on = 0;
+
+    {
+        struct bk_dnsredir_cfg_val *rc = bpf_map_lookup_elem(&bk_dnsredir_cfg, &zero);
+
+#ifndef LEITWACHT_BK_NO_NETNS_COOKIE
+        if (rc && rc->enabled && rc->netns_cookie && bpf_get_netns_cookie(skb) == rc->netns_cookie)
+            proxy_on = 1;
+#else
+        /* Kernels without bpf_get_netns_cookie for cgroup_skb (built as a
+           separate object, never references the helper): no bypass pin;
+           the plain DNS pin (upstream-only port 53) still applies. */
+        (void)rc;
+#endif
+    }
+
     if (bk.mode != BK_MODE_AUDIT && dst_port == 53 &&
-        (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP) && cfg && cfg->n_dns) {
+        (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP) && cfg && (cfg->n_dns || proxy_on)) {
         int dns_ok = 0;
 
 #pragma unroll
@@ -530,6 +593,9 @@ int egress_filter(struct __sk_buff *skb) {
             if (cfg->dns_ip[i] == dst_ip)
                 dns_ok = 1;
         }
+
+        if (proxy_on)
+            dns_ok = 0;
 
         if (!dns_ok)
             return bk_deny(skb, dst_ip, dst_port, protocol, DROP_REASON_DNS_BYPASS, &bk);
@@ -584,4 +650,92 @@ int egress_filter(struct __sk_buff *skb) {
     /* Default deny: BLOCK drops, SHADOW records would_block, everything
        else (audit, pending, ambiguous, unattributed, degraded) observes. */
     return bk_deny(skb, dst_ip, dst_port, protocol, DROP_REASON_POLICY, &bk);
+}
+
+/* ---- Build DNS redirect (cgroup/connect4, sendmsg4, recvmsg4) ----------
+ *
+ * RUN steps of a default-network buildkitd share the buildkitd pod's
+ * netns and resolve through the cluster DNS (BuildKit strips loopback
+ * nameservers, so a resolv.conf override cannot reach them). The
+ * userspace build DNS proxy listens on a loopback address inside that
+ * netns; these programs, attached at the same BuildKit cgroup parent(s)
+ * as the egress filter, rewrite the destination of every UDP/TCP
+ * connection to port 53 from a RUN cgroup to the proxy, and rewrite the
+ * source of UDP replies back to the address the application asked, so
+ * resolvers that check the reply source (unconnected sockets) accept
+ * them. The packet then goes to loopback, which the egress filter
+ * passes before the port-53 pin; the proxy attributes the query to the
+ * RUN cgroup through the dns_pid kprobes.
+ *
+ * Disabled (all three pass through) until userspace has bound the proxy
+ * and set bk_dnsredir_cfg.enabled: with the proxy down, DNS goes to the
+ * real upstream, which the pin allows. Never fails closed. */
+
+
+static __always_inline int bk_dns_rewrite(struct bpf_sock_addr *ctx) {
+    __u32 zero = 0;
+    struct bk_dnsredir_cfg_val *rc = bpf_map_lookup_elem(&bk_dnsredir_cfg, &zero);
+
+    if (!rc || !rc->enabled)
+        return 1;
+
+    if (ctx->user_family != BK_AF_INET || ctx->user_port != bpf_htons(53))
+        return 1;
+
+    /* The proxy only exists in one netns (buildkitd's). A socket in
+       another one (CNI/bridge mode: a netns per RUN step) must be left
+       alone: 127.0.0.x there is not the proxy. Never fails closed. */
+    if (!rc->netns_cookie || bpf_get_netns_cookie(ctx) != rc->netns_cookie)
+        return 1;
+
+    /* Only UDP and TCP stream sockets carry DNS. */
+    if (ctx->type != BK_SOCK_DGRAM && ctx->type != BK_SOCK_STREAM)
+        return 1;
+
+    if (ctx->type == BK_SOCK_DGRAM) {
+        struct bk_dns_orig_val orig = {.ip = ctx->user_ip4, .port = (__u16)ctx->user_port};
+        __u64 cookie = bpf_get_socket_cookie(ctx);
+
+        (void)bpf_map_update_elem(&bk_dns_orig, &cookie, &orig, BPF_ANY);
+    }
+
+    ctx->user_ip4 = rc->ip;
+    ctx->user_port = rc->port;
+
+    return 1;
+}
+
+SEC("cgroup/connect4")
+int bk_dns_connect4(struct bpf_sock_addr *ctx) {
+    return bk_dns_rewrite(ctx);
+}
+
+SEC("cgroup/sendmsg4")
+int bk_dns_sendmsg4(struct bpf_sock_addr *ctx) {
+    return bk_dns_rewrite(ctx);
+}
+
+SEC("cgroup/recvmsg4")
+int bk_dns_recvmsg4(struct bpf_sock_addr *ctx) {
+    __u32 zero = 0;
+    struct bk_dnsredir_cfg_val *rc = bpf_map_lookup_elem(&bk_dnsredir_cfg, &zero);
+
+    if (!rc)
+        return 1;
+
+    /* Rewrite replies even after the proxy was disabled: a socket that
+       was redirected earlier still gets answers from it. Only replies
+       whose source is the proxy are touched. */
+    if (ctx->user_family != BK_AF_INET || ctx->user_ip4 != rc->ip || ctx->user_port != rc->port)
+        return 1;
+
+    __u64 cookie = bpf_get_socket_cookie(ctx);
+    struct bk_dns_orig_val *orig = bpf_map_lookup_elem(&bk_dns_orig, &cookie);
+
+    if (orig) {
+        ctx->user_ip4 = orig->ip;
+        ctx->user_port = orig->port;
+    }
+
+    return 1;
 }

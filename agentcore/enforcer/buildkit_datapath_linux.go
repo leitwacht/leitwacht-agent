@@ -8,11 +8,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/bits"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
+	"github.com/cilium/ebpf/features"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 )
@@ -30,7 +34,21 @@ func (p *LinuxPlatform) LoadBuildKitEBPF(trustedCIDRs []net.IPNet) (BuildKitData
 			"error", lsmErr)
 	}
 
-	spec, err := loadEbpfBK()
+	// The cookie-based bypass pin needs bpf_get_netns_cookie in cgroup_skb
+	// programs (newer kernels only). Without it the object variant that
+	// never references the helper is loaded, so the whole BuildKit attach
+	// does not depend on it; the bypass pin then degrades to the plain
+	// upstream-only port-53 pin.
+	load := loadEbpfBK
+
+	if bkForceNoNetnsCookie || !haveSkbNetnsCookie() {
+		load = loadEbpfBKNC
+
+		p.Logger.Warn("kernel lacks bpf_get_netns_cookie for cgroup_skb: the build DNS bypass pin is reduced to the " +
+			"upstream-only port-53 pin (v4-mapped and raw-socket queries to the configured upstream are not caught)")
+	}
+
+	spec, err := load()
 	if err != nil {
 		return nil, fmt.Errorf("load egress_bk spec: %w", err)
 	}
@@ -91,6 +109,16 @@ func (p *LinuxPlatform) LoadBuildKitEBPF(trustedCIDRs []net.IPNet) (BuildKitData
 	return h, nil
 }
 
+// bkForceNoNetnsCookie makes LoadBuildKitEBPF use the no-cookie object
+// variant (tests, or an operator working around a kernel quirk).
+var bkForceNoNetnsCookie bool
+
+// haveSkbNetnsCookie probes the kernel for bpf_get_netns_cookie in
+// cgroup_skb programs.
+func haveSkbNetnsCookie() bool {
+	return features.HaveProgramHelper(ebpf.CGroupSKB, asm.FnGetNetnsCookie) == nil
+}
+
 // linuxBKHandle is the loaded egress_bk object.
 type linuxBKHandle struct {
 	objs   ebpfBKObjects
@@ -99,14 +127,20 @@ type linuxBKHandle struct {
 
 	denyInner, hostInner, dnsInner *ebpf.MapSpec
 
-	mu sync.Mutex // serialises slot installs/removals
+	mu sync.Mutex // serialises slot installs/removals/seeds
+
+	// redirectFailed is set when a DNS redirect program failed to attach.
+	redirectFailed atomic.Bool
 
 	cfgMu      sync.Mutex // guards holdOn/holdNS and bk_cfg read-modify-write
 	holdOn     bool
 	holdWindow time.Duration
 }
 
-// AttachCgroup attaches the egress program at cgroupPath.
+// AttachCgroup attaches the egress program at cgroupPath, plus the DNS
+// redirect programs (connect4, sendmsg4, recvmsg4). The egress attach is
+// mandatory; a redirect attach failure is logged and only disables
+// domain enforcement (DNSRedirectAvailable turns false).
 func (h *linuxBKHandle) AttachCgroup(cgroupPath string) (CgroupLink, error) {
 	l, err := link.AttachCgroup(link.CgroupOptions{
 		Path:    cgroupPath,
@@ -117,7 +151,120 @@ func (h *linuxBKHandle) AttachCgroup(cgroupPath string) (CgroupLink, error) {
 		return nil, fmt.Errorf("attach egress_bk cgroup: %w", err)
 	}
 
-	return &linuxCgroupLink{link: l}, nil
+	links := []link.Link{l}
+
+	for _, r := range []struct {
+		prog *ebpf.Program
+		typ  ebpf.AttachType
+		name string
+	}{
+		{h.objs.BkDnsConnect4, ebpf.AttachCGroupInet4Connect, "connect4"},
+		{h.objs.BkDnsSendmsg4, ebpf.AttachCGroupUDP4Sendmsg, "sendmsg4"},
+		{h.objs.BkDnsRecvmsg4, ebpf.AttachCGroupUDP4Recvmsg, "recvmsg4"},
+	} {
+		rl, rerr := link.AttachCgroup(link.CgroupOptions{Path: cgroupPath, Attach: r.typ, Program: r.prog})
+		if rerr != nil {
+			h.logger.Warn("buildkit dns redirect program not attached; domain rules cannot be enforced for build steps",
+				"program", r.name, "path", cgroupPath, "error", rerr)
+			h.redirectFailed.Store(true)
+
+			continue
+		}
+
+		links = append(links, rl)
+	}
+
+	return &multiCgroupLink{links: links}, nil
+}
+
+// multiCgroupLink closes several links as one attachment.
+type multiCgroupLink struct{ links []link.Link }
+
+func (m *multiCgroupLink) Close() error {
+	var first error
+
+	for _, l := range m.links {
+		if err := l.Close(); err != nil && first == nil {
+			first = err
+		}
+	}
+
+	return first
+}
+
+// DNSRedirectAvailable reports whether every redirect program attached.
+func (h *linuxBKHandle) DNSRedirectAvailable() bool { return !h.redirectFailed.Load() }
+
+// SetDNSRedirect writes bk_dnsredir_cfg.
+func (h *linuxBKHandle) SetDNSRedirect(ip net.IP, port uint16, netnsCookie uint64, enabled bool) error {
+	v := ebpfBKBkDnsredirCfgVal{}
+
+	if enabled {
+		ip4 := ip.To4()
+		if ip4 == nil || port == 0 || netnsCookie == 0 {
+			return fmt.Errorf("%w: dns redirect target %s:%d", errBKConfigRange, ip, port)
+		}
+
+		v.Enabled = 1
+		// Network byte order, as ctx->user_ip4 / user_port are read
+		// (little-endian host: the bytes land in memory in wire order).
+		v.Ip = binary.LittleEndian.Uint32(ip4)
+		v.Port = bits.ReverseBytes16(port)
+		v.NetnsCookie = netnsCookie
+	} else {
+		// Keep the target so replies of in-flight redirected sockets are
+		// still rewritten back (recvmsg4 matches on it).
+		var cur ebpfBKBkDnsredirCfgVal
+
+		if err := h.objs.BkDnsredirCfg.Lookup(uint32(0), &cur); err == nil {
+			v = cur
+		}
+
+		v.Enabled = 0
+	}
+
+	if err := h.objs.BkDnsredirCfg.Put(uint32(0), &v); err != nil {
+		return fmt.Errorf("set bk_dnsredir_cfg: %w", err)
+	}
+
+	return nil
+}
+
+// SeedDNS adds {ip, port...} to the slot's DNS-derived allow map.
+func (h *linuxBKHandle) SeedDNS(slot uint32, ip net.IP, ports []int, prio uint32) error {
+	if slot >= bkMaxSlots {
+		return fmt.Errorf("%w: slot %d", errBKSlotRange, slot)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	var innerID ebpf.MapID
+
+	if err := h.objs.BkDnsSets.Lookup(slot, &innerID); err != nil {
+		return fmt.Errorf("slot %d dns map: %w", slot, err)
+	}
+
+	inner, err := ebpf.NewMapFromID(innerID)
+	if err != nil {
+		return fmt.Errorf("open slot %d dns map: %w", slot, err)
+	}
+
+	defer inner.Close() //nolint:errcheck // our fd only; the kernel keeps the map
+
+	for _, port := range ports {
+		if port < 0 || port > 65535 {
+			continue
+		}
+
+		key := PackAllowKey(ip, port)
+
+		if putErr := inner.Put(key[:], prio); putErr != nil {
+			return fmt.Errorf("seed dns %s:%d: %w", ip, port, putErr)
+		}
+	}
+
+	return nil
 }
 
 // SetConfig writes bk_cfg.

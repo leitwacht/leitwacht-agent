@@ -25,6 +25,7 @@ type ebpfBKBkCfgVal struct {
 	N_parents uint32
 	N_dns     uint32
 	Flags     uint32
+	HoldNs    uint64
 	Parents   [8]uint64
 	DnsIp     [4]uint32
 }
@@ -90,6 +91,7 @@ const (
 	ebpfBKMapBkDenySets        = "bk_deny_sets"
 	ebpfBKMapBkDnsSets         = "bk_dns_sets"
 	ebpfBKMapBkHostSets        = "bk_host_sets"
+	ebpfBKMapBkPendingSince    = "bk_pending_since"
 	ebpfBKMapDropDedup         = "drop_dedup"
 	ebpfBKMapDropEvents        = "drop_events"
 	ebpfBKMapReserveFailures   = "reserve_failures"
@@ -158,6 +160,7 @@ type ebpfBKMapSpecs struct {
 	BkDenySets      *ebpf.MapSpec `ebpf:"bk_deny_sets"`
 	BkDnsSets       *ebpf.MapSpec `ebpf:"bk_dns_sets"`
 	BkHostSets      *ebpf.MapSpec `ebpf:"bk_host_sets"`
+	BkPendingSince  *ebpf.MapSpec `ebpf:"bk_pending_since"`
 	DropDedup       *ebpf.MapSpec `ebpf:"drop_dedup"`
 	DropEvents      *ebpf.MapSpec `ebpf:"drop_events"`
 	ReserveFailures *ebpf.MapSpec `ebpf:"reserve_failures"`
@@ -202,6 +205,7 @@ type ebpfBKMaps struct {
 	BkDenySets      *ebpf.Map `ebpf:"bk_deny_sets"`
 	BkDnsSets       *ebpf.Map `ebpf:"bk_dns_sets"`
 	BkHostSets      *ebpf.Map `ebpf:"bk_host_sets"`
+	BkPendingSince  *ebpf.Map `ebpf:"bk_pending_since"`
 	DropDedup       *ebpf.Map `ebpf:"drop_dedup"`
 	DropEvents      *ebpf.Map `ebpf:"drop_events"`
 	ReserveFailures *ebpf.Map `ebpf:"reserve_failures"`
@@ -218,6 +222,7 @@ func (m *ebpfBKMaps) Close() error {
 		m.BkDenySets,
 		m.BkDnsSets,
 		m.BkHostSets,
+		m.BkPendingSince,
 		m.DropDedup,
 		m.DropEvents,
 		m.ReserveFailures,

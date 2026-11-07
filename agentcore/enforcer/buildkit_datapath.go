@@ -28,6 +28,10 @@ const (
 	bkVerdictObserved   uint8 = 2
 	bkVerdictWouldBlock uint8 = 3
 	bkVerdictAllowed    uint8 = 4
+	bkVerdictHeld       uint8 = 5
+
+	// bkCfgHoldEnabled is bk_cfg.flags bit 0 (BK_CFG_HOLD_ENABLED).
+	bkCfgHoldEnabled uint32 = 1
 
 	// bkMaxSlots is the outer-array size of the slot tables.
 	bkMaxSlots = 256
@@ -76,6 +80,10 @@ type BKConfig struct {
 	// RunLevel, when nonzero, fixes the RUN cgroup level instead of
 	// scanning for the parents. Tests only.
 	RunLevel uint32
+	// HoldWindow is how long a PENDING RUN cgroup's TCP SYNs are held
+	// (dropped, so the kernel retransmit re-sends them after binding)
+	// when hold is enabled. Zero disables holding.
+	HoldWindow time.Duration
 }
 
 const (
@@ -98,6 +106,9 @@ type BuildKitDatapath interface {
 	// program finds the RUN level in-kernel from them), the DNS upstreams
 	// of the port-53 pin, and an optional fixed RUN level (tests).
 	SetConfig(cfg BKConfig) error
+	// SetHold turns the pre-bind SYN hold on or off. It keeps the rest
+	// of bk_cfg as SetConfig wrote it.
+	SetHold(enabled bool) error
 	// InstallSlot builds fresh inner maps for slot and publishes them in
 	// the slot tables. A failure leaves the slot unpublished (never half
 	// installed).
@@ -122,6 +133,11 @@ type BuildKitPlatform interface {
 	LoadBuildKitEBPF(trustedCIDRs []net.IPNet) (BuildKitDatapath, error)
 }
 
+// ActionSynHeld is the Violation action of a TCP SYN dropped by the
+// pre-bind hold. The connection is not denied: the retransmit is judged
+// by the cgroup's slot once bound (or passes as audit after the window).
+const ActionSynHeld = "syn_held"
+
 // ActionForVerdict maps an egress_bk event verdict (and, for blocked
 // connections, the drop reason) to a Violation action. The verdict is
 // the authority: nothing here consults a global mode.
@@ -141,6 +157,8 @@ func ActionForVerdict(verdict, reason uint8) string {
 		return "would_block"
 	case bkVerdictAllowed:
 		return "packet_allowed"
+	case bkVerdictHeld:
+		return ActionSynHeld
 	default:
 		// bkVerdictObserved and anything unknown: the packet passed.
 		return "packet_observed"

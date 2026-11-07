@@ -39,6 +39,10 @@
 #define BK_VERDICT_OBSERVED    2
 #define BK_VERDICT_WOULD_BLOCK 3
 #define BK_VERDICT_ALLOWED     4
+#define BK_VERDICT_HELD        5 /* TCP SYN dropped by the pre-bind hold */
+
+/* bk_cfg.flags bits. */
+#define BK_CFG_HOLD_ENABLED 1 /* hold SYNs of PENDING cgroups (userspace sets it only while an enforce policy exists) */
 
 #define BK_MAX_SLOTS 256
 #define BK_MAX_PARENTS 8
@@ -81,6 +85,7 @@ struct bk_cfg_val {
     __u32 n_parents;
     __u32 n_dns;
     __u32 flags;
+    __u64 hold_ns; /* SYN-hold window; 0 = never hold */
     __u64 parents[BK_MAX_PARENTS]; /* cgroup ids of the BuildKit parents */
     __u32 dns_ip[BK_MAX_DNS];      /* DNS upstreams (network order) for the port-53 pin */
 };
@@ -134,6 +139,18 @@ struct {
         __type(value, __u32);
     });
 } bk_dns_sets SEC(".maps");
+
+/* First time a PENDING RUN cgroup was seen sending a holdable SYN
+   (cgroup id -> ktime). The hold window is measured from here, so a
+   held SYN can never stall past it. An LRU eviction only restarts the
+   window of a cgroup that is still unbound; the joiner deadline writes
+   a non-PENDING entry (which ends holding) within the same window. */
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __type(key, __u64);
+    __type(value, __u64);
+    __uint(max_entries, 4096);
+} bk_pending_since SEC(".maps");
 
 /* 60 s dedup for packet_allowed events. */
 struct {
@@ -259,6 +276,57 @@ static __always_inline int bk_deny(struct __sk_buff *skb, __u32 ip, __u16 port,
     return 1;
 }
 
+/* Cloud metadata endpoints: a hard block for every cgroup state. */
+static __always_inline int bk_meta_ip(__u32 ip) {
+    return ip == bpf_htonl(0xA9FEA9FE) ||
+           ip == bpf_htonl(0xA9FEAA02) ||
+           ip == bpf_htonl(0xA9FEAA17) ||
+           ip == bpf_htonl(0x646464C8) ||
+           ip == bpf_htonl(0xA9FE0017);
+}
+
+/* Destinations the hold must never exempt (trusted nets, DNS upstreams):
+   metadata, DoT on any IP, the DNS sinkhole. */
+static __always_inline int bk_hard_dst(__u32 ip, __u16 port) {
+    return bk_meta_ip(ip) || port == DOT_PORT || ip == bpf_htonl(0xC0000201);
+}
+
+/* Pre-bind SYN hold. A PENDING RUN cgroup has no policy entry yet (the
+   join takes 25-50 ms), so a connect in that window would pass
+   un-enforced. While hold is enabled and the cgroup is younger than the
+   hold window, its TCP SYNs are dropped (event verdict HELD): the
+   kernel's retransmit (about 1 s later) is judged by the slot once the
+   cgroup is bound. It runs BEFORE the hard blocks and the IPv6 branch,
+   so metadata/DoT/IPv6 SYNs cannot slip through the window either. The
+   caller exempts trusted nets, loopback and DNS upstreams. After the
+   window the cgroup is audit (pass + record): never fail-closed. Only
+   state PENDING is held; ambiguous/unattributed/degraded cgroups carry
+   an entry and are audit. Returns 1 when the SYN was held. */
+static __noinline int bk_hold_syn(struct __sk_buff *skb, __u64 run_id, const struct bk_ev_args *a,
+                                  const struct bk_cur *bk) {
+    __u32 zero = 0;
+    struct bk_cfg_val *cfg = bpf_map_lookup_elem(&bk_cfg, &zero);
+
+    if (!cfg || !cfg->hold_ns)
+        return 0;
+
+    __u64 now = bpf_ktime_get_ns();
+    __u64 first = now;
+    __u64 *since = bpf_map_lookup_elem(&bk_pending_since, &run_id);
+
+    if (since)
+        first = *since;
+    else
+        (void)bpf_map_update_elem(&bk_pending_since, &run_id, &now, BPF_NOEXIST);
+
+    if (now - first >= cfg->hold_ns)
+        return 0;
+
+    bk_emit_event(skb, a, bk);
+
+    return 1;
+}
+
 SEC("cgroup_skb/egress")
 int egress_filter(struct __sk_buff *skb) {
     __u32 zero = 0;
@@ -338,6 +406,20 @@ int egress_filter(struct __sk_buff *skb) {
             daddr.in6_u.u6_addr32[3] == bpf_htonl(1))
             return 1; /* loopback */
 
+        /* Pre-bind hold for IPv6 TCP SYNs (only ::1 is exempt). */
+        if (bk.state == BK_STATE_PENDING && run_id && cfg && (cfg->flags & BK_CFG_HOLD_ENABLED) && cfg->hold_ns) {
+            __u8 nh6 = 0;
+            __u8 fl6 = 0;
+            __be16 dp6;
+
+            if (bpf_skb_load_bytes(skb, 6, &nh6, 1) == 0 && nh6 == IPPROTO_TCP &&
+                bpf_skb_load_bytes(skb, 53, &fl6, 1) == 0 && (fl6 & 0x12) == 0x02 &&
+                bpf_skb_load_bytes(skb, 42, &dp6, sizeof(dp6)) == 0 &&
+                bk_hold_syn(skb, run_id, &(struct bk_ev_args){.ip = 0, .port = bpf_ntohs(dp6), .proto = IPPROTO_TCP,
+                                                              .reason = DROP_REASON_IPV6, .verdict = BK_VERDICT_HELD}, &bk))
+                return 0;
+        }
+
         /* IPv6 is not supported by the policy maps: a BOUND cgroup in
            BLOCK drops it, in SHADOW records would_block, in audit it
            passes unrecorded (as in the per-pod object). The event
@@ -380,12 +462,41 @@ int egress_filter(struct __sk_buff *skb) {
         dst_port = bpf_ntohs(dport);
     }
 
+    /* --- Pre-bind SYN hold: first, so hard-blocked destinations (metadata,
+       DoT, sinkhole) cannot escape during the pre-bind window. Exempt:
+       loopback, trusted nets, DNS upstreams. --- */
+    if (bk.state == BK_STATE_PENDING && run_id && cfg && (cfg->flags & BK_CFG_HOLD_ENABLED) && cfg->hold_ns && protocol == IPPROTO_TCP &&
+        (dst_ip & bpf_htonl(0xFF000000)) != bpf_htonl(0x7F000000)) {
+        __u8 tcp_flags = 0;
+
+        if (bpf_skb_load_bytes(skb, ip_hlen + 13, &tcp_flags, 1) == 0 && (tcp_flags & 0x12) == 0x02) {
+            int exempt = 0;
+            struct lpm_key hold_ck = {.prefixlen = 32, .ip = dst_ip};
+
+            if (bpf_map_lookup_elem(&trusted_nets, &hold_ck))
+                exempt = 1;
+
+#pragma unroll
+            for (int i = 0; i < BK_MAX_DNS; i++) {
+                if (i >= cfg->n_dns)
+                    break;
+                if (cfg->dns_ip[i] == dst_ip)
+                    exempt = 1;
+            }
+
+            struct bk_ev_args hold_a = {.ip = dst_ip, .port = dst_port, .proto = IPPROTO_TCP,
+                                        .reason = DROP_REASON_POLICY, .verdict = BK_VERDICT_HELD};
+
+            if (bk_hard_dst(dst_ip, dst_port))
+                exempt = 0;
+
+            if (!exempt && bk_hold_syn(skb, run_id, &hold_a, &bk))
+                return 0;
+        }
+    }
+
     /* --- Hard blocks: invariants, checked before any rule. --- */
-    if (dst_ip == bpf_htonl(0xA9FEA9FE) ||
-        dst_ip == bpf_htonl(0xA9FEAA02) ||
-        dst_ip == bpf_htonl(0xA9FEAA17) ||
-        dst_ip == bpf_htonl(0x646464C8) ||
-        dst_ip == bpf_htonl(0xA9FE0017))
+    if (bk_meta_ip(dst_ip))
         return bk_deny(skb, dst_ip, dst_port, protocol, DROP_REASON_POLICY, &bk);
 
     if (dst_port == DOT_PORT)

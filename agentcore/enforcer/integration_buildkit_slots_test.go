@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -16,7 +17,10 @@ import (
 
 // bkHelperEnv makes the test binary act as the connecting workload: it
 // dials the target and exits 0 on success, 1 on failure.
-const bkHelperEnv = "LEITWACHT_BK_HELPER_TARGET"
+const (
+	bkHelperEnv        = "LEITWACHT_BK_HELPER_TARGET"
+	bkHelperTimeoutEnv = "LEITWACHT_BK_HELPER_TIMEOUT_MS"
+)
 
 func TestHelperBKConnect(t *testing.T) {
 	target := os.Getenv(bkHelperEnv)
@@ -24,7 +28,18 @@ func TestHelperBKConnect(t *testing.T) {
 		t.Skip("helper only")
 	}
 
-	c, err := net.DialTimeout("tcp4", target, 1500*time.Millisecond)
+	timeout := 1500 * time.Millisecond
+
+	if ms, perr := strconv.Atoi(os.Getenv(bkHelperTimeoutEnv)); perr == nil && ms > 0 {
+		timeout = time.Duration(ms) * time.Millisecond
+	}
+
+	network := "tcp4"
+	if strings.Contains(target, "[") {
+		network = "tcp6"
+	}
+
+	c, err := net.DialTimeout(network, target, timeout)
 	if err != nil {
 		os.Exit(1)
 	}
@@ -40,6 +55,13 @@ func TestHelperBKConnect(t *testing.T) {
 func runInCgroup(t *testing.T, cgroupDir, target string) bool {
 	t.Helper()
 
+	return runInCgroupTimeout(t, cgroupDir, target, 0)
+}
+
+// runInCgroupTimeout is runInCgroup with a dial timeout (0 = default).
+func runInCgroupTimeout(t *testing.T, cgroupDir, target string, timeout time.Duration) bool {
+	t.Helper()
+
 	fd, err := syscall.Open(cgroupDir, syscall.O_RDONLY|syscall.O_DIRECTORY, 0)
 	if err != nil {
 		t.Fatalf("open cgroup dir: %v", err)
@@ -49,6 +71,9 @@ func runInCgroup(t *testing.T, cgroupDir, target string) bool {
 
 	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperBKConnect$")
 	cmd.Env = append(os.Environ(), bkHelperEnv+"="+target)
+	if timeout > 0 {
+		cmd.Env = append(cmd.Env, bkHelperTimeoutEnv+"="+strconv.Itoa(int(timeout.Milliseconds())))
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: fd}
 
 	return cmd.Run() == nil
@@ -365,5 +390,308 @@ func TestIntegrationBuildKitSlotDatapath(t *testing.T) {
 
 	if !runInCgroup(t, children["run-a"], y) {
 		t.Error("after DeleteCgroupPolicy the cgroup must fall back to audit (pass)")
+	}
+}
+
+// TestIntegrationBuildKitSynHold checks the pre-bind SYN hold: a PENDING
+// RUN cgroup's first SYN is dropped (syn_held), the kernel retransmit
+// is judged by the slot once the cgroup is bound, and the hold never
+// outlives its window or applies while disabled.
+//
+// Needs root, cgroup v2, the BPF LSM and `ip`.
+func TestIntegrationBuildKitSynHold(t *testing.T) {
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+
+	platform := &LinuxPlatform{Logger: quietLog()}
+
+	dpIface, err := platform.LoadBuildKitEBPF([]net.IPNet{{IP: net.IPv4(169, 254, 0, 0), Mask: net.CIDRMask(16, 32)}})
+	if err != nil {
+		t.Fatalf("load egress_bk: %v", err)
+	}
+
+	dp := dpIface.(*linuxBKHandle)
+
+	t.Cleanup(func() { _ = dp.Close() })
+
+	if dp.lsm == nil {
+		t.Skip("BPF LSM unavailable")
+	}
+
+	const (
+		ipX  = "10.254.78.1"
+		ipY  = "10.254.78.2"
+		ipZ  = "10.254.78.3" // DNS upstream
+		port = 18444
+	)
+
+	for _, a := range []string{ipX, ipY, ipZ} {
+		if out, addErr := exec.Command("ip", "addr", "add", a+"/32", "dev", "lo").CombinedOutput(); addErr != nil {
+			t.Skipf("cannot add test address %s: %v (%s)", a, addErr, out)
+		}
+
+		a := a
+
+		t.Cleanup(func() { _ = exec.Command("ip", "addr", "del", a+"/32", "dev", "lo").Run() })
+
+		ln, listenErr := net.Listen("tcp4", net.JoinHostPort(a, strconv.Itoa(port)))
+		if listenErr != nil {
+			t.Fatalf("listen: %v", listenErr)
+		}
+
+		t.Cleanup(func() { _ = ln.Close() })
+
+		go func() {
+			for {
+				c, acceptErr := ln.Accept()
+				if acceptErr != nil {
+					return
+				}
+
+				_ = c.Close()
+			}
+		}()
+	}
+
+	parent := filepath.Join("/sys/fs/cgroup", fmt.Sprintf("lwtest-bkhold-%d", os.Getpid()))
+	if err = os.Mkdir(parent, 0o755); err != nil {
+		t.Fatalf("mkdir parent: %v", err)
+	}
+
+	names := []string{"deny", "allow", "off", "expiry", "meta", "v6", "dot", "dns"}
+	dirs := map[string]string{}
+	ids := map[string]uint64{}
+
+	t.Cleanup(func() {
+		for _, p := range dirs {
+			_ = os.Remove(p)
+		}
+
+		_ = os.Remove(parent)
+	})
+
+	for _, n := range names {
+		dirs[n] = filepath.Join(parent, n)
+		if err = os.Mkdir(dirs[n], 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		if ids[n], err = platform.CgroupID(dirs[n]); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	parentID, err := platform.CgroupID(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := BKConfig{ParentIDs: []uint64{parentID}, DNSUpstreams: []net.IP{net.ParseIP(ipZ)}, HoldWindow: 2 * time.Second}
+	if err = dp.SetConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = dp.AddSockKnownAncestor(parentID); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { dp.RemoveSockKnownAncestor(parentID) })
+
+	link, err := dp.AttachCgroup(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = link.Close() })
+
+	recorder := NewViolationRecorder(nil)
+
+	stop, err := dp.StartRingbufReader(t.Context(), func(uint64) *ViolationRecorder { return recorder })
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(stop)
+
+	// Slot 0 allows only X, enforce.
+	if err = dp.InstallSlot(0, BKSlotRules{Allow: []BuildIPRule{{IP: ipX, Port: port, Allow: true, Prio: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = dp.RemoveSlot(0) })
+
+	x := net.JoinHostPort(ipX, strconv.Itoa(port))
+	y := net.JoinHostPort(ipY, strconv.Itoa(port))
+
+	// IPv6 is optional: it needs a local address and a listener.
+	const ip6 = "fd00:254::1"
+
+	v6ok := false
+
+	if out, addErr := exec.Command("ip", "-6", "addr", "add", ip6+"/128", "dev", "lo", "nodad").CombinedOutput(); addErr == nil {
+		t.Cleanup(func() { _ = exec.Command("ip", "-6", "addr", "del", ip6+"/128", "dev", "lo").Run() })
+
+		if ln, lerr := net.Listen("tcp6", net.JoinHostPort(ip6, strconv.Itoa(port))); lerr == nil {
+			v6ok = true
+
+			t.Cleanup(func() { _ = ln.Close() })
+
+			go func() {
+				for {
+					c, acceptErr := ln.Accept()
+					if acceptErr != nil {
+						return
+					}
+
+					_ = c.Close()
+				}
+			}()
+		}
+	} else {
+		t.Logf("IPv6 hold case skipped: %v (%s)", addErr, out)
+	}
+
+	hasEvent := func(cg uint64, ip, action string) bool {
+		vs, _ := recorder.Snapshot()
+		for _, v := range vs {
+			if v.CgroupID == cg && v.IP == ip && v.Action == action {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	// connectBindingAfter dials target from the pending cgroup and binds
+	// it to the enforce slot 300 ms in (a stand-in for the join).
+	connectBindingAfter := func(name, target string) (bool, time.Duration) {
+		go func() {
+			time.Sleep(300 * time.Millisecond)
+
+			if setErr := dp.SetCgroupPolicy(ids[name], BKCgroupPolicy{Slot: 0, State: bkStateBound, Mode: bkModeBlock, Gen: 1}); setErr != nil {
+				t.Errorf("bind %s: %v", name, setErr)
+			}
+		}()
+
+		start := time.Now()
+		ok := runInCgroupTimeout(t, dirs[name], target, 5*time.Second)
+
+		return ok, time.Since(start)
+	}
+
+	if err = dp.SetHold(true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold on, slot denies Y: the first SYN is held, the retransmit after
+	// the bind is dropped by policy.
+	if ok, _ := connectBindingAfter("deny", y); ok {
+		t.Error("held SYN to a denied address got through after binding")
+	}
+
+	if !hasEvent(ids["deny"], ipY, ActionSynHeld) {
+		t.Error("no syn_held event for the pending cgroup")
+	}
+
+	// Hold covers the hard-blocked metadata address: held while pending,
+	// then dropped as a hard block by the enforce slot after binding.
+	const meta = "169.254.169.254"
+
+	if out, addErr := exec.Command("ip", "addr", "add", meta+"/32", "dev", "lo").CombinedOutput(); addErr != nil {
+		t.Logf("metadata hold case skipped: %v (%s)", addErr, out)
+	} else {
+		t.Cleanup(func() { _ = exec.Command("ip", "addr", "del", meta+"/32", "dev", "lo").Run() })
+
+		if ok, _ := connectBindingAfter("meta", net.JoinHostPort(meta, "80")); ok {
+			t.Error("metadata SYN got through the pre-bind window or the hard block")
+		}
+
+		if !hasEvent(ids["meta"], meta, ActionSynHeld) {
+			t.Error("pending SYN to the metadata address was not held")
+		}
+
+		if !hasEvent(ids["meta"], meta, "packet_dropped") {
+			t.Error("metadata retransmit after binding was not dropped as a hard block")
+		}
+	}
+
+	// Trusted nets and DNS upstreams exempt ordinary destinations from the
+	// hold, but never DoT (port 853) on a DNS upstream.
+	if ok, took := connectBindingAfter("dot", net.JoinHostPort(ipZ, "853")); ok || took < 800*time.Millisecond {
+		t.Errorf("DoT to a DNS upstream escaped the hold (ok=%v took=%v)", ok, took)
+	}
+
+	if !hasEvent(ids["dot"], ipZ, ActionSynHeld) {
+		t.Error("pending SYN to a DNS upstream on 853 was not held")
+	}
+
+	start0 := time.Now()
+	if !runInCgroupTimeout(t, dirs["dns"], net.JoinHostPort(ipZ, strconv.Itoa(port)), 5*time.Second) || time.Since(start0) > 700*time.Millisecond {
+		t.Error("a DNS-upstream destination must stay exempt from the hold")
+	}
+
+	if hasEvent(ids["dns"], ipZ, ActionSynHeld) {
+		t.Error("syn_held for an exempt DNS upstream")
+	}
+
+	// IPv6 SYNs from a pending cgroup are held too (and dropped once
+	// bound to an enforce slot, which has no IPv6 support).
+	if v6ok {
+		if ok, _ := connectBindingAfter("v6", net.JoinHostPort(ip6, strconv.Itoa(port))); ok {
+			t.Error("IPv6 SYN got through the pre-bind window")
+		}
+
+		if !hasEvent(ids["v6"], "::", ActionSynHeld) {
+			t.Error("pending IPv6 SYN was not held")
+		}
+	}
+
+	// Hold on, slot allows X: the connect succeeds after the retransmit.
+	ok, took := connectBindingAfter("allow", x)
+	if !ok {
+		t.Error("held SYN to an allowed address never connected after binding")
+	}
+
+	if took < 800*time.Millisecond {
+		t.Errorf("connect took %v; the SYN was not held until the retransmit", took)
+	}
+
+	if !hasEvent(ids["allow"], ipX, ActionSynHeld) {
+		t.Error("no syn_held event for the allowed destination")
+	}
+
+	// Hold disabled: a pending cgroup passes at once.
+	if err = dp.SetHold(false); err != nil {
+		t.Fatal(err)
+	}
+
+	start := time.Now()
+	if !runInCgroupTimeout(t, dirs["off"], y, 5*time.Second) || time.Since(start) > 700*time.Millisecond {
+		t.Errorf("hold disabled: pending connect must pass immediately (took %v)", time.Since(start))
+	}
+
+	if hasEvent(ids["off"], ipY, ActionSynHeld) {
+		t.Error("syn_held recorded while the hold was disabled")
+	}
+
+	// Window expiry: with a 300 ms window the 1 s retransmit passes in
+	// audit (never fail-closed).
+	cfg.HoldWindow = 300 * time.Millisecond
+	if err = dp.SetConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	if err = dp.SetHold(true); err != nil {
+		t.Fatal(err)
+	}
+
+	start = time.Now()
+	if !runInCgroupTimeout(t, dirs["expiry"], y, 5*time.Second) {
+		t.Error("after the hold window the pending cgroup must pass (audit)")
+	}
+
+	if took = time.Since(start); took < 800*time.Millisecond {
+		t.Errorf("expiry case took %v; the first SYN was not held", took)
 	}
 }

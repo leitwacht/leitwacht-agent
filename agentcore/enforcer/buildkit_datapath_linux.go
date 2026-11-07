@@ -100,6 +100,10 @@ type linuxBKHandle struct {
 	denyInner, hostInner, dnsInner *ebpf.MapSpec
 
 	mu sync.Mutex // serialises slot installs/removals
+
+	cfgMu      sync.Mutex // guards holdOn/holdNS and bk_cfg read-modify-write
+	holdOn     bool
+	holdWindow time.Duration
 }
 
 // AttachCgroup attaches the egress program at cgroupPath.
@@ -126,6 +130,16 @@ func (h *linuxBKHandle) SetConfig(c BKConfig) error {
 
 	copy(v.Parents[:], c.ParentIDs)
 
+	h.cfgMu.Lock()
+	defer h.cfgMu.Unlock()
+
+	h.holdWindow = c.HoldWindow
+	v.HoldNs = uint64(max(c.HoldWindow, 0))
+
+	if h.holdOn {
+		v.Flags |= bkCfgHoldEnabled
+	}
+
 	for i, ip := range c.DNSUpstreams {
 		ip4 := ip.To4()
 		if ip4 == nil {
@@ -139,6 +153,32 @@ func (h *linuxBKHandle) SetConfig(c BKConfig) error {
 	if err := h.objs.BkCfg.Put(uint32(0), &v); err != nil {
 		return fmt.Errorf("set bk_cfg: %w", err)
 	}
+
+	return nil
+}
+
+// SetHold flips the hold flag in bk_cfg, preserving everything else.
+func (h *linuxBKHandle) SetHold(enabled bool) error {
+	h.cfgMu.Lock()
+	defer h.cfgMu.Unlock()
+
+	var v ebpfBKBkCfgVal
+
+	if err := h.objs.BkCfg.Lookup(uint32(0), &v); err != nil {
+		return fmt.Errorf("read bk_cfg: %w", err)
+	}
+
+	if enabled {
+		v.Flags |= bkCfgHoldEnabled
+	} else {
+		v.Flags &^= bkCfgHoldEnabled
+	}
+
+	if err := h.objs.BkCfg.Put(uint32(0), &v); err != nil {
+		return fmt.Errorf("set bk_cfg hold: %w", err)
+	}
+
+	h.holdOn = enabled
 
 	return nil
 }
@@ -272,16 +312,26 @@ func (h *linuxBKHandle) SetCgroupPolicy(cgroupID uint64, p BKCgroupPolicy) error
 		return fmt.Errorf("put bk_cgroup_policy: %w", err)
 	}
 
+	// An entry ends the pending window; the first-seen stamp is spent.
+	h.dropPendingSince(cgroupID)
+
 	return nil
 }
 
 // DeleteCgroupPolicy removes a cgroup's entry.
 func (h *linuxBKHandle) DeleteCgroupPolicy(cgroupID uint64) error {
+	h.dropPendingSince(cgroupID)
+
 	if err := h.objs.BkCgroupPolicy.Delete(cgroupID); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 		return fmt.Errorf("delete bk_cgroup_policy: %w", err)
 	}
 
 	return nil
+}
+
+// dropPendingSince forgets a cgroup's hold first-seen stamp (idempotent).
+func (h *linuxBKHandle) dropPendingSince(cgroupID uint64) {
+	_ = h.objs.BkPendingSince.Delete(cgroupID)
 }
 
 // ReserveFailures reports lost events (ring full).

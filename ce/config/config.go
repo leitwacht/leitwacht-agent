@@ -77,7 +77,10 @@ type Config struct {
 	// comma-separated list of cgroup-parent directories to watch
 	// for RUN-container creates — usually the host-side path of
 	// buildkitd's per-build cgroup tree. Glob patterns are
-	// expanded at startup (one `*` per directory level).
+	// expanded at startup (one `*` per directory level). Each path
+	// must be dedicated to buildkitd's RUN cgroups: every descendant
+	// is treated as a build step, so the pre-bind SYN hold and
+	// enforcement apply to all of them.
 	BuildkitGRPCAddr    string
 	BuildkitCgroupPaths string
 

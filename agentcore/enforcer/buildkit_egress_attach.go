@@ -91,6 +91,8 @@ type buildKitAttachConfig struct {
 	bindings BindingLookup
 
 	joinWindow time.Duration
+	// holdWindow is the pre-bind SYN hold window (0 disables the hold).
+	holdWindow time.Duration
 
 	policySrc  BuildPolicySource
 	registry   *SessionRegistry
@@ -190,7 +192,7 @@ func StartBuildKitEgressAttach(
 		return nil, nil //nolint:nilnil // documented: no paths == opt-out, not error
 	}
 
-	cfg := buildKitAttachConfig{sessions: lookupBuildKitSessions, bindings: lookupBuildKitEventBinding, joinWindow: joinPendingWindow}
+	cfg := buildKitAttachConfig{sessions: lookupBuildKitSessions, bindings: lookupBuildKitEventBinding, joinWindow: joinPendingWindow, holdWindow: DefaultSynHoldWindow}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -483,6 +485,18 @@ func (b *BuildKitEgressAttach) collect(final bool, interval time.Duration) ([]Vi
 // JoinPendingWindowFor to derive it from a non-default timeout.
 const joinPendingWindow = 3 * time.Second
 
+// DefaultSynHoldWindow is the default pre-bind SYN hold window: the
+// joiner's deferred-match deadline.
+const DefaultSynHoldWindow = 2 * time.Second
+
+// WithBuildKitSynHoldWindow sets how long a RUN cgroup without a policy
+// entry has its TCP SYNs held (dropped so the kernel retransmit lands
+// after binding) while an enforce policy is in play. Zero disables the
+// hold. Default DefaultSynHoldWindow.
+func WithBuildKitSynHoldWindow(d time.Duration) BuildKitAttachOption {
+	return func(c *buildKitAttachConfig) { c.holdWindow = d }
+}
+
 // JoinPendingWindowFor derives the hold window from the joiner's
 // deferred-match timeout (the WithDeferredMatch value) plus one second of
 // margin.
@@ -743,7 +757,7 @@ func startBuildKitSlotAttach(
 		return nil, fmt.Errorf("%w: %d", errBKConfigRange, cfg.runLevel)
 	}
 
-	err = dp.SetConfig(BKConfig{ParentIDs: parentIDs, DNSUpstreams: cfg.dns, RunLevel: uint32(cfg.runLevel)}) //nolint:gosec // range-checked above
+	err = dp.SetConfig(BKConfig{ParentIDs: parentIDs, DNSUpstreams: cfg.dns, RunLevel: uint32(cfg.runLevel), HoldWindow: cfg.holdWindow}) //nolint:gosec // range-checked above
 	if err != nil {
 		cleanup(nil)
 
@@ -841,6 +855,8 @@ func startBuildKitSlotAttach(
 			reg.ClearBindingObserver(binder)
 			prev()
 		}
+
+		b.binder.RefreshHold()
 
 		go b.binder.Run(ctx)
 	}

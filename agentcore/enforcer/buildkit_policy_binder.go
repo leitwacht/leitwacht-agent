@@ -173,6 +173,14 @@ type BuildPolicyBinder struct {
 	dnsUpstreams []net.IP
 	fqdnLogged   map[slotKey]bool
 
+	// Pre-bind SYN hold: the datapath flag follows "is any enforce
+	// policy in play". enforceSeen records when a session registration
+	// last prefetched an enforce-mode policy for a key (covers the gap
+	// before the session is visible in the session lookup).
+	holdMu      sync.Mutex
+	holdOn      bool
+	enforceSeen map[PolicyKey]time.Time
+
 	// capacityEvents counts cgroups left in audit for lack of slot or
 	// map capacity; surfaced through Stats.
 	capacityEvents atomic.Int64
@@ -251,7 +259,8 @@ func NewBuildPolicyBinder(src BuildPolicySource, dp BuildKitDatapath, log *slog.
 		retired:  map[uint64]retiredDecision{},
 		policies: map[PolicyKey]cachedPolicy{},
 
-		fqdnLogged: map[slotKey]bool{},
+		fqdnLogged:  map[slotKey]bool{},
+		enforceSeen: map[PolicyKey]time.Time{},
 	}
 
 	for _, o := range opts {
@@ -281,6 +290,7 @@ func (b *BuildPolicyBinder) Run(ctx context.Context) {
 		case <-t.C:
 			b.Sweep()
 			b.GC(b.now())
+			b.RefreshHold()
 		}
 	}
 }
@@ -620,7 +630,93 @@ func (b *BuildPolicyBinder) OnSessionRegistered(attrs map[string]string) {
 		return
 	}
 
-	go func() { _, _ = b.fetch(k) }()
+	go func() {
+		pol, err := b.fetch(k)
+		if err == nil && pol.Mode == BuildModeEnforce {
+			b.holdMu.Lock()
+			b.enforceSeen[k] = b.now()
+			b.holdMu.Unlock()
+		}
+
+		b.RefreshHold()
+	}()
+}
+
+// holdSeenTTL is how long a prefetched enforce policy keeps the SYN hold
+// on without the session being visible in the session lookup.
+const holdSeenTTL = time.Minute
+
+// RefreshHold sets the datapath's pre-bind SYN hold: on while a bound
+// cgroup is in enforce, or an open session's cached policy is enforce,
+// or an enforce policy was prefetched in the last minute. Audit/shadow
+// only clusters never pay the hold latency. Idempotent; safe to call
+// often.
+func (b *BuildPolicyBinder) RefreshHold() {
+	if b.dp == nil {
+		return
+	}
+
+	now := b.now()
+	want := false
+	enforceKeys := map[PolicyKey]bool{}
+
+	b.mu.Lock()
+
+	for _, d := range b.cgs {
+		if d.state == bkStateBound && d.mode == bkModeBlock {
+			want = true
+
+			break
+		}
+	}
+
+	for k, c := range b.policies {
+		if c.err == nil && c.pol.Mode == BuildModeEnforce {
+			enforceKeys[k] = true
+		}
+	}
+
+	b.mu.Unlock()
+
+	if !want {
+		b.holdMu.Lock()
+		for k, at := range b.enforceSeen {
+			if now.Sub(at) < holdSeenTTL {
+				want = true
+			} else {
+				delete(b.enforceSeen, k)
+			}
+		}
+		b.holdMu.Unlock()
+	}
+
+	if !want && len(enforceKeys) > 0 && b.sessions != nil {
+		cands, _ := b.sessions(now)
+
+		for _, s := range activeSessionsAt(cands, now) {
+			if !s.Completed && enforceKeys[keyFromAttrs(s.FrontendAttrs)] {
+				want = true
+
+				break
+			}
+		}
+	}
+
+	b.holdMu.Lock()
+	defer b.holdMu.Unlock()
+
+	if want == b.holdOn {
+		return
+	}
+
+	if err := b.dp.SetHold(want); err != nil {
+		b.log.Warn("buildkit policy: cannot set pre-bind SYN hold", "enabled", want, "error", err)
+
+		return
+	}
+
+	b.holdOn = want
+	b.log.Info("buildkit pre-bind SYN hold", "enabled", want)
 }
 
 // OnUnbind implements BindingObserver.
@@ -1138,13 +1234,23 @@ func degradedReasonFor(reason string) string {
 
 func enforcementStateFor(action string, dec *cgDecision) string {
 	switch action {
-	case "packet_dropped", "sinkhole_hit":
+	case "packet_dropped", "sinkhole_hit", "dns_bypass_dropped":
 		return EnfStateEnforced
 	case "would_block":
 		return EnfStateShadow
 	}
 
 	if dec.state == bkStateBound {
+		// Every verdict of a bound cgroup (allowed, observed, ...) takes
+		// the state of the slot's mode; audit_project is for genuinely
+		// audit slots only.
+		switch dec.mode {
+		case bkModeBlock:
+			return EnfStateEnforced
+		case bkModeShadow:
+			return EnfStateShadow
+		}
+
 		return EnfStateAuditProject
 	}
 

@@ -26,6 +26,9 @@ type fakeDP struct {
 	failSlots bool
 	failCgs   bool
 
+	hold      bool
+	holdCalls int
+
 	cfg       BKConfig
 	attached  []string
 	ring      func(uint64) *ViolationRecorder
@@ -51,6 +54,16 @@ func (f *fakeDP) SetConfig(c BKConfig) error {
 	defer f.mu.Unlock()
 
 	f.cfg = c
+
+	return nil
+}
+
+func (f *fakeDP) SetHold(on bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.hold = on
+	f.holdCalls++
 
 	return nil
 }
@@ -879,10 +892,12 @@ func TestAnnotate_StateFromVerdict(t *testing.T) {
 		{CgroupID: 1, Action: "would_block", Timestamp: r.clk.now()},
 		{CgroupID: 1, Action: "packet_allowed", Timestamp: r.clk.now()},
 		{CgroupID: 1, Action: "packet_observed", Timestamp: r.clk.now()},
+		{CgroupID: 1, Action: "dns_bypass_dropped", Timestamp: r.clk.now()},
 	}
 	r.b.Annotate(rows)
 
-	want := []string{EnfStateEnforced, EnfStateEnforced, EnfStateShadow, EnfStateAuditProject, EnfStateAuditProject}
+	// Every verdict of an enforce slot carries "enforced", not audit_project.
+	want := []string{EnfStateEnforced, EnfStateEnforced, EnfStateShadow, EnfStateEnforced, EnfStateEnforced, EnfStateEnforced}
 	for i, w := range want {
 		if rows[i].EnforcementState != w {
 			t.Errorf("row %d (%s) state = %q, want %q", i, rows[i].Action, rows[i].EnforcementState, w)
@@ -952,6 +967,7 @@ func TestActionForVerdict(t *testing.T) {
 		{bkVerdictDropped, dropReasonPolicy, "packet_dropped"},
 		{bkVerdictDropped, dropReasonSinkhole, "sinkhole_hit"},
 		{bkVerdictAllowed, 0, "packet_allowed"},
+		{bkVerdictHeld, dropReasonPolicy, "syn_held"},
 		{0, dropReasonPolicy, "packet_observed"},
 	} {
 		if got := ActionForVerdict(tc.verdict, tc.reason); got != tc.want {
@@ -1125,4 +1141,143 @@ func mkdirAndWrite(dir, name, content string) error {
 	}
 
 	return os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600)
+}
+
+func TestAnnotate_StateFollowsSlotMode(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		mode BuildPolicyMode
+		want map[string]string
+	}{
+		{BuildModeShadow, map[string]string{
+			"packet_allowed": EnfStateShadow, "packet_observed": EnfStateShadow,
+			"would_block": EnfStateShadow, "dns_bypass_dropped": EnfStateEnforced,
+		}},
+		{BuildModeAudit, map[string]string{
+			"packet_allowed": EnfStateAuditProject, "packet_observed": EnfStateAuditProject,
+		}},
+	} {
+		r := newRig()
+		pol := enforcePol(1, "1.1.1.1")
+		pol.Mode = tc.mode
+		r.src.set("g/a", "j", pol)
+		r.b.OnBind(1, exactBinding("g/a", "j"))
+
+		for action, want := range tc.want {
+			rows := []Violation{{CgroupID: 1, Action: action, Timestamp: r.clk.now()}}
+			r.b.Annotate(rows)
+
+			if rows[0].EnforcementState != want {
+				t.Errorf("mode %s action %s: state %q, want %q", tc.mode, action, rows[0].EnforcementState, want)
+			}
+		}
+	}
+}
+
+func TestRefreshHold_FollowsEnforcePolicies(t *testing.T) {
+	t.Parallel()
+
+	r := newRig()
+
+	r.b.RefreshHold()
+
+	if r.dp.hold {
+		t.Fatal("hold on with no policies")
+	}
+
+	// A shadow-only binding never turns the hold on.
+	shadow := enforcePol(1, "1.1.1.1")
+	shadow.Mode = BuildModeShadow
+	r.src.set("g/s", "j", shadow)
+	r.b.OnBind(1, exactBinding("g/s", "j"))
+	r.b.RefreshHold()
+
+	if r.dp.hold {
+		t.Fatal("hold on for a shadow-only cluster")
+	}
+
+	// A bound enforce cgroup does.
+	r.src.set("g/e", "j", enforcePol(1, "1.1.1.1"))
+	r.b.OnBind(2, exactBinding("g/e", "j"))
+	r.b.RefreshHold()
+
+	if !r.dp.hold {
+		t.Fatal("hold off with a bound enforce cgroup")
+	}
+
+	calls := r.dp.holdCalls
+	r.b.RefreshHold()
+
+	if r.dp.holdCalls != calls {
+		t.Fatal("RefreshHold must not rewrite an unchanged flag")
+	}
+
+	r.b.OnUnbind(2)
+	r.b.RefreshHold()
+
+	if r.dp.hold {
+		t.Fatal("hold still on after the last enforce cgroup went away")
+	}
+}
+
+func TestRefreshHold_PrefetchedEnforceSession(t *testing.T) {
+	t.Parallel()
+
+	r := newRig()
+	r.src.set("g/e", "j", enforcePol(1, "1.1.1.1"))
+
+	// A session registration prefetches the policy; the hold must be on
+	// before any cgroup of the session exists, and expire afterwards.
+	r.b.OnSessionRegistered(map[string]string{FrontendAttrKeyProjectPath: "g/e", FrontendAttrKeyJobName: "j"})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r.dp.mu.Lock()
+		on := r.dp.hold
+		r.dp.mu.Unlock()
+
+		if on {
+			break
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !r.dp.hold {
+		t.Fatal("hold not enabled by an enforce session prefetch")
+	}
+
+	r.clk.advance(holdSeenTTL + time.Second)
+	r.b.RefreshHold()
+
+	if r.dp.hold {
+		t.Fatal("hold must lapse once the prefetch is stale and no session is open")
+	}
+}
+
+func TestAnnotate_HeldSynReevaluatedAfterBind(t *testing.T) {
+	t.Parallel()
+
+	r := newRig()
+	r.src.set("g/a", "j", enforcePol(1, "1.1.1.1"))
+	r.b.OnBind(1, exactBinding("g/a", "j"))
+
+	rows := []Violation{
+		{CgroupID: 1, IP: "9.9.9.9", Port: 443, Action: ActionSynHeld, EnforcementState: EnfStatePendingBind, Timestamp: r.clk.now()},
+		{CgroupID: 1, IP: "1.1.1.1", Port: 443, Action: ActionSynHeld, EnforcementState: EnfStatePendingBind, Timestamp: r.clk.now()},
+	}
+	r.b.Annotate(rows)
+
+	if !rows[0].WouldBlock {
+		t.Error("held SYN to a destination the slot denies must be would_block")
+	}
+
+	if rows[1].WouldBlock {
+		t.Error("held SYN to a destination the slot allows must not be would_block")
+	}
+
+	if rows[0].EnforcementState != EnfStatePendingBind {
+		t.Errorf("held row state = %q, want pending_bind", rows[0].EnforcementState)
+	}
 }

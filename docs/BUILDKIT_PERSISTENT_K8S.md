@@ -143,6 +143,8 @@ buildkit:
     - /sys/fs/cgroup/kubepods.slice/*/*/buildkit
 ```
 
+**Dedicated parents only.** Each path must be a cgroup dedicated to buildkitd's RUN cgroups: the datapath treats every descendant as a build step, so the pre-bind SYN hold and enforcement apply to everything under it. Never point it at a parent that also holds other workloads.
+
 Make sure your buildkitd pod's NetworkPolicy allows ingress on its
 Control gRPC port from the agent's namespace. If your buildkitd runs
 under a NetworkPolicy that restricts ingress to specific namespaces,

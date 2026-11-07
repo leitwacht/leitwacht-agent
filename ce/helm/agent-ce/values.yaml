@@ -192,6 +192,10 @@ buildkit:
   #   - /sys/fs/cgroup/kubepods.slice/*/*/buildkit
   # Typical bare-metal Docker shape:
   #   - /sys/fs/cgroup/system.slice/docker-*.scope/buildkit
+  # Each path must be a cgroup dedicated to buildkitd's RUN cgroups: the
+  # datapath treats every descendant as a build step, so the pre-bind SYN
+  # hold and enforcement apply to everything under it. Never point it at a
+  # parent that also holds other workloads.
   cgroupPaths: []
 
   # When true, refuse Solve sessions whose FrontendAttrs lack any

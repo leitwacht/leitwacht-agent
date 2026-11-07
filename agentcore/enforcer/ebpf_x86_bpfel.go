@@ -19,6 +19,13 @@ type ebpfAllowKey struct {
 	Port uint16
 }
 
+type ebpfDedupKey struct {
+	_        structs.HostLayout
+	Ip       uint32
+	Port     uint16
+	CgroupId uint64
+}
+
 type ebpfDropEvent struct {
 	_          structs.HostLayout
 	DstIp      uint32

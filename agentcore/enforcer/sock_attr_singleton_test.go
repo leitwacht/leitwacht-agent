@@ -701,3 +701,134 @@ func firstNonLoopbackIPv4(t *testing.T) string {
 
 	return ""
 }
+
+// TestEgressDedupIsPerCgroup is the regression test for concurrent
+// workloads losing events: two processes in different cgroups of one
+// monitored subtree connect to the SAME ip:port at the same moment. The
+// kernel-side 1s dedup used to be keyed on ip:port only, so the second
+// workload's event was suppressed. Both must be reported with their own
+// pid.
+func TestEgressDedupIsPerCgroup(t *testing.T) { //nolint:gocognit,cyclop // linear end-to-end scenario
+	if os.Getuid() != 0 {
+		t.Skip("requires root")
+	}
+
+	ShutdownSentinelLSM()
+	t.Cleanup(ShutdownSentinelLSM)
+
+	platform := &LinuxPlatform{Logger: testLogger()}
+
+	h, err := platform.LoadEBPF(true, nil)
+	if err != nil {
+		t.Skip("LoadEBPF unavailable on this host: ", err)
+	}
+	defer h.Close() //nolint:errcheck // test cleanup
+
+	reg, ok := h.(SockAncestorRegistrar)
+	if !ok {
+		t.Fatal("handle lacks SockAncestorRegistrar")
+	}
+
+	ownIP := firstNonLoopbackIPv4(t)
+	root := filepath.Join("/sys/fs/cgroup", fmt.Sprintf("lwtest-dedup-%d", os.Getpid()))
+	dirs := []string{root, filepath.Join(root, "run1"), filepath.Join(root, "run2")}
+
+	for _, d := range dirs {
+		if mkErr := os.Mkdir(d, 0o755); mkErr != nil {
+			t.Skip("cannot create test cgroup: ", mkErr)
+		}
+	}
+
+	t.Cleanup(func() {
+		for i := len(dirs) - 1; i >= 0; i-- {
+			_ = os.Remove(dirs[i])
+		}
+	})
+
+	link, err := h.AttachCgroup(root)
+	if err != nil {
+		t.Fatalf("AttachCgroup: %v", err)
+	}
+	defer link.Close() //nolint:errcheck // test cleanup
+
+	id, _ := platform.CgroupID(root)
+	if err := reg.AddSockKnownAncestor(id); err != nil {
+		t.Fatalf("AddSockKnownAncestor: %v", err)
+	}
+	defer reg.RemoveSockKnownAncestor(id)
+
+	recorder := NewViolationRecorder(nil)
+	audit := &atomic.Bool{}
+	audit.Store(true)
+
+	stop, err := h.StartRingbufReader(t.Context(), func(uint64) *ViolationRecorder { return recorder }, audit)
+	if err != nil {
+		t.Fatalf("StartRingbufReader: %v", err)
+	}
+	defer stop()
+
+	ln, err := net.Listen("tcp4", ownIP+":0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close() //nolint:errcheck // test cleanup
+
+	go func() {
+		for {
+			conn, accErr := ln.Accept()
+			if accErr != nil {
+				return
+			}
+
+			conn.Close() //nolint:errcheck,gosec // test
+		}
+	}()
+
+	addr := ln.Addr().String()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	var cmds []*exec.Cmd
+
+	for _, cg := range dirs[1:] {
+		fd, openErr := os.Open(cg)
+		if openErr != nil {
+			t.Fatalf("open cgroup: %v", openErr)
+		}
+		defer fd.Close() //nolint:errcheck // test cleanup
+
+		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperDialProcess$") //nolint:gosec // re-exec of the test binary
+		cmd.Env = append(os.Environ(), "LW_DIAL_ADDR="+addr)
+		cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(fd.Fd())}
+		cmds = append(cmds, cmd)
+	}
+
+	// Start both back to back so their connects land inside one second.
+	for _, c := range cmds {
+		if startErr := c.Start(); startErr != nil {
+			t.Fatalf("start: %v", startErr)
+		}
+	}
+
+	for _, c := range cmds {
+		_ = c.Wait()
+	}
+
+	time.Sleep(500 * time.Millisecond)
+
+	violations, _, _ := recorder.SnapshotAndReset()
+
+	for _, c := range cmds {
+		var seen bool
+
+		for _, v := range violations {
+			if v.IP == ownIP && v.Port == port && int(v.PID) == c.Process.Pid {
+				seen = true
+			}
+		}
+
+		if !seen {
+			t.Errorf("no event for pid %d: concurrent same-destination connect was deduped away (%d events)",
+				c.Process.Pid, len(violations))
+		}
+	}
+}

@@ -47,6 +47,14 @@ type SessionRegistry struct {
 	// enrichment (Phase 3).
 	cgroupIndex map[uint64]CgroupBinding
 
+	// version is bumped on every change to sessions or vertices; the
+	// candidate snapshot cache is valid only for the version it was built
+	// at (and for candidateCacheTTL).
+	version atomic.Uint64
+
+	candMu    sync.Mutex
+	candCache candidateSnapshot
+
 	// retired keeps the final binding of cgroups removed from the index
 	// (runc tore the RUN container down) for retiredRetention, so egress
 	// recorded from a short-lived RUN step can still be resolved when the
@@ -582,6 +590,41 @@ func (r *SessionRegistry) UnlinkCgroup(cgroupID uint64) {
 	delete(r.cgroupIndex, cgroupID)
 }
 
+// vertexHasCgroup reports whether a (non-ambiguous) binding, live or
+// retired, already names this session and vertex.
+func (r *SessionRegistry) vertexHasCgroup(session, digest string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	for _, b := range r.cgroupIndex {
+		if !b.Ambiguous && b.SessionRef == session && b.VertexDigest == digest {
+			return true
+		}
+	}
+
+	for _, rb := range r.retired {
+		if !rb.binding.Ambiguous && rb.binding.SessionRef == session && rb.binding.VertexDigest == digest &&
+			time.Since(rb.retiredAt) < retiredRetention {
+			return true
+		}
+	}
+
+	return false
+}
+
+// retireContainer moves the binding for cgroupID to the retired cache,
+// but only if it still belongs to containerID (a recycled cgroup id may
+// by now name a different, live container).
+func (r *SessionRegistry) retireContainer(cgroupID uint64, containerID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if b, ok := r.cgroupIndex[cgroupID]; ok && b.ContainerID == containerID {
+		r.retireLocked(cgroupID, b)
+		delete(r.cgroupIndex, cgroupID)
+	}
+}
+
 // SetStatFn installs the cgroup-path → cgroup-id resolver used to
 // verify bindings on lookup. The joiner installs its own at
 // construction.
@@ -710,6 +753,93 @@ func (r *SessionRegistry) PendingVertices() []PendingVertex {
 	return out
 }
 
+// vertexStartGrace tolerates clock skew between buildkitd's vertex start
+// timestamp and the agent's view of when a cgroup appeared. There is no
+// grace after completion: a vertex that finished before the cgroup
+// appeared cannot own it.
+const vertexStartGrace = time.Second
+
+// candidateCacheTTL bounds how long one snapshot serves all pending
+// cgroups' polls, so N cgroups polling every few ms share one scan.
+const candidateCacheTTL = 20 * time.Millisecond
+
+// completedRecency limits which completed vertices are kept in the
+// snapshot.
+const completedRecency = time.Minute
+
+type completedVertex struct {
+	v                     PendingVertex
+	startedAt, completeAt time.Time
+}
+
+type candidateSnapshot struct {
+	built     time.Time
+	version   uint64
+	pending   []PendingVertex
+	completed []completedVertex
+}
+
+func (r *SessionRegistry) candidateSnapshot() candidateSnapshot {
+	r.candMu.Lock()
+	defer r.candMu.Unlock()
+
+	ver := r.version.Load()
+	if r.candCache.version == ver && !r.candCache.built.IsZero() && time.Since(r.candCache.built) < candidateCacheTTL {
+		return r.candCache
+	}
+
+	snap := candidateSnapshot{built: time.Now(), version: ver, pending: r.PendingVertices()}
+
+	r.mu.RLock()
+
+	for _, s := range r.sessions {
+		for _, v := range s.Vertices {
+			if !v.Completed || v.StartedAt.IsZero() || v.CompletedAt.IsZero() || time.Since(v.CompletedAt) > completedRecency {
+				continue
+			}
+
+			snap.completed = append(snap.completed, completedVertex{
+				v: PendingVertex{
+					SessionRef: s.Ref, VertexDigest: v.Digest, VertexName: v.Name,
+					FrontendAttrs: cloneStringMap(s.FrontendAttrs), Authorized: s.Authorized,
+					Placeholder: s.placeholder, Completed: true,
+				},
+				startedAt: v.StartedAt, completeAt: v.CompletedAt,
+			})
+		}
+	}
+
+	r.mu.RUnlock()
+
+	r.candCache = snap
+
+	return snap
+}
+
+// CandidateVertices returns the vertices a RUN cgroup that appeared at
+// `at` may belong to: every started, not-yet-completed vertex (as
+// PendingVertices), plus vertices already completed whose interval
+// covers `at` (marked Completed). A fast RUN step can finish, and
+// BuildKit report it completed, before the join layer reads the cgroup.
+//
+// Completed candidates may only WIDEN a match set; the joiner never
+// single-links on completed candidates alone (see completedOnlySafe).
+func (r *SessionRegistry) CandidateVertices(at time.Time) []PendingVertex {
+	snap := r.candidateSnapshot()
+
+	out := append([]PendingVertex(nil), snap.pending...)
+
+	for _, c := range snap.completed {
+		if at.Before(c.startedAt.Add(-vertexStartGrace)) || at.After(c.completeAt) {
+			continue
+		}
+
+		out = append(out, c.v)
+	}
+
+	return out
+}
+
 // PendingVertex is the join-layer's view of an in-flight vertex.
 // Carries the human name (used for cmdline matching), the session's
 // FrontendAttrs (used as the tiebreaker on collisions), and the
@@ -725,6 +855,11 @@ type PendingVertex struct {
 	// been seen yet, so Authorized reflects missing attrs rather than
 	// a real decision. The joiner retries instead of acting on it.
 	Placeholder bool
+
+	// Completed marks a candidate that had already completed when the
+	// join looked (a fast step); it is only trustworthy together with
+	// other evidence, never alone.
+	Completed bool
 }
 
 // SetCIRequirement configures the registry's kill-switch policy.
@@ -804,6 +939,7 @@ func (r *SessionRegistry) evaluateAuthorization(attrs map[string]string) bool {
 func (r *SessionRegistry) RegisterSession(ref string, startedAt time.Time, attrs map[string]string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.version.Add(1)
 
 	if existing, exists := r.sessions[ref]; exists {
 		existing.lastActivity = time.Now()
@@ -856,6 +992,7 @@ func (r *SessionRegistry) CompleteSession(ref string, completedAt time.Time) {
 func (r *SessionRegistry) DropSession(ref string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.version.Add(1)
 
 	if s, ok := r.sessions[ref]; ok {
 		r.entombLocked(s, time.Now())
@@ -928,6 +1065,7 @@ func (r *SessionRegistry) UpsertVertex(ref string, v VertexState) {
 	}
 
 	s.lastActivity = time.Now()
+	r.version.Add(1)
 
 	existing, ok := s.Vertices[v.Digest]
 	if !ok {
@@ -965,6 +1103,7 @@ func (r *SessionRegistry) UpsertVertex(ref string, v VertexState) {
 func (r *SessionRegistry) Sweep(cutoff time.Time) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.version.Add(1)
 
 	maxAge := r.maxSessionAge
 	if maxAge <= 0 {

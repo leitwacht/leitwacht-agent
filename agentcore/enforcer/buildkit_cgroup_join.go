@@ -120,6 +120,27 @@ type CgroupJoiner struct {
 type pendingDeferredMatch struct {
 	cancel context.CancelFunc
 	done   chan struct{}
+
+	// removed is closed when the cgroup's remove event arrives while the
+	// match is still pending. The goroutine then makes one last attempt
+	// with the argv it captured while the process was alive, so a RUN
+	// step that finishes before it could be matched is still linked
+	// (its binding is retired, not live, by handleRemove).
+	removed     chan struct{}
+	removedOnce sync.Once
+}
+
+func (p *pendingDeferredMatch) signalRemoved() { p.removedOnce.Do(func() { close(p.removed) }) }
+
+// matchState carries what a join attempt learned about one cgroup across
+// retries: its argv (read while the process was alive; a fast RUN step
+// can exit, emptying cgroup.procs, before the next attempt) and when the
+// cgroup appeared (to select vertices that were running then).
+type matchState struct {
+	pid  int
+	argv []string
+	at   time.Time
+	gone bool // the cgroup was removed while the match was pending
 }
 
 // JoinerOption tunes a CgroupJoiner at construction.
@@ -167,7 +188,7 @@ func NewCgroupJoiner(registry *SessionRegistry, source CgroupEventSource, logger
 		procRoot:              "/proc",
 		statFn:                defaultStatFn,
 		deferredMatchTimeout:  2 * time.Second,
-		deferredMatchInterval: 100 * time.Millisecond,
+		deferredMatchInterval: 25 * time.Millisecond,
 	}
 
 	for _, opt := range opts {
@@ -255,7 +276,9 @@ func (j *CgroupJoiner) handleCreate(ctx context.Context, evt CgroupCreateEvent) 
 	// First attempt runs synchronously so the happy fast-path
 	// (cgroup already populated, vertex already announced) takes
 	// no goroutine. The deferred loop only spawns when this misses.
-	if j.tryMatch(ctx, cgroupID, evt, j.deferredMatchTimeout <= 0) {
+	st := &matchState{at: time.Now()}
+
+	if j.tryMatchState(ctx, cgroupID, evt, j.deferredMatchTimeout <= 0, st) {
 		return
 	}
 
@@ -270,8 +293,9 @@ func (j *CgroupJoiner) handleCreate(ctx context.Context, evt CgroupCreateEvent) 
 	// exit before doing its unlink walk.
 	pendingCtx, cancel := context.WithCancel(ctx)
 	pending := &pendingDeferredMatch{
-		cancel: cancel,
-		done:   make(chan struct{}),
+		cancel:  cancel,
+		done:    make(chan struct{}),
+		removed: make(chan struct{}),
 	}
 
 	// runc reuses container IDs across builds (rare but possible). If a
@@ -285,10 +309,11 @@ func (j *CgroupJoiner) handleCreate(ctx context.Context, evt CgroupCreateEvent) 
 	}
 
 	go func() {
+		defer cancel()
 		defer close(pending.done)
 		defer j.inflight.CompareAndDelete(evt.ContainerID, pending)
 
-		j.deferredMatch(pendingCtx, cgroupID, evt)
+		j.deferredMatch(pendingCtx, cgroupID, evt, pending, st)
 	}()
 }
 
@@ -305,18 +330,38 @@ func (j *CgroupJoiner) handleCreate(ctx context.Context, evt CgroupCreateEvent) 
 // cgroup: an unattributable RUN container must not run unchecked.
 // Without enforcement a miss only leaves the cgroup unbound.
 func (j *CgroupJoiner) tryMatch(ctx context.Context, cgroupID uint64, evt CgroupCreateEvent, final bool) bool {
-	pid, err := readFirstPID(evt.CgroupPath)
-	if err != nil {
-		return j.noMatch(ctx, cgroupID, evt, final)
+	return j.tryMatchState(ctx, cgroupID, evt, final, &matchState{at: time.Now()})
+}
+
+func (j *CgroupJoiner) tryMatchState(
+	ctx context.Context, cgroupID uint64, evt CgroupCreateEvent, final bool, st *matchState,
+) bool {
+	if st.argv == nil {
+		pid, err := readFirstPID(evt.CgroupPath)
+		if err != nil {
+			return j.noMatch(ctx, cgroupID, evt, final)
+		}
+
+		argv, err := readArgv(j.procRoot, pid)
+		if err != nil {
+			return j.noMatch(ctx, cgroupID, evt, final)
+		}
+
+		st.pid, st.argv = pid, argv
 	}
 
-	argv, err := readArgv(j.procRoot, pid)
-	if err != nil {
-		return j.noMatch(ctx, cgroupID, evt, final)
-	}
+	argv, pid := st.argv, st.pid
 
-	pending := j.registry.PendingVertices()
+	pending := j.registry.CandidateVertices(st.at)
 	matches := matchPendingByArgv(pending, argv)
+
+	// Completed vertices only widen a set. If they are all there is, a
+	// single link could pick another session's finished step with the
+	// same text (the real owner's vertex not announced yet), so unless
+	// that is provably safe the cgroup stays unbound.
+	if len(matches) > 0 && allCompleted(matches) && !j.completedOnlySafe(matches, st.at) {
+		return j.noMatch(ctx, cgroupID, evt, final)
+	}
 
 	if len(matches) == 0 {
 		if weak := matchPendingByTail(pending, argv); len(weak) > 0 {
@@ -608,22 +653,43 @@ func anyPlaceholder(ms []PendingVertex) bool {
 // vertex. One goroutine per cgroup create; bounded by buildkit's
 // max-parallelism (typically low tens). The attempt at or after the
 // deadline is the final one (see tryMatch).
-func (j *CgroupJoiner) deferredMatch(ctx context.Context, cgroupID uint64, evt CgroupCreateEvent) {
+func (j *CgroupJoiner) deferredMatch(
+	ctx context.Context, cgroupID uint64, evt CgroupCreateEvent, pending *pendingDeferredMatch, st *matchState,
+) {
 	deadline := time.Now().Add(j.deferredMatchTimeout)
 
 	tick := time.NewTicker(j.deferredMatchInterval)
 	defer tick.Stop()
 
+	removedCh := pending.removed
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-removedCh:
+			// The cgroup is gone. Without a captured argv nothing can
+			// ever match. With one, keep matching (the vertex may be
+			// announced after the step already finished) until the
+			// deadline; a late link is retired immediately below, never
+			// left live for a cgroup that no longer exists.
+			removedCh = nil
+
+			if st.argv == nil {
+				return
+			}
+
+			st.gone = true
 		case <-tick.C:
 		}
 
 		final := !time.Now().Before(deadline)
 
-		if j.tryMatch(ctx, cgroupID, evt, final) {
+		if j.tryMatchState(ctx, cgroupID, evt, final, st) {
+			if st.gone {
+				j.registry.retireContainer(cgroupID, evt.ContainerID) // the cgroup no longer exists
+			}
+
 			return
 		}
 
@@ -677,8 +743,9 @@ func (j *CgroupJoiner) handleRemove(evt CgroupRemoveEvent) {
 	// persist until process exit.
 	if v, ok := j.inflight.LoadAndDelete(evt.ContainerID); ok {
 		pending := v.(*pendingDeferredMatch)
-		pending.cancel()
-		<-pending.done
+		// Do not wait: a pending match with a captured argv keeps going
+		// after removal and retires its own binding (see deferredMatch).
+		pending.signalRemoved()
 	}
 
 	// Resolve the cgroup id by walking the index — the path's
@@ -851,6 +918,37 @@ func argvMatchesRunLoose(argv []string, runCmd string) bool {
 	// argv is the resolved command, possibly behind an interpreter
 	// (pip install x -> python3 /usr/local/bin/pip install x).
 	return tailMatchesCommand(argv, runCmd)
+}
+
+func allCompleted(ms []PendingVertex) bool {
+	for i := range ms {
+		if !ms[i].Completed {
+			return false
+		}
+	}
+
+	return len(ms) > 0
+}
+
+// completedOnlySafe reports whether a match set made only of completed
+// vertices may be linked: exactly one candidate, and the registry knows
+// of exactly one session active at that time (reliably), so no other
+// session can own the cgroup.
+func (j *CgroupJoiner) completedOnlySafe(ms []PendingVertex, at time.Time) bool {
+	if len(ms) != 1 {
+		return false
+	}
+
+	// One RUN vertex maps to one runc container: if this vertex already
+	// has a cgroup (live or recently retired), a second cgroup cannot be
+	// its step.
+	if j.registry.vertexHasCgroup(ms[0].SessionRef, ms[0].VertexDigest) {
+		return false
+	}
+
+	sessions, reliable := j.registry.SessionsActiveAt(at)
+
+	return reliable && len(sessions) == 1 && sessions[0].Ref == ms[0].SessionRef
 }
 
 // matchPendingByTail is the weakest tier: it matches only the last

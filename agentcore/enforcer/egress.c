@@ -116,9 +116,21 @@ struct {
    (not a pointer-with-used) for toolchain-stable BTF retention. */
 volatile const struct drop_event __drop_event_btf_hint;
 
+/* drop_dedup key: destination AND the socket's cgroup. Without the cgroup,
+   two concurrent workloads (e.g. BuildKit RUN steps of different builds)
+   connecting to the same ip:port within the 1s window shared one entry,
+   and the second one's event was suppressed: its egress was never
+   recorded. The dedup exists to collapse retransmits of one connection,
+   which always come from one cgroup. */
+struct dedup_key {
+    __u32 ip;
+    __u16 port;
+    __u64 cgroup_id;
+} __attribute__((packed));
+
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __type(key, struct allow_key);
+    __type(key, struct dedup_key);
     __type(value, __u64);
     __uint(max_entries, 4096);
 } drop_dedup SEC(".maps");
@@ -232,7 +244,7 @@ static __always_inline void emit_drop_event(struct __sk_buff *skb,
      * sk_storage lookup so we don't pay it on the ~99% of events that
      * are retransmits of an already-published drop on a failed
      * connection. */
-    struct allow_key dedup_key = {.ip = ip, .port = port};
+    struct dedup_key dedup_key = {.ip = ip, .port = port, .cgroup_id = bpf_skb_cgroup_id(skb)};
     __u64 now = bpf_ktime_get_ns();
     __u64 *last = bpf_map_lookup_elem(&drop_dedup, &dedup_key);
 

@@ -294,10 +294,25 @@ build-agent-ce:
     - apk add --no-cache cosign
   script:
     - cosign login "${CI_REGISTRY}" -u "${CI_REGISTRY_USER}" -p "${CI_REGISTRY_PASSWORD}"
-    - cosign sign "${IMAGE}:sha-${CI_COMMIT_SHORT_SHA}"
+    # Idempotent: a commit can get several tag pipelines; the image is
+    # signed once. Skip only when a signature from THIS project's CI
+    # identity already verifies; a signature from any other identity
+    # never counts. Signs by tag, as before.
+    # TODO: sign by digest once the build job exports it to this job.
     - |
+      sign_once() {
+        ref="$1"
+        if cosign verify "${ref}" \
+          --certificate-identity-regexp "^https://gitlab\\.com/${CI_PROJECT_PATH}//\\.gitlab-ci\\.yml@refs/(heads/main|tags/v.*)$" \
+          --certificate-oidc-issuer https://gitlab.com >/dev/null 2>&1; then
+          echo "${ref}: already signed by CI identity; skipping"
+          return 0
+        fi
+        cosign sign "${ref}"
+      }
+      sign_once "${IMAGE}:sha-${CI_COMMIT_SHORT_SHA}"
       if [ -n "${CI_COMMIT_TAG:-}" ]; then
-        cosign sign "${IMAGE}:${CI_COMMIT_TAG}"
+        sign_once "${IMAGE}:${CI_COMMIT_TAG}"
       fi
   rules:
     - if: $CI_COMMIT_TAG

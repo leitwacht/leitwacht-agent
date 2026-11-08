@@ -183,7 +183,7 @@ BuildKit support is off until `grpcAddr` is set.
 | Helm value (`buildkit.*`) | CE env (`LEITWACHT_CE_BUILDKIT_*`) | Default | Meaning |
 | --- | --- | --- | --- |
 | `grpcAddr` | `GRPC_ADDR` | empty (off) | buildkitd Control gRPC address, `tcp://host:port` or `unix:///path`. Plaintext. |
-| `cgroupPaths` | `CGROUP_PATHS` (comma list) | none | Cgroup parents to watch. Globs (`*` per directory level, no `**`) are re-resolved in the background every 15 s, so a buildkitd pod restart is picked up without an agent restart, with a delay (7.7). The resolver caps at 32 paths, but the datapath accepts **at most 8 parents**; more makes the attach fail. |
+| `cgroupPaths` | `CGROUP_PATHS` (comma list) | none | Cgroup parents to watch. Globs (`*` per directory level, no `**`) are re-resolved in the background (on inotify events, with a 15 s poll as fallback), so a buildkitd pod restart is picked up without an agent restart, with a short delay (7.7). The resolver caps at 32 paths, but the datapath accepts **at most 8 parents**; more makes the attach fail. |
 | `requireCIMetadata` | `REQUIRE_CI_METADATA` | `false` | Flag sessions lacking any of `requiredAttrs` (`build_flag: missing_ci_attribution`). See 4.4. |
 | `requiredAttrs` | `REQUIRED_ATTRS` | `LEITWACHT_CI_PROJECT_PATH` | Plain build-arg names required when `requireCIMetadata` is on. |
 | `killOnUnattributed` | `KILL_ON_UNATTRIBUTED` | `false` | Opt-in, effective only together with `requireCIMetadata` or a deny pattern: SIGKILLs RUN cgroups of unauthorized sessions and some other uncertain cases. Never kills an ambiguous step whose candidates are all authorized (4.4). |
@@ -614,13 +614,50 @@ hold lasts at most 2 seconds (6.1).
   containers are covered is untested.
 - **Cache poisoning and cross-tenant cache** are not addressed (3.4).
 - **buildkitd pod recreation gap.** A recreated pod has a new cgroup
-  path. The agent re-resolves `cgroupPaths` every 15 s and applies a
-  changed path set only after two consecutive identical polls (about 15
-  to 30 s), and path-set restarts are rate limited (5 minutes, doubling
-  up to 1 hour while they are consecutive). The parent cgroup is also
-  created lazily, at the first RUN step. Until the change is applied,
-  RUN steps under the new parent have **no eBPF program attached: no
-  enforcement and not even audit rows**.
+  path, and the parent cgroup is also created lazily, at the first RUN
+  step. The agent watches, with inotify, the existing directories the
+  `cgroupPaths` globs and literals live under (for a missing literal,
+  its nearest existing ancestor) and re-resolves on a create event,
+  coalescing bursts over about 50 ms. A path set that adds a directory
+  (or replaces a vanished one with a new one, including a recreated
+  inode) is applied at once: no removal debounce and no restart rate
+  limit, so coverage normally resumes within about 1 to 2 s. Further
+  additions are floored at one apply per 2 s (a throttled change is
+  applied by a deferred re-resolve at the end of the floor), so a
+  storm of new cgroups cannot cause unbounded restarts. The apply
+  restarts the joiner and attach with the new set; the new attach
+  starts before the old one is closed, so paths that stay in the set
+  keep their eBPF coverage, while the joiner restarts briefly.
+  Removal-only changes keep the protection against flapping: two
+  consecutive 15 s timer polls must agree (events never count), and
+  such restarts are rate limited (5 minutes, doubling up to 1 hour
+  while consecutive); the surviving paths stay covered meanwhile. A
+  failed apply (for example more than 8 resolved parents, which the
+  datapath rejects) keeps the old generation and is retried with a
+  doubling backoff that starts at the 2 s floor. The backoff resets on
+  any successful apply and on any healthy poll. It holds back a repeat
+  of the failed set and any set over 8 parents, but a set containing a
+  genuinely new parent only waits for the 2 s floor. A failure is logged once
+  per failure streak. When the resolved set exceeds the 32-path cap,
+  paths already covered are kept in preference to new ones.
+  **Remaining gap:**
+  - If inotify is unavailable, dies, or cannot watch a directory
+    (instance or watch limits), the agent logs a warning and falls back
+    to the 15 s poll, so new parents are picked up after up to about
+    15 s.
+  - At most 256 directories are watched. Directories leading to
+    currently resolved paths rank first; when the cap drops others, one
+    warning is logged and those are poll-only.
+  - A burst of additions inside the 2 s floor, or a failing apply in
+    backoff, delays coverage for the new paths until the floor or
+    backoff ends.
+  - The joiner and attach restart on every apply. During the
+    make-before-break overlap both attaches observe the same traffic,
+    so violation rows can be duplicated. When the DNS proxy is enabled, the
+    build DNS redirect is off until the new proxy rebinds (about
+    0.5 s, or until the next RUN step if none is running).
+  - Until a new parent is applied, RUN steps under it have **no eBPF
+    program attached: no enforcement and not even audit rows**.
 - **Restarts.** Session state is in memory. After an agent restart or a
   gRPC reconnect the active-only history replay restores in-flight
   sessions, but RUN steps that were already running during the gap may be

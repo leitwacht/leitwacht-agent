@@ -29,10 +29,13 @@ rules: |
 
 # Container runtime — "containerd" (default) or "docker".
 #
-# leitwacht only watches containers carrying the GitLab Runner managed
-# label `com.gitlab.gitlab-runner.managed=true`. If you spin up
-# non-Runner workloads on the same node they are ignored — no events,
-# no enforcement.
+# Scope: with runtime=docker, only containers carrying the GitLab Runner
+# managed label `com.gitlab.gitlab-runner.managed=true` are watched. With
+# runtime=containerd, containers are selected by pod namespace
+# (containerd.runnerPodNamespace below); when that is empty every
+# container in the containerd namespace is considered, and a container
+# without CI_PROJECT_PATH in its environment is treated as a sibling
+# (helper/service), not a build.
 runtime: containerd
 
 # Containerd-specific settings (ignored when runtime=docker).
@@ -70,7 +73,7 @@ unknownProject: enforce
 #   - On bare-metal Docker, use the host's recursive resolver
 #     (typically the first nameserver in /etc/resolv.conf).
 #
-# A `helm install` without this set will fail at agent startup.
+# A `helm install` without this set fails at template render time.
 dnsUpstream: ""
 
 # Trusted CIDRs that bypass enforcement and are not recorded. Intended for

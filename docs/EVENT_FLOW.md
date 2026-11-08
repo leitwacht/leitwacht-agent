@@ -40,11 +40,18 @@ flowchart LR
     E -->|bucket reports| S1 & S2 & S3
 ```
 
-`recoverRunning` runs once at agent startup against containers that
-were already alive when the agent attached. It calls Handler methods
-directly (no event-channel hop). Operators sizing `MAX_CONCURRENT` for
-restart storms need to know the burst hits Handler before the
-event-loop goroutine is even reading from the channel.
+Startup order in `ce/cmd/agent-ce/main.go`: `Handler.RecoverFrozen`
+first (thaws anything a previous agent process left frozen, because a
+frozen workload is not reported as running), then `recoverRunning`, then
+`runEventLoop`.
+
+`recoverRunning` runs once, against containers that were already alive
+when the agent attached. It calls Handler methods directly (no
+event-channel hop): pod sandboxes first (`HandlePodSandboxStart`), then
+siblings (`HandleSiblingStart`) and build containers (`HandleStart`).
+Operators sizing `MAX_CONCURRENT` for restart storms need to know the
+burst hits Handler before the event-loop goroutine is even reading from
+the channel.
 
 ## Lifecycle of one CI job
 
@@ -90,6 +97,27 @@ event-loop goroutine is even reading from the channel.
    after `LEITWACHT_CE_NETNS_GRACE`** (default 30s) — this is what lets
    K8s init-containers exit before the build container without the
    netns infrastructure dying first.
+
+## Reconcile ticker (missed exits)
+
+`runEventLoop` also owns a 10-second ticker (`reconcileInterval`). Each
+tick lists the runtime's running container IDs and diffs them against
+`Manager.AttachedContainerIDs()`. An attached container with no running
+task for two consecutive ticks is treated as a missed `die` event (dropped
+under event-stream back-pressure, or lost in a `--rm` teardown race) and
+is detached through the normal `die` path, so its final report is
+flushed. A listing error skips the whole tick, so a transient runtime
+failure cannot mass-detach live containers. Only the containerd watcher
+implements the running-set query (`RunningContainerIDs`); other runtimes
+get no reconcile.
+
+## Shutdown order
+
+On context cancellation the loop calls, in order: `Handler.Shutdown`
+(releases any container still frozen), `StopCredwatch`,
+`StopDNSPIDTracker`, `StopProcMem`, then `Manager.DetachAll` and reports
+each result through the sinks. `DetachAll` semantics are under
+"Shutdown semantics" below.
 
 ## The event channel: why it exists, what it gates
 
@@ -469,9 +497,10 @@ The pod-sandbox event attaches egress at the pod cgroup with an
 `leitwacht-initc` polls. initc is an init container whose pod-spec patch
 carries no job environment, so its start is only a sibling
 (`PrepareNetns`); it never reaches `Attach` and must be released as soon
-as the pod-level program is linked. The build, helper and service
-containers (the ones that carry `CI_PROJECT_PATH` and reach `Attach`)
-cannot start until initc exits.
+as the pod-level program is linked. Only a container whose environment
+carries `CI_PROJECT_PATH` (the build container) is a build and reaches
+`Attach`; helper and service containers without it are siblings, like
+initc. None of the pod's containers start until initc exits.
 
 **Known window:** from the build container's start until its own `Attach`
 reconciles the netns to the job's policy, egress runs under the

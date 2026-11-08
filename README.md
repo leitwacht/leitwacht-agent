@@ -26,6 +26,7 @@ and replaces the YAML loader with a gRPC rule stream.
 agentcore/                   data-plane primitives (MPL-2.0)
   enforcer/                  eBPF + nftables + DNS proxy + LSM cred/proc_mem
   watcher/                   container-lifecycle event source (containerd, docker)
+  cgrouppath/ clusterdomain/ procenv/   small helpers (cgroup paths, cluster domain, /proc env reads)
   handler/                   lifecycle handler — edition-neutral
   policy/                    ResolvedPolicy + Source interface + loader
   advisory/                  plain-Go advisory type + Sink interface
@@ -34,6 +35,7 @@ agentcore/                   data-plane primitives (MPL-2.0)
   version/                   build-version stamp (set via -ldflags)
   cmd/
     leitwacht-initc/          pod init container that gates entrypoints on agent attach
+    buildkit-probe/           dev tool for exercising the BuildKit gRPC subscriber
 
 ce/                          Community Edition daemon (MPL-2.0)
   cmd/agent-ce/              the binary
@@ -46,20 +48,36 @@ ce/                          Community Edition daemon (MPL-2.0)
 examples/
   rules.yaml                 starter rule set
 
+tools/
+  leitwacht-buildx           bash wrapper that injects LEITWACHT_CI_* build-args for BuildKit attribution
+
+tests/                       integration + e2e (Linux, root)
+
 docs/
   EVENT_FLOW.md              watcher → handler → enforcer flow + tunables (with mermaid)
   BUILDKIT.md                BuildKit: secure builder setup, integration, limitations
+  BUILDKIT_STEP_ATTRIBUTION.md   original design memo (BUILDKIT.md and the code win on differences)
+  BUILDKIT_PERSISTENT_K8S.md     stub pointing to BUILDKIT.md
 ```
 
 ## Container scope
 
-leitwacht-agent only inspects containers carrying the GitLab Runner
-managed label `com.gitlab.gitlab-runner.managed=true`. Containers
-without this label — anything you spin up by hand, sidecars, application
-workloads — are ignored entirely (no events, no enforcement, no
-violations). This is deliberate: leitwacht is the data plane for **CI
-runner** egress, and non-runner workloads should not be silently
-intercepted. Non-Runner use cases are out of scope for v0.1.0.
+leitwacht-agent is the data plane for **GitLab Runner** CI egress. What it
+watches depends on the runtime watcher:
+
+- **Docker / Podman (`LEITWACHT_CE_CONTAINER_RUNTIME=docker`):** only
+  containers carrying the Runner label
+  `com.gitlab.gitlab-runner.managed=true`. Anything else (hand-started
+  containers, sidecars, application workloads) is ignored.
+- **containerd / Kubernetes (default):** containers are selected by pod
+  namespace via `LEITWACHT_CE_RUNNER_POD_NAMESPACE` (helm
+  `containerd.runnerPodNamespace`, comma-separated). If it is empty, every
+  container in the containerd namespace (`k8s.io` by default) is
+  considered, so set it on shared nodes. A container without
+  `CI_PROJECT_PATH` in its environment is handled as a sibling
+  (helper/service container), not a build.
+
+Non-Runner workloads are out of scope.
 
 ## DNS configuration advisory
 
@@ -70,11 +88,12 @@ carries non-cluster search suffixes, CE emits a `dns_config` advisory on its
 NDJSON / webhook / Prometheus sinks, with a `lower_ndots` or
 `node_search_domains` recommendation. Details: `docs/EVENT_FLOW.md`.
 
-## Known limitations (v0.1.0)
+## Known limitations
 
 - **IPv4 only.** The eBPF programs and DNS proxy enforce on IPv4 traffic; IPv6 egress is dropped at the netns boundary regardless of policy. CI jobs that require IPv6 connectivity cannot use leitwacht enforcement until this is addressed.
 - **Linux x86_64 only.** arm64 runners are not yet supported (CI ships amd64 images; arm64 follows once we have eBPF artefacts for that architecture).
 - **GitLab Runner workloads only.** See "Container scope" above.
+- **Pre-attach window.** On Kubernetes, egress between a build container's start and its own attach runs under an audit-all placeholder policy; see `docs/EVENT_FLOW.md`.
 
 ## Quickstart
 
@@ -126,5 +145,9 @@ requires `clang` + kernel headers; CI builds rely on the committed
 artefacts. To regenerate locally on Linux:
 
 ```sh
-go generate ./agentcore/enforcer/
+make ebpf-generate        # go generate ./agentcore/enforcer/...
+make check-ebpf-drift     # what CI runs: fails if committed .o/.go differ from the .c sources
 ```
+
+CI regenerates with clang from a pinned Debian bookworm image; a different
+clang version can produce a diff in the committed objects.

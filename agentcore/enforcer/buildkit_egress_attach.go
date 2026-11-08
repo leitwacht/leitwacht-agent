@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -581,9 +582,17 @@ func resolveAtFlush(
 // sessions open at the event time resolve to a single CI identity the
 // row inherits it (session_ref is stamped only when exactly one session
 // is open; vertex stays empty). When several sessions with different
-// identities overlap, nothing is guessed: the row records the candidate
-// sessions as ambiguous and, carrying no project, lands in the
-// unattributed bucket.
+// identities overlap, nothing is guessed about the job: the row records
+// the candidate sessions as ambiguous. If every candidate session
+// nevertheless belongs to one CI project (parallel jobs of one
+// pipeline), the row is lifted to project level: it keeps the ambiguous
+// flag and candidates, gains the project (and the pipeline when common)
+// plus the distinct candidate job ids, and leaves every job-specific
+// field empty. Candidates from different projects, or any session
+// missing a project or job id, carry no project and land in the
+// unattributed bucket. Rows that arrive ambiguous from the cgroup join
+// with candidates spanning several sessions get the same lift when all
+// of those sessions are known.
 func attributeBySession(violations []Violation, sessions SessionsLookup) {
 	if sessions == nil {
 		return
@@ -595,7 +604,18 @@ func attributeBySession(violations []Violation, sessions SessionsLookup) {
 			continue
 		}
 
-		if v.BuildAmbiguous && !candidatesShareSession(v.BuildAmbiguousCandidates) {
+		// Candidate sets from the session-level and weak-tail join tiers
+		// are not trusted: the real owner may be a session with no
+		// announced vertex, or the evidence is forgeable. Such rows are
+		// decided over all open sessions, like unbound rows. Only an
+		// exact-argv multi-match (StrengthAmbiguous) keeps its candidates.
+		weakSet := v.BuildAmbiguous &&
+			(v.BindingStrength == StrengthSessionLevel || v.BindingStrength == StrengthWeakTail)
+		trustCands := v.BuildAmbiguous && !weakSet
+
+		if trustCands && !candidatesShareSession(v.BuildAmbiguousCandidates) {
+			liftJoinAmbiguous(v, sessions)
+
 			continue
 		}
 
@@ -608,7 +628,7 @@ func attributeBySession(violations []Violation, sessions SessionsLookup) {
 
 		open := activeSessionsAt(cands, v.Timestamp)
 
-		if v.BuildAmbiguous && len(v.BuildAmbiguousCandidates) > 0 {
+		if trustCands && len(v.BuildAmbiguousCandidates) > 0 {
 			// Narrow to the one session every candidate belongs to.
 			ref := v.BuildAmbiguousCandidates[0].SessionRef
 			open = filterSession(open, ref)
@@ -638,6 +658,13 @@ func attributeBySession(violations []Violation, sessions SessionsLookup) {
 		}
 
 		if identity, ok := commonCIIdentity(open); ok {
+			if weakSet {
+				// Every open session is the same job: the untrusted
+				// candidate set is moot.
+				v.BuildAmbiguous = false
+				v.BuildAmbiguousCandidates = nil
+			}
+
 			v.BuildProjectPath, v.BuildJobID, v.BuildPipelineID,
 				v.BuildJobName, v.BuildJobStage, v.BuildGitRef,
 				v.BuildJobURL = CIOverrideFromFrontendAttrs(identity)
@@ -647,12 +674,137 @@ func attributeBySession(violations []Violation, sessions SessionsLookup) {
 
 		v.BuildAmbiguous = true
 
-		v.BuildAmbiguousCandidates = v.BuildAmbiguousCandidates[:0]
+		// Fresh slice: the incoming one may be shared with the cgroup
+		// binding and other rows.
+		v.BuildAmbiguousCandidates = make([]AmbiguousCandidate, 0, len(open))
 		for _, s := range open {
 			v.BuildAmbiguousCandidates = append(v.BuildAmbiguousCandidates,
 				AmbiguousCandidate{SessionRef: s.Ref})
 		}
+
+		applyProjectLift(v, open)
 	}
+}
+
+// liftJoinAmbiguous applies the project-level lift to a row that arrived
+// ambiguous from the cgroup join with candidates spanning several
+// sessions. The vertex candidates stay untouched; if any candidate
+// session is unknown or the session set is unreliable, nothing changes.
+func liftJoinAmbiguous(v *Violation, sessions SessionsLookup) {
+	all, reliable := sessions(v.Timestamp)
+	if !reliable {
+		return
+	}
+
+	byRef := make(map[string]SessionState, len(all))
+	for _, s := range all {
+		byRef[s.Ref] = s
+	}
+
+	var cand []SessionState
+
+	seen := make(map[string]struct{})
+
+	for _, c := range v.BuildAmbiguousCandidates {
+		if _, dup := seen[c.SessionRef]; dup {
+			continue
+		}
+
+		seen[c.SessionRef] = struct{}{}
+
+		s, ok := byRef[c.SessionRef]
+		if !ok {
+			return
+		}
+
+		cand = append(cand, s)
+	}
+
+	applyProjectLift(v, cand)
+}
+
+// applyProjectLift stamps project-level identity on an ambiguous row when
+// all candidate sessions share one project. Job-specific fields stay
+// empty: the row never borrows a single job's identity.
+func applyProjectLift(v *Violation, sessions []SessionState) {
+	project, pipeline, jobIDs, ok := commonCIProject(sessions)
+	if !ok {
+		return
+	}
+
+	v.BuildProjectPath = project
+	v.BuildPipelineID = pipeline
+	v.BuildAmbiguousJobIDs = jobIDs
+}
+
+// Caps for the project-level lift: bound the report size regardless of
+// how many parallel jobs or how long the ids are. Over-long values are
+// dropped rather than truncated: a truncated id is not a real identity.
+const (
+	maxLiftJobIDs  = 16
+	maxLiftIDBytes = 128
+)
+
+// commonCIProject reports the shared CI project of the sessions. It is
+// ok only when every session carries a non-empty project and job id, all
+// projects are identical and the project fits the cap. pipeline is the
+// common pipeline id, or "" when the sessions differ or it is over-long.
+// jobIDs are the distinct, sorted job ids that fit the cap (over-long
+// ids are dropped; none left means no lift), at most maxLiftJobIDs.
+func commonCIProject(sessions []SessionState) (project, pipeline string, jobIDs []string, ok bool) {
+	if len(sessions) == 0 {
+		return "", "", nil, false
+	}
+
+	jobs := make(map[string]struct{}, len(sessions))
+
+	for i, s := range sessions {
+		p, j, pl, _, _, _, _ := CIOverrideFromFrontendAttrs(s.FrontendAttrs)
+		if p == "" || j == "" {
+			return "", "", nil, false
+		}
+
+		if i == 0 {
+			project, pipeline = p, pl
+		} else {
+			if p != project {
+				return "", "", nil, false
+			}
+
+			if pl != pipeline {
+				pipeline = ""
+			}
+		}
+
+		if len(j) <= maxLiftIDBytes {
+			jobs[j] = struct{}{}
+		}
+	}
+
+	if len(project) > maxLiftIDBytes {
+		return "", "", nil, false
+	}
+
+	if len(pipeline) > maxLiftIDBytes {
+		pipeline = ""
+	}
+
+	if len(jobs) == 0 {
+		return "", "", nil, false
+	}
+
+	jobIDs = make([]string, 0, len(jobs))
+	for j := range jobs {
+		jobIDs = append(jobIDs, j)
+	}
+
+	sort.Strings(jobIDs)
+
+	if len(jobIDs) > maxLiftJobIDs {
+		jobIDs = jobIDs[:maxLiftJobIDs]
+	}
+
+	return project, pipeline, jobIDs, true
 }
 
 func candidatesShareSession(cs []AmbiguousCandidate) bool {

@@ -50,6 +50,10 @@ type Violation struct {
 	BuildVertexName          string               `json:"build_vertex_name,omitempty"`
 	BuildAmbiguous           bool                 `json:"build_ambiguous,omitempty"`
 	BuildAmbiguousCandidates []AmbiguousCandidate `json:"build_ambiguous_candidates,omitempty"`
+	// BuildAmbiguousJobIDs lists the distinct CI job ids of the
+	// candidate sessions. Set only when every candidate shares one
+	// project (then BuildProjectPath carries it, with no job identity).
+	BuildAmbiguousJobIDs []string `json:"build_ambiguous_job_ids,omitempty"`
 
 	// CgroupID is the cgroup of the connecting socket's owner. Kept on
 	// the row (not serialized) so BuildKit egress that was unbound when

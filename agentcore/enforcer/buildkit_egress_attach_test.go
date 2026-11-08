@@ -3,8 +3,12 @@ package enforcer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -610,4 +614,336 @@ func TestSessionFallback_ReliabilityGaps(t *testing.T) {
 			t.Error("event long after all gaps reported unreliable")
 		}
 	})
+}
+
+func sessAttrs(ref, project, job, pipeline string, start time.Time) SessionState {
+	s := sess(ref, project, job, start)
+	if pipeline != "" {
+		s.FrontendAttrs[FrontendAttrKeyPipelineID] = pipeline
+	}
+
+	return s
+}
+
+func TestAttributeBySessionProjectLift(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	st := now.Add(-time.Minute)
+
+	noJob := sess("s3", "grp/p", "", st)
+	noProj := sess("s3", "", "9", st)
+
+	var many []SessionState
+
+	for i := range 20 {
+		many = append(many, sess(fmt.Sprintf("m%02d", i), "grp/p", fmt.Sprintf("%03d", 99-i), st))
+	}
+
+	many = append(many, sess("long", "grp/p", strings.Repeat("9", 300), st))
+
+	cases := []struct {
+		name         string
+		sessions     []SessionState
+		wantProject  string
+		wantPipeline string
+		wantJobs     []string
+	}{
+		{"same project different jobs", []SessionState{sess("a", "grp/p", "20", st), sess("b", "grp/p", "10", st)}, "grp/p", "", []string{"10", "20"}},
+		{"same pipeline", []SessionState{sessAttrs("a", "grp/p", "1", "P7", st), sessAttrs("b", "grp/p", "2", "P7", st)}, "grp/p", "P7", []string{"1", "2"}},
+		{"different pipelines", []SessionState{sessAttrs("a", "grp/p", "1", "P7", st), sessAttrs("b", "grp/p", "2", "P8", st)}, "grp/p", "", []string{"1", "2"}},
+		{"different projects", []SessionState{sess("a", "grp/p", "1", st), sess("b", "grp/q", "2", st)}, "", "", nil},
+		{"one missing job", []SessionState{sess("a", "grp/p", "1", st), noJob}, "", "", nil},
+		{"one missing project", []SessionState{sess("a", "grp/p", "1", st), noProj}, "", "", nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			vs := []Violation{{IP: "1.1.1.1", Timestamp: now}}
+			attributeBySession(vs, okSessions(tc.sessions))
+
+			v := vs[0]
+			if !v.BuildAmbiguous || len(v.BuildAmbiguousCandidates) != len(tc.sessions) {
+				t.Fatalf("want ambiguous over all sessions, got %+v", v)
+			}
+
+			if v.BuildProjectPath != tc.wantProject || v.BuildPipelineID != tc.wantPipeline ||
+				!slices.Equal(v.BuildAmbiguousJobIDs, tc.wantJobs) {
+				t.Errorf("got project=%q pipeline=%q jobs=%v", v.BuildProjectPath, v.BuildPipelineID, v.BuildAmbiguousJobIDs)
+			}
+
+			assertNoJobLevel(t, v)
+		})
+	}
+
+	t.Run("cap keeps the 16 smallest ids, order independent", func(t *testing.T) {
+		t.Parallel()
+
+		want := []string{
+			"080", "081", "082", "083", "084", "085", "086", "087",
+			"088", "089", "090", "091", "092", "093", "094", "095",
+		}
+
+		for seed := range 5 {
+			in := slices.Clone(many[:20])
+			rand.New(rand.NewPCG(uint64(seed), 1)).Shuffle(len(in), func(i, j int) { in[i], in[j] = in[j], in[i] })
+
+			vs := []Violation{{IP: "1.1.1.1", Timestamp: now}}
+			attributeBySession(vs, okSessions(in))
+
+			if !slices.Equal(vs[0].BuildAmbiguousJobIDs, want) {
+				t.Fatalf("seed %d: got %v", seed, vs[0].BuildAmbiguousJobIDs)
+			}
+
+			assertNoJobLevel(t, vs[0])
+		}
+	})
+
+	longID := strings.Repeat("9", 129)
+
+	t.Run("over-long job id dropped", func(t *testing.T) {
+		t.Parallel()
+
+		vs := []Violation{{IP: "1.1.1.1", Timestamp: now}}
+		attributeBySession(vs, okSessions([]SessionState{
+			sess("a", "grp/p", longID, st), sess("b", "grp/p", "1", st),
+		}))
+
+		if got := vs[0].BuildAmbiguousJobIDs; !slices.Equal(got, []string{"1"}) || vs[0].BuildProjectPath != "grp/p" {
+			t.Errorf("got %+v", vs[0])
+		}
+
+		assertNoJobLevel(t, vs[0])
+	})
+
+	t.Run("all job ids over-long no lift", func(t *testing.T) {
+		t.Parallel()
+
+		vs := []Violation{{IP: "1.1.1.1", Timestamp: now}}
+		attributeBySession(vs, okSessions([]SessionState{
+			sess("a", "grp/p", longID, st), sess("b", "grp/p", longID+"1", st),
+		}))
+
+		if vs[0].BuildProjectPath != "" || vs[0].BuildAmbiguousJobIDs != nil || !vs[0].BuildAmbiguous {
+			t.Errorf("got %+v", vs[0])
+		}
+	})
+
+	t.Run("over-long project no lift", func(t *testing.T) {
+		t.Parallel()
+
+		lp := strings.Repeat("p", 129)
+		vs := []Violation{{IP: "1.1.1.1", Timestamp: now}}
+		attributeBySession(vs, okSessions([]SessionState{sess("a", lp, "1", st), sess("b", lp, "2", st)}))
+
+		if vs[0].BuildProjectPath != "" || vs[0].BuildAmbiguousJobIDs != nil || !vs[0].BuildAmbiguous {
+			t.Errorf("got %+v", vs[0])
+		}
+	})
+
+	t.Run("over-long pipeline lifts without pipeline", func(t *testing.T) {
+		t.Parallel()
+
+		lp := strings.Repeat("q", 129)
+		vs := []Violation{{IP: "1.1.1.1", Timestamp: now}}
+		attributeBySession(vs, okSessions([]SessionState{
+			sessAttrs("a", "grp/p", "1", lp, st), sessAttrs("b", "grp/p", "2", lp, st),
+		}))
+
+		if vs[0].BuildProjectPath != "grp/p" || vs[0].BuildPipelineID != "" || len(vs[0].BuildAmbiguousJobIDs) != 2 {
+			t.Errorf("got %+v", vs[0])
+		}
+	})
+
+	t.Run("unreliable sessions unchanged", func(t *testing.T) {
+		t.Parallel()
+
+		vs := []Violation{{IP: "1.1.1.1", Timestamp: now}}
+		attributeBySession(vs, func(time.Time) ([]SessionState, bool) {
+			return []SessionState{sess("a", "grp/p", "1", st), sess("b", "grp/p", "2", st)}, false
+		})
+
+		if vs[0].BuildAmbiguous || vs[0].BuildProjectPath != "" {
+			t.Errorf("changed on unreliable: %+v", vs[0])
+		}
+	})
+
+	joinRow := func() []Violation {
+		return []Violation{{
+			IP: "1.1.1.1", Timestamp: now, BuildAmbiguous: true, BindingStrength: StrengthAmbiguous,
+			BuildAmbiguousCandidates: []AmbiguousCandidate{
+				{SessionRef: "a", VertexDigest: "x"}, {SessionRef: "b", VertexDigest: "y"},
+			},
+		}}
+	}
+
+	t.Run("join ambiguous multi-session lifted", func(t *testing.T) {
+		t.Parallel()
+
+		vs := joinRow()
+		// An unrelated open session must not influence the lift.
+		attributeBySession(vs, okSessions([]SessionState{
+			sess("a", "grp/p", "2", st), sess("b", "grp/p", "1", st), sess("z", "other/q", "5", st),
+		}))
+
+		v := vs[0]
+		if v.BuildProjectPath != "grp/p" || !slices.Equal(v.BuildAmbiguousJobIDs, []string{"1", "2"}) ||
+			!v.BuildAmbiguous || len(v.BuildAmbiguousCandidates) != 2 ||
+			v.BuildAmbiguousCandidates[0].VertexDigest != "x" {
+			t.Errorf("got %+v", v)
+		}
+
+		assertNoJobLevel(t, v)
+	})
+
+	t.Run("join ambiguous candidate session missing", func(t *testing.T) {
+		t.Parallel()
+
+		vs := joinRow()
+		attributeBySession(vs, okSessions([]SessionState{sess("a", "grp/p", "2", st)}))
+
+		if vs[0].BuildProjectPath != "" || vs[0].BuildAmbiguousJobIDs != nil {
+			t.Errorf("lifted with unknown session: %+v", vs[0])
+		}
+	})
+
+	t.Run("join ambiguous unreliable", func(t *testing.T) {
+		t.Parallel()
+
+		vs := joinRow()
+		attributeBySession(vs, func(time.Time) ([]SessionState, bool) {
+			return []SessionState{sess("a", "grp/p", "2", st), sess("b", "grp/p", "1", st)}, false
+		})
+
+		if vs[0].BuildProjectPath != "" {
+			t.Errorf("lifted on unreliable: %+v", vs[0])
+		}
+	})
+}
+
+func assertNoJobLevel(t *testing.T, v Violation) {
+	t.Helper()
+
+	if v.BuildSessionRef != "" || v.BuildJobID != "" || v.BuildJobName != "" ||
+		v.BuildJobStage != "" || v.BuildGitRef != "" || v.BuildJobURL != "" {
+		t.Errorf("job-level field set on lifted row: %+v", v)
+	}
+}
+
+func TestAttributeBySessionJoinNegatives(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	st := now.Add(-time.Minute)
+
+	row := func(refs ...string) []Violation {
+		v := Violation{IP: "1.1.1.1", Timestamp: now, BuildAmbiguous: true, BindingStrength: StrengthAmbiguous}
+		for _, r := range refs {
+			v.BuildAmbiguousCandidates = append(v.BuildAmbiguousCandidates, AmbiguousCandidate{SessionRef: r})
+		}
+
+		return []Violation{v}
+	}
+
+	t.Run("different projects", func(t *testing.T) {
+		t.Parallel()
+
+		vs := row("a", "b")
+		attributeBySession(vs, okSessions([]SessionState{sess("a", "g/p", "1", st), sess("b", "g/q", "2", st)}))
+
+		if vs[0].BuildProjectPath != "" || vs[0].BuildAmbiguousJobIDs != nil {
+			t.Errorf("got %+v", vs[0])
+		}
+	})
+
+	t.Run("candidate without job id", func(t *testing.T) {
+		t.Parallel()
+
+		vs := row("a", "b")
+		attributeBySession(vs, okSessions([]SessionState{sess("a", "g/p", "1", st), sess("b", "g/p", "", st)}))
+
+		if vs[0].BuildProjectPath != "" {
+			t.Errorf("got %+v", vs[0])
+		}
+	})
+
+	t.Run("duplicate session refs still lift over distinct sessions", func(t *testing.T) {
+		t.Parallel()
+
+		vs := row("a", "b", "a")
+		attributeBySession(vs, okSessions([]SessionState{sess("a", "g/p", "1", st), sess("b", "g/p", "2", st)}))
+
+		if vs[0].BuildProjectPath != "g/p" || !slices.Equal(vs[0].BuildAmbiguousJobIDs, []string{"1", "2"}) {
+			t.Errorf("got %+v", vs[0])
+		}
+	})
+}
+
+func TestAttributeBySessionUntrustedCandidates(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	st := now.Add(-time.Minute)
+
+	for _, strength := range []string{StrengthSessionLevel, StrengthWeakTail} {
+		row := func() []Violation {
+			return []Violation{{
+				IP: "1.1.1.1", Timestamp: now, BuildAmbiguous: true, BindingStrength: strength,
+				BuildAmbiguousCandidates: []AmbiguousCandidate{{SessionRef: "a", VertexDigest: "x"}},
+			}}
+		}
+
+		t.Run(strength+" owner absent from candidates, other project", func(t *testing.T) {
+			t.Parallel()
+
+			vs := row()
+			attributeBySession(vs, okSessions([]SessionState{sess("a", "g/p", "1", st), sess("owner", "g/q", "2", st)}))
+
+			v := vs[0]
+			if v.BuildProjectPath != "" || v.BuildSessionRef != "" || v.BuildJobID != "" || !v.BuildAmbiguous || len(v.BuildAmbiguousCandidates) != 2 {
+				t.Errorf("trusted the candidate set: %+v", v)
+			}
+		})
+
+		t.Run(strength+" owner absent from candidates, same project", func(t *testing.T) {
+			t.Parallel()
+
+			vs := row()
+			attributeBySession(vs, okSessions([]SessionState{sess("a", "g/p", "1", st), sess("owner", "g/p", "2", st)}))
+
+			v := vs[0]
+			if v.BuildProjectPath != "g/p" || !slices.Equal(v.BuildAmbiguousJobIDs, []string{"1", "2"}) || !v.BuildAmbiguous {
+				t.Errorf("got %+v", v)
+			}
+
+			assertNoJobLevel(t, v)
+		})
+
+		t.Run(strength+" single open session owner not in candidates", func(t *testing.T) {
+			t.Parallel()
+
+			vs := row()
+			attributeBySession(vs, okSessions([]SessionState{sess("shell", "g/q", "9", st)}))
+
+			v := vs[0]
+			if v.BuildSessionRef != "shell" || v.BuildProjectPath != "g/q" || v.BuildJobID != "9" || v.BuildAmbiguous || v.BuildAmbiguousCandidates != nil {
+				t.Errorf("want single-session attribution, got %+v", v)
+			}
+		})
+
+		t.Run(strength+" unreliable unchanged", func(t *testing.T) {
+			t.Parallel()
+
+			vs := row()
+			attributeBySession(vs, func(time.Time) ([]SessionState, bool) {
+				return []SessionState{sess("shell", "g/q", "9", st)}, false
+			})
+
+			if vs[0].BuildSessionRef != "" || vs[0].BuildProjectPath != "" {
+				t.Errorf("got %+v", vs[0])
+			}
+		})
+	}
 }

@@ -1,9 +1,19 @@
 # BuildKit step-level attribution
 
-**Status:** design accepted, implementation pending
+> Operator guide: [BUILDKIT.md](BUILDKIT.md). This memo is the original
+> design record; where it differs from the code, the guide and the code win.
+
+**Status:** implemented (design memo retained for rationale)
 **Scope:** agent (this repo) + EE server + UI (sibling repos)
-**Owner:** Thomas
-**Last update:** 2026-05-18
+**Owner:** maintainers
+**Last update:** 2026-05-18 (status line and implementation notes updated later)
+
+**Implementation notes (differences from the plan below):** the cgroup
+watcher uses inotify, not fanotify; the kprobe/runc-bundle-path tier of the
+join was not built (join tiers are exact argv, environ tiebreak, weak tail,
+session level); ambiguity is resolved at flush time and, when all candidate
+builds share one project, lifted to project level; the agent subscribes with
+`ListenBuildHistory(ActiveOnly=true)` plus per-build `Status`.
 
 ## Goal
 

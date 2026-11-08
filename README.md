@@ -48,6 +48,7 @@ examples/
 
 docs/
   EVENT_FLOW.md              watcher → handler → enforcer flow + tunables (with mermaid)
+  BUILDKIT.md                BuildKit: secure builder setup, integration, limitations
 ```
 
 ## Container scope

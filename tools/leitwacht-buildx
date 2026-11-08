@@ -23,7 +23,7 @@
 #     -o /usr/local/bin/leitwacht-buildx
 #   chmod +x /usr/local/bin/leitwacht-buildx
 #
-# See docs/BUILDKIT_PERSISTENT_K8S.md for the full deployment guide.
+# See docs/BUILDKIT.md for the full deployment guide.
 
 set -euo pipefail
 

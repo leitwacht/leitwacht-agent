@@ -175,7 +175,7 @@ bucketInterval: 5m
 # session ref + vertex digest + Dockerfile RUN string. Per-row CI
 # routing requires the CI runner to inject
 # `--build-arg LEITWACHT_CI_*=...` at buildx invocation time — see
-# docs/BUILDKIT_PERSISTENT_K8S.md for the full setup.
+# docs/BUILDKIT.md for the full setup.
 #
 # Empty grpcAddr disables the whole subsystem; the agent behaves
 # exactly as it did before BuildKit attribution existed.
@@ -186,8 +186,10 @@ buildkit:
   grpcAddr: ""
 
   # Cgroup parent paths to watch for RUN-container creates. Glob
-  # patterns expand once at agent startup (one `*` per directory
-  # level — Go stdlib filepath.Glob shape, `**` is NOT supported).
+  # patterns (one `*` per directory level — Go stdlib filepath.Glob
+  # shape, `**` is NOT supported) are re-resolved every 15 s; a changed
+  # path set is applied after two polls and rate limited (see
+  # docs/BUILDKIT.md). At most 8 parents are accepted by the datapath.
   # Typical K8s shape:
   #   - /sys/fs/cgroup/kubepods.slice/*/*/buildkit
   # Typical bare-metal Docker shape:
@@ -198,9 +200,10 @@ buildkit:
   # parent that also holds other workloads.
   cgroupPaths: []
 
-  # When true, refuse Solve sessions whose FrontendAttrs lack any
-  # of requiredAttrs. Refused sessions have their RUN cgroups
-  # SIGKILLed at runc-create via cgroup.kill. Roll out in two
+  # When true, flag Solve sessions whose FrontendAttrs lack any of
+  # requiredAttrs (build_flag missing_ci_attribution; the steps run in
+  # audit). They are SIGKILLed via cgroup.kill only when
+  # killOnUnattributed is also true. Roll out in two
   # phases: start with false while wrapping pipelines, then flip
   # to true once unattributed builds have stopped appearing in
   # the metrics.

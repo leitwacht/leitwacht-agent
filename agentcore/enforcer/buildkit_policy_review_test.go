@@ -76,14 +76,31 @@ func TestRecorder_AllowedRowsHaveOwnCap(t *testing.T) {
 	}
 }
 
-func TestClassify_ArgvUntrustedIsAmbiguous(t *testing.T) {
+func TestClassify_ArgvUntrustedClassifiedByKeys(t *testing.T) {
 	t.Parallel()
 
 	b := exactBinding("g/a", "build")
 	b.Flag = BuildFlagArgvUntrusted
 
-	if got := classify(b); got.state != bkStateAmbiguous {
-		t.Fatalf("argv_untrusted exact link bound: %+v", got)
+	// The flag is for review only: a single exact key still binds.
+	if got := classify(b); got.state != bkStateBound || got.key != (PolicyKey{"g/a", "build"}) {
+		t.Fatalf("argv_untrusted exact link must bind to its key: %+v", got)
+	}
+
+	// One project, several jobs: project default (mixedJobs).
+	m := ambiguousBinding(StrengthAmbiguous, PolicyKey{"g/a", "build"}, PolicyKey{"g/a", "test"})
+	m.Flag = BuildFlagArgvUntrusted
+
+	if got := classify(m); got.state != bkStateBound || !got.mixedJobs {
+		t.Fatalf("argv_untrusted multi-job same project: %+v", got)
+	}
+
+	// Across projects: still ambiguous.
+	x := ambiguousBinding(StrengthAmbiguous, PolicyKey{"g/a", "build"}, PolicyKey{"g/b", "build"})
+	x.Flag = BuildFlagArgvUntrusted
+
+	if got := classify(x); got.state != bkStateAmbiguous {
+		t.Fatalf("argv_untrusted across projects must stay ambiguous: %+v", got)
 	}
 
 	w := ambiguousBinding(StrengthWeakTail, PolicyKey{"g/a", "build"})
@@ -453,3 +470,31 @@ func TestRegistry_RetiredLinkNeverLive(t *testing.T) {
 }
 
 var _ = policy.RulePriority
+
+// With the kill opt-in off, an argv_untrusted exact link must still
+// enforce its key's policy (the flag is for review only).
+func TestBinder_ArgvUntrustedStillEnforcesMatchedPolicy(t *testing.T) {
+	t.Parallel()
+
+	r := newRig()
+	r.src.set("g/a", "build", enforcePol(1, "93.184.216.34"))
+
+	b := exactBinding("g/a", "build")
+	b.Flag = BuildFlagArgvUntrusted
+	r.b.OnBind(1, b)
+
+	if p, ok := r.dp.cg(1); !ok || p.State != bkStateBound || p.Mode != bkModeBlock {
+		t.Fatalf("argv_untrusted link = %+v ok=%v, want bound/block", p, ok)
+	}
+
+	// Across projects the flag changes nothing: ambiguous / audit.
+	r.src.set("g/b", "build", enforcePol(1, "1.2.3.4"))
+
+	x := ambiguousBinding(StrengthAmbiguous, PolicyKey{"g/a", "build"}, PolicyKey{"g/b", "build"})
+	x.Flag = BuildFlagArgvUntrusted
+	r.b.OnBind(2, x)
+
+	if p, ok := r.dp.cg(2); !ok || p.State != bkStateAmbiguous || p.Mode != bkModeAudit {
+		t.Fatalf("cross-project argv_untrusted = %+v ok=%v, want ambiguous/audit", p, ok)
+	}
+}

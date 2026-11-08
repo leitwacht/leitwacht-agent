@@ -307,13 +307,27 @@ What this does **not** give you:
 - A deny-pattern match on a single exactly-linked vertex always kills; it
   is explicit policy, independent of this flag.
 
-**Downgrade side effect (kill off).** With `requireCIMetadata` (or any
-deny pattern) on and `killOnUnattributed` off, any *open* unauthorized or
-deny-matching session makes the agent distrust every argv match: all
-concurrent steps get `build_flag: argv_untrusted`, and the policy binder
-treats them as ambiguous, which means **audit**. One unwrapped build
-therefore drops all concurrent builds on that buildkitd to audit while it
-is open. With the kill flag on, those steps are killed instead. The
+**Argv distrust (kill off).** With `requireCIMetadata` (or any deny
+pattern) on and `killOnUnattributed` off, any *open* unauthorized or
+deny-matching session makes the agent distrust every argv match: the
+concurrent steps get `build_flag: argv_untrusted`, but this is a review
+flag only. The policy binder still classifies them by their candidate
+keys, so an argv-linked step keeps the policy of the step it matched
+(enforced or shadowed per mode) and one unwrapped build does not
+downgrade other builds. The residual risk is that a forged argv in an
+unauthorized build can link to another build's step and is then judged
+by that build's policy, which is never looser than the audit default its
+own unattributed steps get anyway (equal when the matched key itself runs
+in audit). Two side effects remain and were present before this change
+for the row side: rows from a forged link are filed under the victim's
+project and job, and can feed the victim's learned allows while that key
+is in learning mode; and the forging cgroup shares the victim's DNS slot,
+so if the victim's policy allows a name whose DNS the attacker controls
+(a wildcard over shared hosting, or an attacker-owned subdomain), the
+forger can seed arbitrary IPs into the victim key's DNS-derived allow
+set. That widens what steps bound to that key may reach; a step
+legitimately bound to the key could already do the same. With the kill flag on, those steps are
+killed instead. The
 same state also covers, for up to 30 s, a session whose Status event
 arrived before its history record; with the kill flag on, concurrent
 legitimate steps can be killed during that window.
@@ -447,7 +461,7 @@ projects.
 
 | Outcome | Row carries | How it arises | What it means for policy |
 | --- | --- | --- | --- |
-| **Linked to step** | `build_session_ref`, `build_vertex_digest`, `build_vertex_name`, project, job id and other `build_*` identity | The RUN step's argv matched exactly one pending vertex (binding strength `exact_argv`, or `environ_tiebreak`). | Policy of the claimed project and job name (the project default list if the job has none). Enforced in shadow/enforce (an `environ_tiebreak` link across projects, or an `argv_untrusted` link, runs in audit). |
+| **Linked to step** | `build_session_ref`, `build_vertex_digest`, `build_vertex_name`, project, job id and other `build_*` identity | The RUN step's argv matched exactly one pending vertex (binding strength `exact_argv`, or `environ_tiebreak`). | Policy of the claimed project and job name (the project default list if the job has none). Enforced in shadow/enforce (an `environ_tiebreak` link across projects runs in audit; an `argv_untrusted` link keeps its matched policy and is flagged for review). |
 | **Job-level (session)** | Session ref, project, job id; no vertex | Join found no vertex, but all builds open at event time share one CI identity. | Same as above. |
 | **Project-level (ambiguous)** | `build_ambiguous: true`, `build_project_path`, no job id, sorted `build_ambiguous_job_ids` (up to 16), common pipeline id if any | Several builds overlap and the step cannot be pinned to one, but every candidate belongs to one project (agent v0.14.1 and later). | Candidates from one project: the project's default policy applies (enforcement is unchanged by the lift). In the EE server these rows are stored under the project as job `buildkit-ambiguous` and raise an advisory. |
 | **Ambiguous across projects** | `build_ambiguous: true`, no project | Candidates belong to different projects, or one lacks a project or job id. | Filed without a project. For enforcement, candidates in different projects, or one without a project claim, run in audit (`enforcement_state: ambiguous_multi_project`). Candidates that share a project but lack a job id are still judged by that project's default policy. |
@@ -581,9 +595,14 @@ uncertain is worse than a recorded gap. The consequences:
   flag on, such a step is not killed when all candidates are authorized.
   It is still recorded.
 - With `requireCIMetadata` (or deny patterns) on and the kill flag off,
-  one open unwrapped or deny-matching session turns every concurrent
-  step's match `argv_untrusted`, which the binder treats as ambiguous
-  (audit). One bad build downgrades all concurrent builds (4.4).
+  one open unwrapped or deny-matching session marks every concurrent
+  step's match `argv_untrusted` for review. The binder still applies the
+  matched policy, so other builds are not downgraded; a forged argv is
+  judged by another build's policy, never looser than the audit default
+  (equal when that key runs in audit). Its rows are filed under the
+  victim's project and job (and can feed the victim's learned allows in
+  learning mode), and the forger can seed the victim key's DNS-derived
+  allow set if the victim's policy allows an attacker-controlled name (4.4).
 
 The pre-bind SYN hold covers TCP only (IPv4 and IPv6 SYNs); UDP and other
 traffic of a not-yet-bound step is not held and passes in audit. The

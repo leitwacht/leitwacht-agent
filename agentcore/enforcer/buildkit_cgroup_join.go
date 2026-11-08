@@ -641,8 +641,15 @@ func (j *CgroupJoiner) tryWeakMatch(ctx context.Context, cgroupID uint64, evt Cg
 // matches: argv is controlled by the process (exec -a, setproctitle), so
 // a match proves nothing about which session owns the cgroup. Under a
 // policy, while any unauthorized, placeholder or deny-matching session
-// is open, no match is trusted and the cgroup is killed instead of
-// bound. Returns true when it killed (the caller must stop).
+// is open, no match is trusted. With the kill opt-in the cgroup is
+// killed instead of bound (forging argv must not dodge the kill);
+// returns stop=true then. With kill off the match is only flagged
+// (argv_untrusted, for anomaly review) and the binder still applies the
+// matched key's policy: a forger's own steps are unattributed and run in
+// audit with unrestricted egress anyway, so being judged by another
+// build's policy is never looser than that audit default (equal when the
+// matched key itself runs in audit), whereas downgrading to audit would switch off
+// enforcement for every concurrent build.
 func (j *CgroupJoiner) distrustArgvMatch(cgroupID uint64, evt CgroupCreateEvent, candidates int) (stop, untrusted bool) {
 	if !j.registry.EnforcementEnabled() || !j.registry.PolicyCandidates().Risky {
 		return false, false
@@ -650,8 +657,8 @@ func (j *CgroupJoiner) distrustArgvMatch(cgroupID uint64, evt CgroupCreateEvent,
 
 	if !j.killOnUnattributed {
 		// Flag, do not kill: the match is still used for attribution and
-		// binding (rule 1 binds an exact argv match), and the row carries
-		// argv_untrusted for anomaly review.
+		// binding (the binder classifies by candidate keys regardless of
+		// the flag), and the row carries argv_untrusted for review.
 		return false, true
 	}
 

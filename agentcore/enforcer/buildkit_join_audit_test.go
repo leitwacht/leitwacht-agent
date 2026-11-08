@@ -179,6 +179,53 @@ func TestJoinerDefault_SpoofedArgvFlaggedNotKilled(t *testing.T) {
 	if h.killed() {
 		t.Fatal("default config killed a spoof-suspect cgroup")
 	}
+
+	// The match stays a bound exact link keyed to the matched session:
+	// the flag is for review, the binder applies that key's policy.
+	b, _ := reg.LookupByCgroupID(4321)
+	if b.Ambiguous || b.SessionRef != "rA" || b.Strength != StrengthExactArgv ||
+		len(b.CandidateKeys) != 1 || b.CandidateKeys[0].Project != "g/p" {
+		t.Fatalf("flagged link lost its binding: %+v", b)
+	}
+
+	if got := classify(b); got.state != bkStateBound || got.key.Project != "g/p" {
+		t.Fatalf("classify(argv_untrusted join result) = %+v, want bound g/p", got)
+	}
+}
+
+// Kill on: the same Risky state kills the argv match (unchanged).
+func TestJoinerKillOn_SpoofedArgvKilled(t *testing.T) {
+	reg := NewSessionRegistry(time.Minute)
+	reg.SetCIRequirement(true, []string{FrontendAttrKeyProjectPath})
+	authedSession(reg, "rA", "[s 1/1] RUN make")
+	reg.RegisterSession("rB", time.Unix(1, 0), nil)
+
+	h := newJoinHarness(t, reg, 60*time.Millisecond, WithKillOnUnattributed(true))
+	cg := h.stage(t, "ctr-spoof", 68, "make\x00")
+	h.source.creates <- CgroupCreateEvent{ContainerID: "ctr-spoof", CgroupPath: cg}
+
+	waitFor(t, 2*time.Second, h.killed)
+
+	if _, ok := reg.LookupByCgroupID(4321); ok {
+		t.Fatal("a killed cgroup was linked")
+	}
+}
+
+// Not Risky: an argv match carries no flag.
+func TestJoinerDefault_NotRiskyArgvUnflagged(t *testing.T) {
+	reg := NewSessionRegistry(time.Minute)
+	reg.SetCIRequirement(true, []string{FrontendAttrKeyProjectPath})
+	authedSession(reg, "rA", "[s 1/1] RUN make")
+
+	h := newJoinHarness(t, reg, 60*time.Millisecond)
+	cg := h.stage(t, "ctr-ok", 69, "make\x00")
+	h.source.creates <- CgroupCreateEvent{ContainerID: "ctr-ok", CgroupPath: cg}
+
+	waitFor(t, 2*time.Second, func() bool {
+		b, ok := reg.LookupByCgroupID(4321)
+
+		return ok && b.SessionRef == "rA" && b.Flag == ""
+	})
 }
 
 func TestJoinerDefault_UnmatchedUnderRiskyPolicyBoundAmbiguousWithFlag(t *testing.T) {

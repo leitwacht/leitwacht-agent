@@ -367,12 +367,16 @@ func keyFromAttrs(attrs map[string]string) PolicyKey {
 // consults the policy: whether a bound key has an enforceable policy is
 // a separate step.
 func classify(b CgroupBinding) bindOutcome {
-	// An argv match made while an unauthorized, placeholder or denied
-	// session is open proves nothing about ownership (argv is forgeable):
-	// audit, never a policy chosen by it.
-	if b.Flag == BuildFlagArgvUntrusted {
-		return bindOutcome{state: bkStateAmbiguous, strength: StrengthAmbiguous, reason: EnfStateAmbiguous}
-	}
+	// BuildFlagArgvUntrusted is deliberately NOT downgraded here. It marks
+	// an argv match made while an unauthorized, placeholder or denied
+	// session was open, kept on the row for anomaly review. With the kill
+	// opt-in off (the only way the flag is produced) a forged argv can at
+	// worst link an unauthorized build's step to another build's key, and
+	// that step is judged by that key's policy: never looser than the
+	// unattributed audit default the forger already has (equal when the
+	// matched key itself runs in audit). Downgrading to
+	// audit would instead let one unwrapped build switch off enforcement
+	// for every concurrent build. Candidate keys decide, as for any binding.
 
 	keys := b.CandidateKeys
 

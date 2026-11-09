@@ -713,29 +713,43 @@ reading code only and should be checked on your runtime.
 How the watched daemon is found (all visible `buildkitd` processes are
 considered, by process name):
 
-- `grpcAddr` as `unix://<path>` (any path, including
-  `unix:///proc/<pid>/root/...`): the daemon holding a listening socket
-  on that file.
-- `grpcAddr` as `tcp://host:port`: the local daemon holding a listener on
-  that port. A Service whose port differs from its `targetPort` never
-  matches; the agent logs an Error once. Use the unix socket form or the
-  same port.
+- `grpcAddr` as `tcp://host:port`: the agent records its own established
+  gRPC connection. The watched daemon is the local buildkitd holding the
+  server end of that connection (an ESTABLISHED socket in its network
+  namespace whose peer is the agent's source address and port, and whose
+  socket is in its fd table). Another pod cannot fake this by listening on
+  the same port, and a Service port that differs from `targetPort` works.
+  While the connection is down the last tie is kept and re-tied on
+  reconnect. Only if no daemon matches the connection (for example NAT
+  rewrote the source address) does the agent fall back to matching the
+  listening port; if that finds several daemons it logs an Error and their
+  steps stay `daemon_unverified`.
+- `grpcAddr` as `unix://<path>` (including `unix:///proc/<pid>/root/...`):
+  the daemon holding a listener on that socket file. The path is resolved
+  inside the daemon's own root (`openat2` with `RESOLVE_IN_ROOT`), so
+  links in a pod's filesystem cannot point at the agent's files, and
+  compared by device and inode.
 
 Outcomes for a RUN cgroup:
 
 - Owner is the watched daemon: attributed as usual.
 - Owner is another local buildkitd: `build_flag: foreign_daemon`.
-- Owner cannot be resolved, or several local daemons match the address:
-  `build_flag: daemon_unverified`. The one exception: if the watched daemon
-  is the only buildkitd visible, an unresolved owner behaves as before
-  (nothing else could own the step).
-- No local daemon matches the address (the watched daemon is remote): every
-  step of a local buildkitd is `foreign_daemon` or `daemon_unverified`.
+- Owner cannot be resolved, or several local daemons tie equally:
+  `daemon_unverified`. The one exception: if the watched daemon is the only
+  buildkitd visible, an unresolved owner behaves as before (nothing else
+  could own the step).
+- No local daemon could be tied (the watched daemon is remote, or the agent
+  lacks permission): every step of a local buildkitd is `foreign_daemon` or
+  `daemon_unverified`.
 
-A second buildkitd (including a process that merely renames itself
-`buildkitd`, a docker-in-docker, or a `buildctl-daemonless` run in a CI
-job) never changes how the watched daemon's steps are treated. When two or
-more buildkitd processes are visible the agent logs an Error with each
+The guarantee: a second buildkitd (a docker-in-docker, a
+`buildctl-daemonless` run in a CI job, or a process that renames itself
+`buildkitd`) cannot cause a step to be attributed to the wrong job, and
+with a connection or socket tie it cannot change how the watched daemon's
+own steps are treated. With the listening-port fallback (NAT) a second
+daemon on the same port can leave the watched daemon's steps
+`daemon_unverified`: unattributed and audited, never a wrong job. When two
+or more buildkitd processes are visible the agent logs an Error with each
 pid and cgroup (repeated at most once a minute).
 
 Flagged steps link to no vertex and no session, are skipped by the
@@ -747,7 +761,9 @@ seconds and re-run when an owner does not match, so a daemon restart
 
 Requirements and limits:
 
-- The guard needs `hostPID` on the agent (section 3.2). Without it no
+- The guard needs `hostPID` on the agent (section 3.2), and enough
+  privilege to read other processes' fd tables and root (CAP_SYS_PTRACE
+  level; the shipped charts run privileged). Without it no
   buildkitd is visible; the guard cannot verify anything, attribution
   proceeds as before, and the agent logs one warning. Do not run several
   buildkitd instances in that setup.
@@ -790,8 +806,9 @@ Use these log lines (structured, metadata only) for diagnosis:
 | Log message | Meaning |
 | --- | --- |
 | `buildkit cgroup not attributed: no pending vertex matched before the join deadline` | A RUN cgroup could not be tied to a vertex. Fields: `pending_vertices`, `history_disconnected`, `suppressed_since_last` (the line is rate-limited). A steady stream means missing build-args, a command-matching problem or overlap. |
-| `buildkit RUN cgroup not attributed: its buildkitd is not the watched daemon` | The daemon-ancestry guard flagged a RUN cgroup (`flag`: `foreign_daemon` or `daemon_unverified`). Another buildkitd shares the cgroup parent; give each daemon its own `cgroupPaths` and pin the watched one (7.8). |
-| `buildkit daemon-ancestry guard: no local buildkitd listens on the watched address` | The watched address does not match any local listener (Service port differs from targetPort, or the daemon is remote). All local daemons' steps are left unattributed (7.8). |
+| `buildkit RUN cgroup not attributed: its buildkitd is not the watched daemon` | The daemon-ancestry guard flagged a RUN cgroup (`flag`: `foreign_daemon` or `daemon_unverified`). Another buildkitd shares the cgroup parent; give each daemon its own `cgroupPaths` (7.8). |
+| `buildkit daemon-ancestry guard: no local buildkitd could be tied to the watched address` | The watched daemon is not on this node, the agent cannot read other processes' fd tables or root (missing privilege), or the connection could not be matched. All local daemons' steps are left unattributed (7.8). |
+| `buildkit daemon-ancestry guard: no daemon matches the agent's gRPC connection` | Source address rewritten by NAT and several daemons share the port; their steps are `daemon_unverified` (7.8). |
 | `several buildkitd processes visible on this node` | Lists each pid and cgroup. Only steps of the daemon owning the watched address are attributed (7.8). |
 | `buildkit daemon-ancestry guard cannot verify which buildkitd owns RUN cgroups` | No buildkitd process visible: missing `hostPID` or remote daemon (7.8). Logged once. |
 | `buildkit cgroup glob matched zero paths` | `cgroupPaths` does not match yet or at all. |

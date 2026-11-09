@@ -125,6 +125,8 @@ type CgroupJoiner struct {
 	guardAddr string
 	guardOn   bool
 
+	guardTracker *BuildKitConnTracker
+
 	// gone marks containers whose cgroup was removed while their match
 	// was still pending: a late link for one goes straight to the retired
 	// cache (atomically), never through a live index entry.
@@ -250,6 +252,7 @@ func NewCgroupJoiner(registry *SessionRegistry, source CgroupEventSource, logger
 
 	if j.guardOn {
 		j.guard = newDaemonGuard(j.guardAddr, j.procRoot, logger)
+		j.guard.tracker = j.guardTracker
 	}
 
 	// Let the registry verify bindings against the cgroup's current
@@ -444,7 +447,12 @@ func (j *CgroupJoiner) tryMatchState(
 	}
 
 	if j.guard != nil {
-		if flag := j.guard.verdict(st.owner, st.ownerKnown); flag != "" {
+		flag, retry := j.guard.verdict(st.owner, st.ownerKnown, final || st.gone)
+		if retry {
+			return false
+		}
+
+		if flag != "" {
 			// An unresolved owner may still resolve on a later attempt
 			// (the first process can be a short-lived helper).
 			if flag == BuildFlagDaemonUnverified && !st.ownerKnown && !st.walkDef && !final && !st.gone {
@@ -894,7 +902,7 @@ func (j *CgroupJoiner) deferredMatch(
 			removedCh = nil
 
 			if st.goodArgv == nil {
-				if j.guard != nil && !st.ownerKnown && j.guard.verdict(0, false) == BuildFlagDaemonUnverified {
+				if j.guard != nil && !st.ownerKnown && j.daemonUnverifiedNow() {
 					// Never examined and the daemon cannot be proven: bind
 					// it unattributed (retired) so the session-level
 					// fallback does not guess a job for it.
@@ -1646,4 +1654,12 @@ func (j *CgroupJoiner) killCgroup(cgroupPath string) bool {
 	}
 
 	return true
+}
+
+// daemonUnverifiedNow reports whether a never-examined cgroup would be
+// judged daemon_unverified.
+func (j *CgroupJoiner) daemonUnverifiedNow() bool {
+	flag, _ := j.guard.verdict(0, false, true)
+
+	return flag == BuildFlagDaemonUnverified
 }

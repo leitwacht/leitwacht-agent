@@ -46,14 +46,17 @@ type daemonGuard struct {
 	logger   *slog.Logger
 	now      func() time.Time
 
+	tracker *BuildKitConnTracker // nil: no connection tie (port fallback only)
+
 	mu           sync.Mutex
 	scannedAt    time.Time
-	forcedAt     time.Time
+	scannedGen   uint64
 	daemons      []int // every visible buildkitd process
 	matching     []int // visible daemons that listen on grpcAddr
 	warnedNone   bool
 	warnedWalk   bool
 	warnedTie    bool
+	warnedPort   bool
 	loggedMulti  string
 	loggedMultiT time.Time
 }
@@ -62,37 +65,44 @@ func newDaemonGuard(grpcAddr, procRoot string, logger *slog.Logger) *daemonGuard
 	return &daemonGuard{procRoot: procRoot, addr: grpcAddr, logger: logger, now: time.Now}
 }
 
-// snapshot returns the cached daemon sets, rescanning when stale or forced.
-// A forced rescan is rate-limited to once per second.
-func (g *daemonGuard) snapshot(force bool) (daemons, matching []int) {
+// snapshot returns the cached daemon sets, rescanning when stale, when the
+// tracked connection changed, or when forced. A rescan is never repeated
+// within one second; refreshed reports whether this call rescanned or the
+// data is that fresh anyway (false: a forced rescan was suppressed).
+func (g *daemonGuard) snapshot(force bool) (daemons, matching []int, refreshed bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	now := g.now()
-	stale := g.scannedAt.IsZero() || now.Sub(g.scannedAt) >= daemonDiscoveryTTL
-	canForce := force && (g.forcedAt.IsZero() || now.Sub(g.forcedAt) >= time.Second)
 
-	if stale || canForce {
-		if canForce {
-			g.forcedAt = now
-		}
-
-		g.refreshLocked()
-		g.scannedAt = now
+	var gen uint64
+	if g.tracker != nil {
+		gen = g.tracker.Generation()
 	}
 
-	return g.daemons, g.matching
+	age := now.Sub(g.scannedAt)
+	stale := g.scannedAt.IsZero() || age >= daemonDiscoveryTTL || gen != g.scannedGen
+	recent := !g.scannedAt.IsZero() && age < time.Second
+
+	switch {
+	case stale && !recent, force && !recent:
+		g.refreshLocked()
+		g.scannedAt, g.scannedGen = now, gen
+
+		refreshed = true
+	case stale && recent:
+		// Connection changed within the last second: rescan next time.
+		refreshed = false
+	default:
+		refreshed = !force
+	}
+
+	return g.daemons, g.matching, refreshed
 }
 
 func (g *daemonGuard) refreshLocked() {
 	g.daemons = listDaemonPIDs(g.procRoot)
-	g.matching = nil
-
-	for _, d := range g.daemons {
-		if daemonListensOn(g.procRoot, d, g.addr) {
-			g.matching = append(g.matching, d)
-		}
-	}
+	g.matching = g.tieLocked()
 
 	if len(g.daemons) == 0 {
 		if !g.warnedNone {
@@ -110,10 +120,11 @@ func (g *daemonGuard) refreshLocked() {
 	if len(g.matching) == 0 && !g.warnedTie {
 		g.warnedTie = true
 
-		g.logger.Error("buildkit daemon-ancestry guard: no local buildkitd listens on the watched address; "+
-			"RUN steps of local buildkitd processes will be left unattributed. If the watched daemon is "+
-			"local, the address does not match its listener (a Service port that differs from targetPort "+
-			"never matches): use the unix socket form or the same port",
+		g.logger.Error("buildkit daemon-ancestry guard: no local buildkitd could be tied to the watched "+
+			"address; RUN steps of local buildkitd processes will be left unattributed. Either the watched "+
+			"daemon is not on this node, or the agent lacks permission to read other processes' fd tables "+
+			"and root (needs CAP_SYS_PTRACE-level access; the shipped charts run privileged), or the "+
+			"connection could not be matched (try the unix socket form)",
 			"grpc_addr", g.addr, "local_daemons", len(g.daemons))
 	}
 
@@ -144,6 +155,76 @@ func (g *daemonGuard) logMultiLocked() {
 		"buildkitd owns the watched address are attributed", attrs...)
 }
 
+// tieLocked finds the local daemons on the other end of grpcAddr.
+//   - unix:// address: the daemon holding a listener on that socket file.
+//   - tcp: the daemon with an ESTABLISHED socket whose peer is the agent's
+//     own gRPC connection (local address as recorded by the tracker). A
+//     pod cannot fake that by listening on the same port. While the
+//     connection is down the previous tie is kept. Only when no daemon
+//     matches by connection (source address rewritten by NAT) does it fall
+//     back to port matching.
+func (g *daemonGuard) tieLocked() []int {
+	if strings.HasPrefix(g.addr, "unix:") {
+		var out []int
+
+		for _, d := range g.daemons {
+			if unixListens(g.procRoot, d, g.addr) {
+				out = append(out, d)
+			}
+		}
+
+		return out
+	}
+
+	if g.tracker != nil {
+		if local, ok := g.tracker.Local(); ok {
+			var out []int
+
+			for _, d := range g.daemons {
+				if tcpEstablishedFrom(g.procRoot, d, local) {
+					out = append(out, d)
+				}
+			}
+
+			if len(out) > 0 {
+				return out
+			}
+		} else {
+			// Connection down: keep the last tie for daemons still alive.
+			var out []int
+
+			for _, d := range g.matching {
+				if pidIn(g.daemons, d) {
+					out = append(out, d)
+				}
+			}
+
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
+
+	var out []int
+
+	for _, d := range g.daemons {
+		if tcpListensOn(g.procRoot, d, g.addr) {
+			out = append(out, d)
+		}
+	}
+
+	if len(out) >= 2 && !g.warnedPort {
+		g.warnedPort = true
+
+		g.logger.Error("buildkit daemon-ancestry guard: no daemon matches the agent's gRPC connection "+
+			"(source address rewritten by NAT?) and several local daemons listen on the watched port; "+
+			"their RUN steps are left unverified",
+			"grpc_addr", g.addr, "candidates", len(out))
+	}
+
+	return out
+}
+
 func readCgroupLine(procRoot string, pid int) string {
 	b, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cgroup"))
 	if err != nil {
@@ -167,17 +248,24 @@ func pidIn(xs []int, x int) bool {
 
 // verdict returns "" when the RUN cgroup may be attributed to the watched
 // daemon, or the BuildFlag to stamp on it. owner is the outermost buildkitd
-// found by ancestry when ownerKnown.
-func (g *daemonGuard) verdict(owner int, ownerKnown bool) string {
-	daemons, matching := g.snapshot(false)
+// found by ancestry when ownerKnown. retry is true (non-final attempts only)
+// when the owner does not match but a forced rescan was suppressed by the
+// rate limit, so a later attempt may see a restarted daemon.
+func (g *daemonGuard) verdict(owner int, ownerKnown, final bool) (flag string, retry bool) {
+	daemons, matching, _ := g.snapshot(false)
 
 	if ownerKnown && !pidIn(matching, owner) {
-		// The watched daemon may have restarted (new pid): re-tie once.
-		daemons, matching = g.snapshot(true)
+		// The watched daemon may have restarted (new pid): re-tie.
+		var refreshed bool
+
+		daemons, matching, refreshed = g.snapshot(true)
+		if !refreshed && !final && !pidIn(matching, owner) {
+			return "", true
+		}
 	}
 
 	if len(daemons) == 0 {
-		return ""
+		return "", false
 	}
 
 	if !ownerKnown {
@@ -186,19 +274,19 @@ func (g *daemonGuard) verdict(owner int, ownerKnown bool) string {
 		// Only the watched daemon is visible: nothing else could own the
 		// step (also covers workers whose process tree hides buildkitd).
 		if len(daemons) == 1 && len(matching) == 1 {
-			return ""
+			return "", false
 		}
 
-		return BuildFlagDaemonUnverified
+		return BuildFlagDaemonUnverified, false
 	}
 
 	switch {
 	case !pidIn(matching, owner):
-		return BuildFlagForeignDaemon
+		return BuildFlagForeignDaemon, false
 	case len(matching) == 1:
-		return ""
+		return "", false
 	default:
-		return BuildFlagDaemonUnverified
+		return BuildFlagDaemonUnverified, false
 	}
 }
 
@@ -257,54 +345,125 @@ func isDaemonProc(procRoot string, pid int) bool {
 	return false
 }
 
-// daemonListensOn reports whether process pid owns a listening socket for
-// addr (unix:// path or tcp:// port). The socket must be held in pid's fd
-// table, so a process that merely shares the network namespace never matches.
-func daemonListensOn(procRoot string, pid int, addr string) bool {
-	p := strconv.Itoa(pid)
+// unixListens reports whether process pid owns a listening unix socket
+// for addr (unix://path). The path is resolved inside the daemon's own root
+// (never following links out of it) and compared by device+inode with the
+// agent's view of addr; the daemon must hold the socket in its fd table.
+func unixListens(procRoot string, pid int, addr string) bool {
+	path := strings.TrimPrefix(strings.TrimPrefix(addr, "unix:"), "//")
 
-	switch {
-	case strings.HasPrefix(addr, "unix:"):
-		path := strings.TrimPrefix(strings.TrimPrefix(addr, "unix:"), "//")
-
-		want, err := os.Stat(path)
-		if err != nil {
-			return false
-		}
-
-		for _, e := range listeningSockets(filepath.Join(procRoot, p, "net", "unix"), 6, 7, 3, "00010000") {
-			if e.path == "" || strings.HasPrefix(e.path, "@") {
-				continue
-			}
-
-			got, err := os.Stat(filepath.Join(procRoot, p, "root", e.path))
-			if err == nil && os.SameFile(want, got) && holdsSocket(procRoot, pid, e.inode) {
-				return true
-			}
-		}
-
+	want, ok := statID(path)
+	if !ok {
 		return false
-	case strings.HasPrefix(addr, "tcp:"):
-		_, port, err := net.SplitHostPort(strings.TrimPrefix(addr, "tcp://"))
-		if err != nil {
-			return false
+	}
+
+	p := strconv.Itoa(pid)
+	root := filepath.Join(procRoot, p, "root")
+
+	for _, e := range listeningSockets(filepath.Join(procRoot, p, "net", "unix"), 6, 7, 3, "00010000") {
+		if e.path == "" || strings.HasPrefix(e.path, "@") {
+			continue
 		}
 
-		n, err := strconv.Atoi(port)
-		if err != nil {
-			return false
+		if got, ok := statInRoot(root, e.path); ok && got == want && holdsSocket(procRoot, pid, e.inode) {
+			return true
 		}
+	}
 
-		for _, f := range []string{"tcp", "tcp6"} {
-			for _, e := range listeningSockets(filepath.Join(procRoot, p, "net", f), 9, 1, 3, "0A") {
-				if strings.HasSuffix(e.path, ":"+fmt.Sprintf("%04X", n)) && holdsSocket(procRoot, pid, e.inode) {
-					return true
-				}
+	return false
+}
+
+// tcpListensOn is the port fallback: pid holds a LISTEN socket on addr's port.
+func tcpListensOn(procRoot string, pid int, addr string) bool {
+	_, port, err := net.SplitHostPort(strings.TrimPrefix(addr, "tcp://"))
+	if err != nil {
+		return false
+	}
+
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return false
+	}
+
+	for _, f := range []string{"tcp", "tcp6"} {
+		for _, e := range listeningSockets(filepath.Join(procRoot, strconv.Itoa(pid), "net", f), 9, 1, 3, "0A") {
+			if strings.HasSuffix(e.path, ":"+fmt.Sprintf("%04X", n)) && holdsSocket(procRoot, pid, e.inode) {
+				return true
 			}
 		}
 	}
 
 	return false
+}
+
+// procAddr renders ip:port the way /proc/net/tcp{,6} does (each 32-bit
+// word byte-reversed, upper-case hex).
+func procAddr(ip net.IP, port int, v6 bool) string {
+	b := ip.To4()
+	if v6 || b == nil {
+		b = ip.To16()
+	}
+
+	var sb strings.Builder
+
+	for i := 0; i+3 < len(b); i += 4 {
+		fmt.Fprintf(&sb, "%02X%02X%02X%02X", b[i+3], b[i+2], b[i+1], b[i])
+	}
+
+	fmt.Fprintf(&sb, ":%04X", port)
+
+	return sb.String()
+}
+
+// tcpEstablishedFrom reports whether pid holds an ESTABLISHED socket whose
+// peer is the agent's connection (agent local address), i.e. pid is the
+// server end of the agent's own gRPC connection.
+func tcpEstablishedFrom(procRoot string, pid int, local net.Addr) bool {
+	ta, ok := local.(*net.TCPAddr)
+	if !ok {
+		return false
+	}
+
+	for _, f := range []struct {
+		name string
+		v6   bool
+	}{{"tcp", false}, {"tcp6", true}} {
+		if !f.v6 && ta.IP.To4() == nil {
+			continue
+		}
+
+		want := procAddr(ta.IP, ta.Port, f.v6)
+
+		for _, e := range establishedSockets(filepath.Join(procRoot, strconv.Itoa(pid), "net", f.name)) {
+			if e.path == want && holdsSocket(procRoot, pid, e.inode) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// establishedSockets returns ESTABLISHED rows of a /proc/net/tcp table with
+// path set to the REMOTE address.
+func establishedSockets(file string) []sockEntry {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil
+	}
+
+	var out []sockEntry
+
+	for i, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if i == 0 || len(f) < 10 || f[3] != "01" {
+			continue
+		}
+
+		out = append(out, sockEntry{inode: f[9], path: f[2]})
+	}
+
+	return out
 }
 
 type sockEntry struct {
@@ -430,6 +589,13 @@ func isDaemonBlockFlag(f string) bool {
 // buildkitd reached at grpcAddr (see the package comment above).
 func WithDaemonGuard(grpcAddr string) JoinerOption {
 	return func(j *CgroupJoiner) { j.guardAddr, j.guardOn = grpcAddr, true }
+}
+
+// WithDaemonConnTracker ties the watched daemon to the agent's own gRPC
+// connection (the watcher must be built with WithConnTracker on the same
+// tracker). Without it, tcp addresses fall back to port matching.
+func WithDaemonConnTracker(t *BuildKitConnTracker) JoinerOption {
+	return func(j *CgroupJoiner) { j.guardTracker = t }
 }
 
 // linkDaemonBlocked records an unattributable binding for a RUN cgroup

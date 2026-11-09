@@ -82,7 +82,9 @@ func startBuildKitAttribution(
 		)
 	}
 
-	watcher := enforcer.NewAttributionWatcher(cfg.BuildkitGRPCAddr, registry, log)
+	connTracker := enforcer.NewBuildKitConnTracker()
+	watcher := enforcer.NewAttributionWatcher(cfg.BuildkitGRPCAddr, registry, log,
+		enforcer.WithConnTracker(connTracker))
 
 	go func() {
 		err := watcher.Run(ctx)
@@ -140,7 +142,8 @@ func startBuildKitAttribution(
 
 			return enforcer.NewCgroupJoiner(registry, src, log,
 				enforcer.WithKillOnUnattributed(cfg.BuildkitKillOnUnattributed),
-				enforcer.WithDaemonGuard(cfg.BuildkitGRPCAddr))
+				enforcer.WithDaemonGuard(cfg.BuildkitGRPCAddr),
+				enforcer.WithDaemonConnTracker(connTracker))
 		},
 	}
 

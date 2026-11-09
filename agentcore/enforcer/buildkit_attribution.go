@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"regexp"
 	"sync"
@@ -1400,6 +1401,10 @@ type AttributionWatcher struct {
 	// default plaintext + keepalive options.
 	dialOpts []grpc.DialOption
 
+	// tracker, when set, records the established connection (see
+	// BuildKitConnTracker).
+	tracker *BuildKitConnTracker
+
 	// Reconnect backoff. Defaults: min 1s, max 60s, growth 2x.
 	minBackoff time.Duration
 	maxBackoff time.Duration
@@ -1653,6 +1658,23 @@ func (w *AttributionWatcher) connect(_ context.Context) (*grpc.ClientConn, error
 	if opts == nil {
 		opts = []grpc.DialOption{
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		}
+
+		if w.tracker != nil {
+			network := dialNetwork(w.addr)
+
+			opts = append(opts, grpc.WithContextDialer(func(ctx context.Context, address string) (net.Conn, error) {
+				var d net.Dialer
+
+				c, err := d.DialContext(ctx, network, address)
+				if err != nil {
+					return nil, err //nolint:wrapcheck // gRPC expects the raw dial error
+				}
+
+				w.tracker.set(c.LocalAddr(), c.RemoteAddr())
+
+				return &trackedConn{Conn: c, t: w.tracker}, nil
+			}))
 		}
 	}
 

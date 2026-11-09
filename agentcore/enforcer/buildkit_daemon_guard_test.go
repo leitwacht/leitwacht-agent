@@ -5,10 +5,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -105,6 +107,7 @@ type guardEnv struct {
 	reg  *SessionRegistry
 	log  *bytes.Buffer
 	j    *CgroupJoiner
+	clk  atomic.Int64 // guard clock, unix nanos
 }
 
 func newGuardEnv(t *testing.T, addr string, deferred time.Duration) *guardEnv {
@@ -129,8 +132,13 @@ func newGuardEnv(t *testing.T, addr string, deferred time.Duration) *guardEnv {
 		WithDaemonGuard(addr),
 	)
 
+	e.clk.Store(time.Now().UnixNano())
+	e.j.guard.now = func() time.Time { return time.Unix(0, e.clk.Load()) }
+
 	return e
 }
+
+func (e *guardEnv) advance(d time.Duration) { e.clk.Add(int64(d)) }
 
 // runUnder stages a RUN cgroup (process 5000 under runc 4000, whose parent
 // is parent; parent<0 leaves runc missing so the walk fails mid-way).
@@ -264,7 +272,7 @@ func TestDaemonGuard_RemoteWatchedDaemonLocalOneIsForeign(t *testing.T) {
 	b, ok := e.join(e.runUnder(3100))
 	assertBlocked(t, b, ok, BuildFlagForeignDaemon)
 
-	if !strings.Contains(e.log.String(), "no local buildkitd listens on the watched address") {
+	if !strings.Contains(e.log.String(), "no local buildkitd could be tied to the watched") {
 		t.Fatalf("expected the tie Error log:\n%s", e.log.String())
 	}
 }
@@ -305,9 +313,9 @@ func TestDaemonGuard_ZeroDaemonsUnchangedWarnOnce(t *testing.T) {
 	e := newGuardEnv(t, "tcp://remote:1234", 0)
 
 	assertLinkedB(t, guardBinding(e.join(e.runUnder(0))))
-	_, _ = e.j.guard.snapshot(true)
-	time.Sleep(1100 * time.Millisecond) // forced rescans are rate limited
-	_, _ = e.j.guard.snapshot(true)
+	_, _, _ = e.j.guard.snapshot(true)
+	e.advance(2 * time.Second) // forced rescans are rate limited
+	_, _, _ = e.j.guard.snapshot(true)
 
 	if n := strings.Count(e.log.String(), "cannot verify which buildkitd"); n != 1 {
 		t.Fatalf("warn count = %d, want 1:\n%s", n, e.log.String())
@@ -377,6 +385,7 @@ func TestDaemonGuard_DaemonRestartReties(t *testing.T) {
 	fakeTCPListener(t, e.root, 3500, 1234)
 
 	e.reg.UnlinkCgroup(guardCgID)
+	e.advance(2 * time.Second) // past the rescan rate limit
 
 	assertLinkedB(t, guardBinding(e.join(e.runUnder(3500))))
 }
@@ -484,4 +493,207 @@ func TestAncestorDaemon(t *testing.T) {
 	if _, ok, def := ancestorDaemon(pr, 999); ok || def {
 		t.Fatal("missing pid must not resolve definitively")
 	}
+}
+
+// fakeEstablished makes pid the server end of a connection from peer.
+func fakeEstablished(t *testing.T, root string, pid int, peer *net.TCPAddr) {
+	t.Helper()
+
+	pdir := filepath.Join(root, "proc", strconv.Itoa(pid))
+	ino := strconv.Itoa(70000 + pid)
+
+	guardWrite(t, filepath.Join(pdir, "net", "tcp"),
+		"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"+
+			"   0: 0A01010A:04D2 "+procAddr(peer.IP, peer.Port, false)+" 01 00000000:00000000 00:00000000 00000000     0        0 "+ino+" 1 0 0\n")
+	guardLink(t, "socket:["+ino+"]", filepath.Join(pdir, "fd", "5"))
+}
+
+func trackedAt(e *guardEnv, ip string, port int) *net.TCPAddr {
+	a := &net.TCPAddr{IP: net.ParseIP(ip), Port: port}
+	tr := NewBuildKitConnTracker()
+	tr.set(a, &net.TCPAddr{IP: net.ParseIP("10.1.1.10"), Port: 1234})
+	e.j.guard.tracker = tr
+
+	return a
+}
+
+func listenAndMaybeEstablish(t *testing.T, e *guardEnv, peer *net.TCPAddr, establishedPID int) {
+	t.Helper()
+
+	for _, pid := range []int{3000, 3100} {
+		fakeProc(t, e.root, pid, 1, "buildkitd")
+		fakeTCPListener(t, e.root, pid, 1234)
+	}
+
+	if establishedPID != 0 {
+		// Merge an ESTABLISHED row into the listener's table.
+		f := filepath.Join(e.root, "proc", strconv.Itoa(establishedPID), "net", "tcp")
+		b, _ := os.ReadFile(f)
+		ino := strconv.Itoa(70000 + establishedPID)
+
+		row := "   1: 0A01010A:04D2 " + procAddr(peer.IP, peer.Port, false) +
+			" 01 00000000:00000000 00:00000000 00000000     0        0 " + ino + " 1 0 0\n"
+		guardWrite(t, f, string(b)+row)
+		guardLink(t, "socket:["+ino+"]", filepath.Join(e.root, "proc", strconv.Itoa(establishedPID), "fd", "5"))
+	}
+}
+
+func TestDaemonGuard_ConnTieIgnoresSpoofListeningOnSamePort(t *testing.T) {
+	// Both daemons listen on 1234 (a pod listening on the same port); only
+	// the real daemon has the agent's connection.
+	peer := &net.TCPAddr{IP: net.ParseIP("10.1.1.5"), Port: 40000}
+
+	e := newGuardEnv(t, "tcp://h:1234", 0)
+	trackedAt(e, "10.1.1.5", 40000)
+	listenAndMaybeEstablish(t, e, peer, 3000)
+
+	assertLinkedB(t, guardBinding(e.join(e.runUnder(3000)))) // not downgraded
+}
+
+func TestDaemonGuard_ConnTieMarksOtherListenerForeign(t *testing.T) {
+	peer := &net.TCPAddr{IP: net.ParseIP("10.1.1.5"), Port: 40000}
+
+	e := newGuardEnv(t, "tcp://h:1234", 0)
+	trackedAt(e, "10.1.1.5", 40000)
+	listenAndMaybeEstablish(t, e, peer, 3000)
+
+	b, ok := e.join(e.runUnder(3100))
+	assertBlocked(t, b, ok, BuildFlagForeignDaemon)
+}
+
+func TestDaemonGuard_ConnDownKeepsLastTie(t *testing.T) {
+	peer := &net.TCPAddr{IP: net.ParseIP("10.1.1.5"), Port: 40000}
+
+	e := newGuardEnv(t, "tcp://h:1234", 0)
+	trackedAt(e, "10.1.1.5", 40000)
+	listenAndMaybeEstablish(t, e, peer, 3000)
+
+	assertLinkedB(t, guardBinding(e.join(e.runUnder(3000))))
+
+	e.j.guard.tracker.clear(e.j.guard.tracker.local)
+	e.reg.UnlinkCgroup(guardCgID)
+	e.advance(20 * time.Second)
+
+	assertLinkedB(t, guardBinding(e.join(e.runUnder(3000))))
+}
+
+func TestDaemonGuard_SNATFallbackToPort(t *testing.T) {
+	// The recorded source address matches no daemon (rewritten by NAT).
+	e := newGuardEnv(t, "tcp://h:1234", 0)
+	trackedAt(e, "10.9.9.9", 1)
+	fakeProc(t, e.root, 3000, 1, "buildkitd")
+	fakeTCPListener(t, e.root, 3000, 1234)
+
+	assertLinkedB(t, guardBinding(e.join(e.runUnder(3000))))
+
+	e2 := newGuardEnv(t, "tcp://h:1234", 0)
+	trackedAt(e2, "10.9.9.9", 1)
+	listenAndMaybeEstablish(t, e2, nil, 0)
+
+	b, ok := e2.join(e2.runUnder(3000))
+	assertBlocked(t, b, ok, BuildFlagDaemonUnverified)
+
+	if !strings.Contains(e2.log.String(), "source address rewritten by NAT") {
+		t.Fatalf("expected the NAT Error log:\n%s", e2.log.String())
+	}
+}
+
+// fakeUnixListenerAt is fakeUnixListener with a custom in-root socket path.
+func fakeUnixListenerAt(t *testing.T, root string, pid int, procPath string) (rootfs string) {
+	t.Helper()
+
+	rootfs = filepath.Join(root, "rootfs", strconv.Itoa(pid))
+	pdir := filepath.Join(root, "proc", strconv.Itoa(pid))
+	ino := strconv.Itoa(90000 + pid)
+
+	if err := os.MkdirAll(rootfs, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	guardLink(t, rootfs, filepath.Join(pdir, "root"))
+	guardWrite(t, filepath.Join(pdir, "net", "unix"),
+		"Num RefCount Protocol Flags Type St Inode Path\n"+
+			"0000: 00000002 00000000 00010000 0001 01 "+ino+" "+procPath+"\n")
+	guardLink(t, "socket:["+ino+"]", filepath.Join(pdir, "fd", "3"))
+
+	return rootfs
+}
+
+func TestDaemonGuard_UnixAbsoluteSymlinkInsideDaemonRoot(t *testing.T) {
+	e := newGuardEnv(t, "tcp://x:1", 0)
+	fakeProc(t, e.root, 3000, 1, "buildkitd")
+	fakeProc(t, e.root, 3100, 1, "buildkitd")
+
+	// Watched daemon: /var/run -> /run (absolute) inside its root.
+	rootfs := fakeUnixListenerAt(t, e.root, 3000, "/var/run/buildkit/buildkitd.sock")
+	sock := filepath.Join(rootfs, "run", "buildkit", "buildkitd.sock")
+	guardWrite(t, sock, "")
+	guardLink(t, "/run", filepath.Join(rootfs, "var", "run"))
+
+	// A pod-side symlink tries to point at the watched socket on the
+	// agent's filesystem by absolute path.
+	evil := fakeUnixListenerAt(t, e.root, 3100, "/run/buildkit/buildkitd.sock")
+	guardLink(t, sock, filepath.Join(evil, "run", "buildkit", "buildkitd.sock"))
+
+	e.j.guard.addr = "unix://" + sock
+
+	assertLinkedB(t, guardBinding(e.join(e.runUnder(3000))))
+
+	e.reg.UnlinkCgroup(guardCgID)
+	e.advance(2 * time.Second)
+
+	b, ok := e.join(e.runUnder(3100))
+	assertBlocked(t, b, ok, BuildFlagForeignDaemon)
+}
+
+func TestWalkInRootMatchesOpenat2(t *testing.T) {
+	root := t.TempDir()
+	guardWrite(t, filepath.Join(root, "run", "x.sock"), "")
+	guardLink(t, "/run", filepath.Join(root, "var", "run"))
+	guardLink(t, "../../../../etc/passwd", filepath.Join(root, "run", "escape"))
+
+	want, ok := statID(filepath.Join(root, "run", "x.sock"))
+	if !ok {
+		t.Fatal("stat")
+	}
+
+	for name, fn := range map[string]func(string, string) (fileID, bool){"openat2": statInRoot, "walk": walkInRoot} {
+		if got, ok := fn(root, "/var/run/x.sock"); !ok || got != want {
+			t.Errorf("%s: in-root symlink: got %v,%v", name, got, ok)
+		}
+
+		if _, ok := fn(root, "/run/escape"); ok {
+			t.Errorf("%s: escape symlink must not resolve outside root", name)
+		}
+	}
+}
+
+func TestDaemonGuard_SuppressedRescanRetriesInsteadOfForeign(t *testing.T) {
+	e := newGuardEnv(t, "tcp://h:1234", 400*time.Millisecond)
+	fakeProc(t, e.root, 3000, 1, "buildkitd")
+	fakeTCPListener(t, e.root, 3000, 1234)
+
+	// First scan (clock frozen): the owner below is a "restarted" daemon.
+	_, _, _ = e.j.guard.snapshot(false)
+
+	fakeProc(t, e.root, 3600, 1, "buildkitd")
+	fakeTCPListener(t, e.root, 3600, 1234)
+	if err := os.RemoveAll(filepath.Join(e.root, "proc", "3000")); err != nil {
+		t.Fatal(err)
+	}
+
+	evt := e.runUnder(3600)
+	e.j.handleCreate(context.Background(), evt)
+
+	if _, ok := e.reg.LookupByCgroupID(guardCgID); ok {
+		t.Fatal("must not conclude foreign while the rescan is suppressed")
+	}
+
+	e.advance(2 * time.Second)
+
+	waitFor(t, time.Second, func() bool {
+		b, ok := e.reg.LookupByCgroupID(guardCgID)
+
+		return ok && b.Flag == ""
+	})
 }

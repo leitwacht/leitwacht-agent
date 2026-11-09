@@ -51,8 +51,12 @@ type daemonGuard struct {
 	mu           sync.Mutex
 	scannedAt    time.Time
 	scannedGen   uint64
-	daemons      []int // every visible buildkitd process
-	matching     []int // visible daemons that listen on grpcAddr
+	genAt        time.Time // when the tracked connection last changed
+	daemons      []int     // every visible buildkitd process
+	matching     []int     // visible daemons tied to grpcAddr
+	weak         bool      // the tie is port-only (not proof)
+	unsettled    bool      // live connection held by no local daemon yet
+	warnedOpen   bool
 	warnedNone   bool
 	warnedWalk   bool
 	warnedTie    bool
@@ -65,11 +69,20 @@ func newDaemonGuard(grpcAddr, procRoot string, logger *slog.Logger) *daemonGuard
 	return &daemonGuard{procRoot: procRoot, addr: grpcAddr, logger: logger, now: time.Now}
 }
 
+type guardView struct {
+	daemons, matching []int
+	weak              bool
+	// refreshed is false when a forced rescan was suppressed by the rate
+	// limit.
+	refreshed bool
+}
+
 // snapshot returns the cached daemon sets, rescanning when stale, when the
-// tracked connection changed, or when forced. A rescan is never repeated
-// within one second; refreshed reports whether this call rescanned or the
-// data is that fresh anyway (false: a forced rescan was suppressed).
-func (g *daemonGuard) snapshot(force bool) (daemons, matching []int, refreshed bool) {
+// tracked connection changed (always: a pre-reconnect tie is never
+// authoritative), when a live connection was not yet held by any local
+// daemon (re-checked after a second: accept may lag the handshake), or
+// when forced. A forced rescan is never repeated within one second.
+func (g *daemonGuard) snapshot(force bool) guardView {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -81,28 +94,28 @@ func (g *daemonGuard) snapshot(force bool) (daemons, matching []int, refreshed b
 	}
 
 	age := now.Sub(g.scannedAt)
-	stale := g.scannedAt.IsZero() || age >= daemonDiscoveryTTL || gen != g.scannedGen
 	recent := !g.scannedAt.IsZero() && age < time.Second
+	stale := g.scannedAt.IsZero() || age >= daemonDiscoveryTTL || gen != g.scannedGen ||
+		(g.unsettled && !recent && now.Sub(g.genAt) < 5*time.Second)
 
-	switch {
-	case stale && !recent, force && !recent:
+	refreshed := !force
+
+	if stale || (force && !recent) {
+		if gen != g.scannedGen {
+			g.genAt = now
+		}
+
 		g.refreshLocked()
 		g.scannedAt, g.scannedGen = now, gen
-
 		refreshed = true
-	case stale && recent:
-		// Connection changed within the last second: rescan next time.
-		refreshed = false
-	default:
-		refreshed = !force
 	}
 
-	return g.daemons, g.matching, refreshed
+	return guardView{daemons: g.daemons, matching: g.matching, weak: g.weak, refreshed: refreshed}
 }
 
 func (g *daemonGuard) refreshLocked() {
 	g.daemons = listDaemonPIDs(g.procRoot)
-	g.matching = g.tieLocked()
+	g.matching, g.weak = g.tieLocked()
 
 	if len(g.daemons) == 0 {
 		if !g.warnedNone {
@@ -155,74 +168,79 @@ func (g *daemonGuard) logMultiLocked() {
 		"buildkitd owns the watched address are attributed", attrs...)
 }
 
-// tieLocked finds the local daemons on the other end of grpcAddr.
-//   - unix:// address: the daemon holding a listener on that socket file.
-//   - tcp: the daemon with an ESTABLISHED socket whose peer is the agent's
-//     own gRPC connection (local address as recorded by the tracker). A
-//     pod cannot fake that by listening on the same port. While the
-//     connection is down the previous tie is kept. Only when no daemon
-//     matches by connection (source address rewritten by NAT) does it fall
-//     back to port matching.
-func (g *daemonGuard) tieLocked() []int {
-	if strings.HasPrefix(g.addr, "unix:") {
-		var out []int
+// tieLocked finds the local daemons on the other end of grpcAddr; weak is
+// true when the tie is only a port match (never proof).
+//   - unix:// address: the daemon holding a listener on that socket file,
+//     resolved inside its root. Without openat2 nothing matches.
+//   - tcp, live agent connection: the daemon holding the server end of it.
+//     If no local daemon does, the watched daemon is remote and nothing
+//     matches (every local daemon is foreign).
+//   - tcp, connection down: the previous tie is kept for daemons still
+//     alive.
+//   - tcp, no connection information at all: the daemons listening on the
+//     port, as a weak tie.
+func (g *daemonGuard) tieLocked() (pids []int, weak bool) {
+	g.unsettled = false
 
+	if strings.HasPrefix(g.addr, "unix:") {
 		for _, d := range g.daemons {
 			if unixListens(g.procRoot, d, g.addr) {
-				out = append(out, d)
+				pids = append(pids, d)
 			}
 		}
 
-		return out
+		if openat2Unavailable.Load() && !g.warnedOpen {
+			g.warnedOpen = true
+
+			g.logger.Error("buildkit daemon-ancestry guard: openat2(RESOLVE_IN_ROOT) is unavailable " +
+				"(old kernel or seccomp); the unix socket tie fails closed and local buildkitd steps " +
+				"are left unattributed")
+		}
+
+		return pids, false
 	}
 
 	if g.tracker != nil {
 		if local, ok := g.tracker.Local(); ok {
-			var out []int
-
 			for _, d := range g.daemons {
 				if tcpEstablishedFrom(g.procRoot, d, local) {
-					out = append(out, d)
+					pids = append(pids, d)
 				}
 			}
 
-			if len(out) > 0 {
-				return out
-			}
-		} else {
-			// Connection down: keep the last tie for daemons still alive.
-			var out []int
+			g.unsettled = len(pids) == 0
 
-			for _, d := range g.matching {
-				if pidIn(g.daemons, d) {
-					out = append(out, d)
-				}
-			}
+			return pids, false
+		}
 
-			if len(out) > 0 {
-				return out
+		// Connection down: keep the last tie for daemons still alive.
+		for _, d := range g.matching {
+			if pidIn(g.daemons, d) {
+				pids = append(pids, d)
 			}
 		}
-	}
 
-	var out []int
+		if len(pids) > 0 {
+			return pids, g.weak
+		}
+	}
 
 	for _, d := range g.daemons {
 		if tcpListensOn(g.procRoot, d, g.addr) {
-			out = append(out, d)
+			pids = append(pids, d)
 		}
 	}
 
-	if len(out) >= 2 && !g.warnedPort {
+	if len(pids) > 0 && !g.warnedPort {
 		g.warnedPort = true
 
-		g.logger.Error("buildkit daemon-ancestry guard: no daemon matches the agent's gRPC connection "+
-			"(source address rewritten by NAT?) and several local daemons listen on the watched port; "+
-			"their RUN steps are left unverified",
-			"grpc_addr", g.addr, "candidates", len(out))
+		g.logger.Error("buildkit daemon-ancestry guard: no connection information to tie the watched "+
+			"daemon; only the listening port matches, which is not proof. Steps of those daemons are "+
+			"left unverified",
+			"grpc_addr", g.addr, "candidates", len(pids))
 	}
 
-	return out
+	return pids, true
 }
 
 func readCgroupLine(procRoot string, pid int) string {
@@ -252,19 +270,17 @@ func pidIn(xs []int, x int) bool {
 // when the owner does not match but a forced rescan was suppressed by the
 // rate limit, so a later attempt may see a restarted daemon.
 func (g *daemonGuard) verdict(owner int, ownerKnown, final bool) (flag string, retry bool) {
-	daemons, matching, _ := g.snapshot(false)
+	v := g.snapshot(false)
 
-	if ownerKnown && !pidIn(matching, owner) {
+	if ownerKnown && !pidIn(v.matching, owner) {
 		// The watched daemon may have restarted (new pid): re-tie.
-		var refreshed bool
-
-		daemons, matching, refreshed = g.snapshot(true)
-		if !refreshed && !final && !pidIn(matching, owner) {
+		v = g.snapshot(true)
+		if !v.refreshed && !final && !pidIn(v.matching, owner) {
 			return "", true
 		}
 	}
 
-	if len(daemons) == 0 {
+	if len(v.daemons) == 0 {
 		return "", false
 	}
 
@@ -273,7 +289,7 @@ func (g *daemonGuard) verdict(owner int, ownerKnown, final bool) (flag string, r
 
 		// Only the watched daemon is visible: nothing else could own the
 		// step (also covers workers whose process tree hides buildkitd).
-		if len(daemons) == 1 && len(matching) == 1 {
+		if !v.weak && len(v.daemons) == 1 && len(v.matching) == 1 {
 			return "", false
 		}
 
@@ -281,12 +297,12 @@ func (g *daemonGuard) verdict(owner int, ownerKnown, final bool) (flag string, r
 	}
 
 	switch {
-	case !pidIn(matching, owner):
+	case !pidIn(v.matching, owner):
 		return BuildFlagForeignDaemon, false
-	case len(matching) == 1:
-		return "", false
-	default:
+	case v.weak || len(v.matching) != 1:
 		return BuildFlagDaemonUnverified, false
+	default:
+		return "", false
 	}
 }
 

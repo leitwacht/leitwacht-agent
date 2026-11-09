@@ -1660,8 +1660,10 @@ func (w *AttributionWatcher) connect(_ context.Context) (*grpc.ClientConn, error
 			grpc.WithTransportCredentials(insecure.NewCredentials()),
 		}
 
-		if w.tracker != nil {
-			network := dialNetwork(w.addr)
+		// Only tcp targets are tracked; the unix tie needs no connection.
+		// The custom dialer bypasses gRPC's HTTP proxy environment support.
+		if w.tracker != nil && dialNetwork(w.addr) == "tcp" {
+			network := "tcp"
 
 			opts = append(opts, grpc.WithContextDialer(func(ctx context.Context, address string) (net.Conn, error) {
 				var d net.Dialer

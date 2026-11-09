@@ -13,6 +13,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/connectivity"
 )
 
 const guardCgID = 777
@@ -62,6 +66,22 @@ func fakeUnixListener(t *testing.T, root string, pid int) string {
 	guardLink(t, "socket:["+ino+"]", filepath.Join(pdir, "fd", "3"))
 
 	return sock
+}
+
+// fakeWatchedTCP makes pid listen on port AND hold the server end of the
+// agent's connection (the default tracked peer 10.1.1.5:40000).
+func fakeWatchedTCP(t *testing.T, root string, pid, port int) {
+	t.Helper()
+
+	fakeTCPListener(t, root, pid, port)
+
+	f := filepath.Join(root, "proc", strconv.Itoa(pid), "net", "tcp")
+	b, _ := os.ReadFile(f)
+	ino := strconv.Itoa(70000 + pid)
+
+	guardWrite(t, f, string(b)+"   1: 0A01010A:04D2 "+procAddr(net.ParseIP("10.1.1.5"), 40000, false)+
+		" 01 00000000:00000000 00:00000000 00000000     0        0 "+ino+" 1 0 0\n")
+	guardLink(t, "socket:["+ino+"]", filepath.Join(root, "proc", strconv.Itoa(pid), "fd", "5"))
 }
 
 // fakeTCPListener makes daemon pid listen on port.
@@ -131,6 +151,12 @@ func newGuardEnv(t *testing.T, addr string, deferred time.Duration) *guardEnv {
 		WithDeferredMatch(deferred, 10*time.Millisecond),
 		WithDaemonGuard(addr),
 	)
+
+	if strings.HasPrefix(addr, "tcp:") {
+		tr := NewBuildKitConnTracker()
+		tr.set(&net.TCPAddr{IP: net.ParseIP("10.1.1.5"), Port: 40000}, &net.TCPAddr{IP: net.ParseIP("10.1.1.10"), Port: 1234})
+		e.j.guard.tracker = tr
+	}
 
 	e.clk.Store(time.Now().UnixNano())
 	e.j.guard.now = func() time.Time { return time.Unix(0, e.clk.Load()) }
@@ -243,14 +269,14 @@ func TestDaemonGuard_TCPSingleLocalUnrelatedDaemonDoesNotTakeOver(t *testing.T) 
 	e := newGuardEnv(t, "tcp://buildkitd.ns.svc:1234", 0)
 	fakeProc(t, e.root, 3000, 1, "buildkitd")
 	fakeProc(t, e.root, 3100, 1, "buildkitd")
-	fakeTCPListener(t, e.root, 3000, 1234)
+	fakeWatchedTCP(t, e.root, 3000, 1234)
 
 	assertLinkedB(t, guardBinding(e.join(e.runUnder(3000))))
 
 	e2 := newGuardEnv(t, "tcp://buildkitd.ns.svc:1234", 0)
 	fakeProc(t, e2.root, 3000, 1, "buildkitd")
 	fakeProc(t, e2.root, 3100, 1, "buildkitd")
-	fakeTCPListener(t, e2.root, 3000, 1234)
+	fakeWatchedTCP(t, e2.root, 3000, 1234)
 
 	b, ok := e2.join(e2.runUnder(3100))
 	assertBlocked(t, b, ok, BuildFlagForeignDaemon)
@@ -292,8 +318,8 @@ func TestDaemonGuard_SeveralMatchingDaemons(t *testing.T) {
 	fakeProc(t, e.root, 3000, 1, "buildkitd")
 	fakeProc(t, e.root, 3100, 1, "buildkitd")
 	fakeProc(t, e.root, 3200, 1, "buildkitd")
-	fakeTCPListener(t, e.root, 3000, 1234)
-	fakeTCPListener(t, e.root, 3100, 1234)
+	fakeWatchedTCP(t, e.root, 3000, 1234)
+	fakeWatchedTCP(t, e.root, 3100, 1234)
 
 	b, ok := e.join(e.runUnder(3000))
 	assertBlocked(t, b, ok, BuildFlagDaemonUnverified)
@@ -302,8 +328,8 @@ func TestDaemonGuard_SeveralMatchingDaemons(t *testing.T) {
 	fakeProc(t, e2.root, 3000, 1, "buildkitd")
 	fakeProc(t, e2.root, 3100, 1, "buildkitd")
 	fakeProc(t, e2.root, 3200, 1, "buildkitd")
-	fakeTCPListener(t, e2.root, 3000, 1234)
-	fakeTCPListener(t, e2.root, 3100, 1234)
+	fakeWatchedTCP(t, e2.root, 3000, 1234)
+	fakeWatchedTCP(t, e2.root, 3100, 1234)
 
 	b, ok = e2.join(e2.runUnder(3200))
 	assertBlocked(t, b, ok, BuildFlagForeignDaemon)
@@ -313,9 +339,9 @@ func TestDaemonGuard_ZeroDaemonsUnchangedWarnOnce(t *testing.T) {
 	e := newGuardEnv(t, "tcp://remote:1234", 0)
 
 	assertLinkedB(t, guardBinding(e.join(e.runUnder(0))))
-	_, _, _ = e.j.guard.snapshot(true)
+	_ = e.j.guard.snapshot(true)
 	e.advance(2 * time.Second) // forced rescans are rate limited
-	_, _, _ = e.j.guard.snapshot(true)
+	_ = e.j.guard.snapshot(true)
 
 	if n := strings.Count(e.log.String(), "cannot verify which buildkitd"); n != 1 {
 		t.Fatalf("warn count = %d, want 1:\n%s", n, e.log.String())
@@ -327,7 +353,7 @@ func TestDaemonGuard_OnlyWatchedVisibleUnresolvedOwnerUnchanged(t *testing.T) {
 	// process tree does not lead to it. Today's behaviour is kept.
 	e := newGuardEnv(t, "tcp://h:1234", 0)
 	fakeProc(t, e.root, 3000, 1, "buildkitd")
-	fakeTCPListener(t, e.root, 3000, 1234)
+	fakeWatchedTCP(t, e.root, 3000, 1234)
 
 	assertLinkedB(t, guardBinding(e.join(e.runUnder(1))))
 
@@ -339,7 +365,7 @@ func TestDaemonGuard_OnlyWatchedVisibleUnresolvedOwnerUnchanged(t *testing.T) {
 func TestDaemonGuard_SpoofedSecondDaemonDoesNotDowngradeWatched(t *testing.T) {
 	e := newGuardEnv(t, "tcp://h:1234", 0)
 	fakeProc(t, e.root, 3000, 1, "buildkitd")
-	fakeTCPListener(t, e.root, 3000, 1234)
+	fakeWatchedTCP(t, e.root, 3000, 1234)
 	// A CI job process renames itself buildkitd.
 	fakeProc(t, e.root, 3300, 1, "buildkitd")
 
@@ -361,7 +387,7 @@ func TestDaemonGuard_SpoofedNameInsideRunStepResolvesOutermost(t *testing.T) {
 func TestDaemonGuard_NestedDaemonInJobIsForeign(t *testing.T) {
 	e := newGuardEnv(t, "tcp://h:1234", 0)
 	fakeProc(t, e.root, 3000, 1, "buildkitd")
-	fakeTCPListener(t, e.root, 3000, 1234)
+	fakeWatchedTCP(t, e.root, 3000, 1234)
 	fakeProc(t, e.root, 2000, 1, "sh") // CI job shell
 	fakeProc(t, e.root, 3400, 2000, "buildkitd")
 
@@ -372,7 +398,7 @@ func TestDaemonGuard_NestedDaemonInJobIsForeign(t *testing.T) {
 func TestDaemonGuard_DaemonRestartReties(t *testing.T) {
 	e := newGuardEnv(t, "tcp://h:1234", 0)
 	fakeProc(t, e.root, 3000, 1, "buildkitd")
-	fakeTCPListener(t, e.root, 3000, 1234)
+	fakeWatchedTCP(t, e.root, 3000, 1234)
 
 	assertLinkedB(t, guardBinding(e.join(e.runUnder(3000))))
 
@@ -382,7 +408,7 @@ func TestDaemonGuard_DaemonRestartReties(t *testing.T) {
 	}
 
 	fakeProc(t, e.root, 3500, 1, "buildkitd")
-	fakeTCPListener(t, e.root, 3500, 1234)
+	fakeWatchedTCP(t, e.root, 3500, 1234)
 
 	e.reg.UnlinkCgroup(guardCgID)
 	e.advance(2 * time.Second) // past the rescan rate limit
@@ -394,7 +420,7 @@ func TestDaemonGuard_RetryResolvesOwnerLater(t *testing.T) {
 	e := newGuardEnv(t, "tcp://h:1234", 2*time.Second)
 	fakeProc(t, e.root, 3000, 1, "buildkitd")
 	fakeProc(t, e.root, 3100, 1, "buildkitd")
-	fakeTCPListener(t, e.root, 3000, 1234)
+	fakeWatchedTCP(t, e.root, 3000, 1234)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -420,7 +446,7 @@ func TestDaemonGuard_DefinitiveFailureLinksImmediately(t *testing.T) {
 	e := newGuardEnv(t, "tcp://h:1234", 5*time.Second)
 	fakeProc(t, e.root, 3000, 1, "buildkitd")
 	fakeProc(t, e.root, 3100, 1, "buildkitd")
-	fakeTCPListener(t, e.root, 3000, 1234)
+	fakeWatchedTCP(t, e.root, 3000, 1234)
 
 	start := time.Now()
 	b, ok := e.join(e.runUnder(1)) // walk completes at init: not found
@@ -436,7 +462,7 @@ func TestDaemonGuard_RemovedBeforeResolvedIsUnverified(t *testing.T) {
 	e := newGuardEnv(t, "tcp://h:1234", 2*time.Second)
 	fakeProc(t, e.root, 3000, 1, "buildkitd")
 	fakeProc(t, e.root, 3100, 1, "buildkitd")
-	fakeTCPListener(t, e.root, 3000, 1234)
+	fakeWatchedTCP(t, e.root, 3000, 1234)
 
 	cg := filepath.Join(e.root, "cgroups", "ctr-guard")
 	guardWrite(t, filepath.Join(cg, "cgroup.procs"), "") // empty: nothing readable
@@ -570,32 +596,49 @@ func TestDaemonGuard_ConnDownKeepsLastTie(t *testing.T) {
 
 	assertLinkedB(t, guardBinding(e.join(e.runUnder(3000))))
 
-	e.j.guard.tracker.clear(e.j.guard.tracker.local)
+	l, _ := e.j.guard.tracker.Local()
+	e.j.guard.tracker.clear(l)
 	e.reg.UnlinkCgroup(guardCgID)
 	e.advance(20 * time.Second)
 
 	assertLinkedB(t, guardBinding(e.join(e.runUnder(3000))))
 }
 
-func TestDaemonGuard_SNATFallbackToPort(t *testing.T) {
-	// The recorded source address matches no daemon (rewritten by NAT).
+func TestDaemonGuard_LiveConnHeldByNoLocalDaemonIsRemote(t *testing.T) {
+	// The agent's connection is held by no local daemon: the watched
+	// daemon is remote, so a local daemon on the same port is foreign.
 	e := newGuardEnv(t, "tcp://h:1234", 0)
-	trackedAt(e, "10.9.9.9", 1)
 	fakeProc(t, e.root, 3000, 1, "buildkitd")
 	fakeTCPListener(t, e.root, 3000, 1234)
 
-	assertLinkedB(t, guardBinding(e.join(e.runUnder(3000))))
+	b, ok := e.join(e.runUnder(3000))
+	assertBlocked(t, b, ok, BuildFlagForeignDaemon)
+}
 
-	e2 := newGuardEnv(t, "tcp://h:1234", 0)
-	trackedAt(e2, "10.9.9.9", 1)
-	listenAndMaybeEstablish(t, e2, nil, 0)
+func TestDaemonGuard_PortFallbackIsNeverProof(t *testing.T) {
+	// No connection information at all: a lone listener on the port is
+	// only a weak tie and must not yield a link.
+	e := newGuardEnv(t, "tcp://h:1234", 0)
+	e.j.guard.tracker = nil
+	fakeProc(t, e.root, 3000, 1, "buildkitd")
+	fakeTCPListener(t, e.root, 3000, 1234)
 
-	b, ok := e2.join(e2.runUnder(3000))
+	b, ok := e.join(e.runUnder(3000))
 	assertBlocked(t, b, ok, BuildFlagDaemonUnverified)
 
-	if !strings.Contains(e2.log.String(), "source address rewritten by NAT") {
-		t.Fatalf("expected the NAT Error log:\n%s", e2.log.String())
+	if !strings.Contains(e.log.String(), "only the listening port matches") {
+		t.Fatalf("expected the weak-tie Error log:\n%s", e.log.String())
 	}
+
+	// A daemon that does not even listen on the port is provably foreign.
+	e2 := newGuardEnv(t, "tcp://h:1234", 0)
+	e2.j.guard.tracker = nil
+	fakeProc(t, e2.root, 3000, 1, "buildkitd")
+	fakeProc(t, e2.root, 3100, 1, "buildkitd")
+	fakeTCPListener(t, e2.root, 3000, 1234)
+
+	b, ok = e2.join(e2.runUnder(3100))
+	assertBlocked(t, b, ok, BuildFlagForeignDaemon)
 }
 
 // fakeUnixListenerAt is fakeUnixListener with a custom in-root socket path.
@@ -646,7 +689,7 @@ func TestDaemonGuard_UnixAbsoluteSymlinkInsideDaemonRoot(t *testing.T) {
 	assertBlocked(t, b, ok, BuildFlagForeignDaemon)
 }
 
-func TestWalkInRootMatchesOpenat2(t *testing.T) {
+func TestStatInRootConfinesSymlinks(t *testing.T) {
 	root := t.TempDir()
 	guardWrite(t, filepath.Join(root, "run", "x.sock"), "")
 	guardLink(t, "/run", filepath.Join(root, "var", "run"))
@@ -657,27 +700,129 @@ func TestWalkInRootMatchesOpenat2(t *testing.T) {
 		t.Fatal("stat")
 	}
 
-	for name, fn := range map[string]func(string, string) (fileID, bool){"openat2": statInRoot, "walk": walkInRoot} {
-		if got, ok := fn(root, "/var/run/x.sock"); !ok || got != want {
-			t.Errorf("%s: in-root symlink: got %v,%v", name, got, ok)
-		}
+	if got, ok := statInRoot(root, "/var/run/x.sock"); !ok || got != want {
+		t.Errorf("in-root symlink: got %v,%v", got, ok)
+	}
 
-		if _, ok := fn(root, "/run/escape"); ok {
-			t.Errorf("%s: escape symlink must not resolve outside root", name)
+	if _, ok := statInRoot(root, "/run/escape"); ok {
+		t.Error("escape symlink must not resolve outside root")
+	}
+}
+
+func TestDaemonGuard_UnixFailsClosedWithoutOpenat2(t *testing.T) {
+	old := openat2Fn
+	openat2Fn = func(int, string, *unix.OpenHow) (int, error) { return -1, unix.ENOSYS }
+
+	defer func() { openat2Fn = old; openat2Unavailable.Store(false) }()
+
+	e := newGuardEnv(t, "tcp://x:1", 0)
+	fakeProc(t, e.root, 3000, 1, "buildkitd")
+	sock := fakeUnixListener(t, e.root, 3000)
+	e.j.guard.addr = "unix://" + sock
+
+	b, ok := e.join(e.runUnder(3000))
+	assertBlocked(t, b, ok, BuildFlagForeignDaemon)
+
+	if !strings.Contains(e.log.String(), "openat2(RESOLVE_IN_ROOT) is unavailable") {
+		t.Fatalf("expected the openat2 Error log:\n%s", e.log.String())
+	}
+}
+
+// connectOnce dials via the production connect() and waits until Ready.
+func connectOnce(t *testing.T, addr string, tr *BuildKitConnTracker, srvNet, srvAddr string) *grpc.ClientConn {
+	t.Helper()
+
+	ln, err := net.Listen(srvNet, srvAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv := grpc.NewServer()
+
+	go func() { _ = srv.Serve(ln) }()
+
+	t.Cleanup(srv.Stop)
+
+	if addr == "" {
+		addr = "tcp://" + ln.Addr().String()
+	}
+
+	w := NewAttributionWatcher(addr, NewSessionRegistry(time.Minute), nil, WithConnTracker(tr))
+
+	conn, err := w.connect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = conn.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn.Connect()
+
+	for s := conn.GetState(); s != connectivity.Ready; s = conn.GetState() {
+		if !conn.WaitForStateChange(ctx, s) {
+			t.Fatalf("connection never became ready (state %v)", conn.GetState())
 		}
+	}
+
+	return conn
+}
+
+func TestWatcherConnect_TCPTracked(t *testing.T) {
+	tr := NewBuildKitConnTracker()
+	conn := connectOnce(t, "", tr, "tcp", "127.0.0.1:0")
+
+	if l, ok := tr.Local(); !ok || l == nil {
+		t.Fatal("tracker did not record the tcp connection")
+	}
+
+	_ = conn.Close()
+
+	waitFor(t, time.Second, func() bool { _, ok := tr.Local(); return !ok })
+}
+
+func TestWatcherConnect_UnixWorksWithTracker(t *testing.T) {
+	tr := NewBuildKitConnTracker()
+	path := filepath.Join(t.TempDir(), "bk.sock")
+
+	connectOnce(t, "unix://"+path, tr, "unix", path)
+
+	if _, ok := tr.Local(); ok {
+		t.Fatal("unix connections are not tracked")
+	}
+}
+
+func TestConnTracker_RefcountedPerLocalAddr(t *testing.T) {
+	tr := NewBuildKitConnTracker()
+	a := &net.TCPAddr{IP: net.ParseIP("10.0.0.1"), Port: 5}
+
+	tr.set(a, a)
+	tr.set(a, a)
+	tr.clear(a)
+
+	if _, ok := tr.Local(); !ok {
+		t.Fatal("one reference left: connection must stay tracked")
+	}
+
+	tr.clear(a)
+
+	if _, ok := tr.Local(); ok {
+		t.Fatal("all references released")
 	}
 }
 
 func TestDaemonGuard_SuppressedRescanRetriesInsteadOfForeign(t *testing.T) {
 	e := newGuardEnv(t, "tcp://h:1234", 400*time.Millisecond)
 	fakeProc(t, e.root, 3000, 1, "buildkitd")
-	fakeTCPListener(t, e.root, 3000, 1234)
+	fakeWatchedTCP(t, e.root, 3000, 1234)
 
 	// First scan (clock frozen): the owner below is a "restarted" daemon.
-	_, _, _ = e.j.guard.snapshot(false)
+	_ = e.j.guard.snapshot(false)
 
 	fakeProc(t, e.root, 3600, 1, "buildkitd")
-	fakeTCPListener(t, e.root, 3600, 1234)
+	fakeWatchedTCP(t, e.root, 3600, 1234)
 	if err := os.RemoveAll(filepath.Join(e.root, "proc", "3000")); err != nil {
 		t.Fatal(err)
 	}

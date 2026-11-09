@@ -12,29 +12,58 @@ import (
 // uses it to find which local buildkitd is on the other end of THAT
 // connection, which a pod cannot fake by listening on the same port.
 type BuildKitConnTracker struct {
-	mu     sync.Mutex
-	local  net.Addr
-	remote net.Addr
-	gen    atomic.Uint64
+	mu      sync.Mutex
+	conns   map[string]*trackedEntry // by local address string, refcounted
+	current *trackedEntry
+	gen     atomic.Uint64
+}
+
+type trackedEntry struct {
+	local, remote net.Addr
+	n             int
 }
 
 // NewBuildKitConnTracker returns an empty tracker.
-func NewBuildKitConnTracker() *BuildKitConnTracker { return &BuildKitConnTracker{} }
+func NewBuildKitConnTracker() *BuildKitConnTracker {
+	return &BuildKitConnTracker{conns: map[string]*trackedEntry{}}
+}
 
 func (t *BuildKitConnTracker) set(local, remote net.Addr) {
 	t.mu.Lock()
-	t.local, t.remote = local, remote
+
+	if t.conns == nil {
+		t.conns = map[string]*trackedEntry{}
+	}
+
+	e := t.conns[local.String()]
+	if e == nil {
+		e = &trackedEntry{local: local, remote: remote}
+		t.conns[local.String()] = e
+	}
+
+	e.n++
+	t.current = e
 	t.mu.Unlock()
 	t.gen.Add(1)
 }
 
-// clear forgets the connection if it is still the one given (a stale
-// close must not wipe a newer connection).
+// clear releases one reference to the connection with this local address.
+// A stale close never wipes a newer connection.
 func (t *BuildKitConnTracker) clear(local net.Addr) {
 	t.mu.Lock()
 
-	if t.local == local {
-		t.local, t.remote = nil, nil
+	if e := t.conns[local.String()]; e != nil {
+		if e.n--; e.n <= 0 {
+			delete(t.conns, local.String())
+
+			if t.current == e {
+				t.current = nil
+
+				for _, o := range t.conns {
+					t.current = o
+				}
+			}
+		}
 	}
 
 	t.mu.Unlock()
@@ -46,7 +75,11 @@ func (t *BuildKitConnTracker) Local() (net.Addr, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	return t.local, t.local != nil
+	if t.current == nil {
+		return nil, false
+	}
+
+	return t.current.local, true
 }
 
 // Generation changes on every connect and disconnect.
@@ -54,11 +87,12 @@ func (t *BuildKitConnTracker) Generation() uint64 { return t.gen.Load() }
 
 type trackedConn struct {
 	net.Conn
-	t *BuildKitConnTracker
+	t    *BuildKitConnTracker
+	once sync.Once
 }
 
 func (c *trackedConn) Close() error {
-	c.t.clear(c.LocalAddr())
+	c.once.Do(func() { c.t.clear(c.LocalAddr()) })
 
 	return c.Conn.Close() //nolint:wrapcheck // passthrough
 }

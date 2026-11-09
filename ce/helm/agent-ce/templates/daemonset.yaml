@@ -149,6 +149,9 @@ spec:
             {{- with .tls }}
             {{- if .secretName }}
             {{- $caKey := ternary .caKey "ca.crt" (hasKey . "caKey") }}
+            {{- if and (not $caKey) (eq (toString .clientAuth) "false") (not .serverName) }}
+            {{- fail "buildkit.tls.secretName is set but caKey is empty, clientAuth is false and serverName is empty: that configures no TLS (silent plaintext). Set at least one, or clear secretName." }}
+            {{- end }}
             {{- if $caKey }}
             - name: LEITWACHT_CE_BUILDKIT_TLS_CA
               value: {{ printf "/etc/leitwacht-buildkit-tls/%s" $caKey | quote }}

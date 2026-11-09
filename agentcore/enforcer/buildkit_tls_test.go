@@ -486,3 +486,43 @@ func TestLoadBuildKitTLS_ExpiredCertFatal(t *testing.T) {
 		t.Fatalf("err = %v, want expired", err)
 	}
 }
+
+func TestBuildKitTLS_RotationToExpiredCertKeepsOld(t *testing.T) {
+	f := newTLSFixture(t)
+
+	bk, err := LoadBuildKitTLS(BuildKitTLSConfig{CertFile: f.certFile, KeyFile: f.keyFile}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(98),
+		Subject:      pkix.Name{CommonName: "expired"},
+		NotBefore:    time.Now().Add(-48 * time.Hour),
+		NotAfter:     time.Now().Add(-time.Hour),
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, f.ca.cert, &key.PublicKey, f.ca.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kder, _ := x509.MarshalECPrivateKey(key)
+	writeFile(t, f.certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	writeFile(t, f.keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kder}))
+
+	future := time.Now().Add(time.Minute)
+	_ = os.Chtimes(f.certFile, future, future)
+	_ = os.Chtimes(f.keyFile, future, future)
+
+	c, err := bk.getClientCertificate(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := c.Leaf.Subject.CommonName; got != "agent-1" {
+		t.Fatalf("cert after rotation to expired = %q, want old agent-1", got)
+	}
+}

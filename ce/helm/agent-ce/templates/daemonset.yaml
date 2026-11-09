@@ -148,8 +148,11 @@ spec:
               value: {{ .grpcAddr | quote }}
             {{- with .tls }}
             {{- if .secretName }}
+            {{- $caKey := ternary .caKey "ca.crt" (hasKey . "caKey") }}
+            {{- if $caKey }}
             - name: LEITWACHT_CE_BUILDKIT_TLS_CA
-              value: {{ printf "/etc/leitwacht-buildkit-tls/%s" (.caKey | default "ca.crt") | quote }}
+              value: {{ printf "/etc/leitwacht-buildkit-tls/%s" $caKey | quote }}
+            {{- end }}
             {{- if ne (toString .clientAuth) "false" }}
             - name: LEITWACHT_CE_BUILDKIT_TLS_CERT
               value: {{ printf "/etc/leitwacht-buildkit-tls/%s" (.certKey | default "tls.crt") | quote }}

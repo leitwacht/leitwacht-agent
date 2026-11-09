@@ -180,9 +180,14 @@ and optionally `_TLS_SERVER_NAME` to file paths. Details:
   renewal needs no restart. The CA bundle is re-read on every reconnect.
   An established connection is not interrupted by a rotation.
 - Minimum TLS version is 1.2.
-- TLS also works with a `unix://` address, but the gRPC authority for a
-  socket is `localhost`, so you must set the server name. This is
-  unusual; prefer (b) for sockets.
+- Do not combine TLS settings with a `unix://` address: buildkitd wraps
+  only its TCP listeners in TLS, unix sockets are plaintext. The agent
+  refuses to start with that combination. Use (b) for sockets.
+- An already-expired client certificate is a startup error.
+- `tls.caKey: ""` omits the CA setting, so buildkitd's certificate is
+  verified against the system roots.
+- Only the CE agent (chart and binary) supports this today. The EE agent
+  chart/binary will follow in the EE bump.
 - The client certificate must carry the `clientAuth` extended key usage;
   buildkitd's server certificate needs `serverAuth`.
 
@@ -220,9 +225,9 @@ BuildKit support is off until `grpcAddr` is set.
 | --- | --- | --- | --- |
 | `grpcAddr` | `GRPC_ADDR` | empty (off) | buildkitd Control gRPC address, `tcp://host:port` or `unix:///path`. Plaintext unless the `tls.*` settings below are set. |
 | `tls.secretName` (CE chart only) | n/a | empty | Secret with the CA and client pair, mounted read-only. The chart sets the three file env vars from it. |
-| `tls.caKey`, `tls.certKey`, `tls.keyKey` (CE chart only) | `TLS_CA`, `TLS_CERT`, `TLS_KEY` (file paths) | `ca.crt`, `tls.crt`, `tls.key` | CA bundle (sole trust anchor when set), client certificate and key (both or neither). Cert/key are reloaded on rotation. |
+| `tls.caKey`, `tls.certKey`, `tls.keyKey` (CE chart only) | `TLS_CA`, `TLS_CERT`, `TLS_KEY` (file paths) | `ca.crt`, `tls.crt`, `tls.key` | CA bundle (sole trust anchor when set; `caKey: ""` omits it and uses system roots), client certificate and key (both or neither). Cert/key are reloaded on rotation. |
 | `tls.clientAuth` (CE chart only) | n/a | `true` | `false` omits the client certificate. |
-| `tls.serverName` | `TLS_SERVER_NAME` | empty | Override SNI/verification name. |
+| `tls.serverName` (CE chart only) | `TLS_SERVER_NAME` | empty | Override SNI/verification name. |
 | `cgroupPaths` | `CGROUP_PATHS` (comma list) | none | Cgroup parents to watch. Globs (`*` per directory level, no `**`) are re-resolved in the background (on inotify events, with a 15 s poll as fallback), so a buildkitd pod restart is picked up without an agent restart, with a short delay (7.7). The resolver caps at 32 paths, but the datapath accepts **at most 8 parents**; more makes the attach fail. |
 | `requireCIMetadata` | `REQUIRE_CI_METADATA` | `false` | Flag sessions lacking any of `requiredAttrs` (`build_flag: missing_ci_attribution`). See 4.4. |
 | `requiredAttrs` | `REQUIRED_ATTRS` | `LEITWACHT_CI_PROJECT_PATH` | Plain build-arg names required when `requireCIMetadata` is on. |

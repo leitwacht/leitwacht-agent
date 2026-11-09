@@ -380,3 +380,109 @@ func TestLoadBuildKitTLS_Validation(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildKitTLS_MismatchedPairKeepsOldThenNew(t *testing.T) {
+	f := newTLSFixture(t)
+
+	bk, err := LoadBuildKitTLS(BuildKitTLSConfig{CAFile: f.caFile, CertFile: f.certFile, KeyFile: f.keyFile}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cn := func() string {
+		c, err := bk.getClientCertificate(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		return c.Leaf.Subject.CommonName
+	}
+
+	// New cert lands first, old key still on disk: mismatch.
+	c2, k2 := f.ca.issue(t, "agent-2", 21, nil, nil)
+	writeFile(t, f.certFile, c2)
+
+	future := time.Now().Add(time.Minute)
+	_ = os.Chtimes(f.certFile, future, future)
+
+	if got := cn(); got != "agent-1" {
+		t.Fatalf("mid-write cert = %q, want old agent-1", got)
+	}
+
+	writeFile(t, f.keyFile, k2)
+
+	future = future.Add(time.Minute)
+	_ = os.Chtimes(f.keyFile, future, future)
+
+	if got := cn(); got != "agent-2" {
+		t.Fatalf("after both files landed cert = %q, want agent-2", got)
+	}
+}
+
+func TestBuildKitTLS_CAReloadedOnConnect(t *testing.T) {
+	f := newTLSFixture(t)
+	addr := startTLSServer(t, f.ca, nil)
+
+	other := newTestCA(t, "other-ca")
+	caFile := filepath.Join(f.dir, "live-ca.pem")
+	writeFile(t, caFile, other.pem)
+
+	bk, err := LoadBuildKitTLS(BuildKitTLSConfig{CAFile: caFile, ServerName: "buildkitd.test"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := NewAttributionWatcher("tcp://"+addr, NewSessionRegistry(time.Minute), nil, WithTLS(bk))
+
+	try := func() error {
+		conn, err := w.connect(context.Background())
+		if err != nil {
+			return err
+		}
+		defer conn.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		_, err = healthpb.NewHealthClient(conn).Check(ctx, &healthpb.HealthCheckRequest{})
+
+		return err
+	}
+
+	if try() == nil {
+		t.Fatal("old (wrong) CA accepted")
+	}
+
+	writeFile(t, caFile, f.ca.pem)
+
+	if err := try(); err != nil {
+		t.Fatalf("new CA not honoured on next connect: %v", err)
+	}
+}
+
+func TestLoadBuildKitTLS_ExpiredCertFatal(t *testing.T) {
+	f := newTLSFixture(t)
+
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(99),
+		Subject:      pkix.Name{CommonName: "old"},
+		NotBefore:    time.Now().Add(-48 * time.Hour),
+		NotAfter:     time.Now().Add(-time.Hour),
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, f.ca.cert, &key.PublicKey, f.ca.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	kder, _ := x509.MarshalECPrivateKey(key)
+	writeFile(t, f.certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+	writeFile(t, f.keyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kder}))
+
+	_, err = LoadBuildKitTLS(BuildKitTLSConfig{CertFile: f.certFile, KeyFile: f.keyFile}, nil)
+	if err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("err = %v, want expired", err)
+	}
+}

@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -56,6 +57,11 @@ func startBuildKitAttribution(
 ) (*enforcer.CgroupResolver, error) {
 	if cfg.BuildkitGRPCAddr == "" {
 		return nil, nil //nolint:nilnil // documented disable
+	}
+
+	if cfg.BuildkitTLSEnabled() && strings.HasPrefix(cfg.BuildkitGRPCAddr, "unix:") {
+		return nil, errors.New("buildkit TLS settings cannot be combined with a unix:// " +
+			"grpc address: buildkitd serves unix sockets in plaintext")
 	}
 
 	registry := enforcer.NewSessionRegistry(buildKitSessionTTL)

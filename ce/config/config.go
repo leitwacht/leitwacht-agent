@@ -424,6 +424,10 @@ func (c *Config) Validate() error {
 	if (c.BuildkitTLSCert == "") != (c.BuildkitTLSKey == "") {
 		return errors.New("LEITWACHT_CE_BUILDKIT_TLS_CERT and LEITWACHT_CE_BUILDKIT_TLS_KEY must be set together")
 	}
+	if c.BuildkitTLSEnabled() && strings.HasPrefix(c.BuildkitGRPCAddr, "unix:") {
+		return errors.New("LEITWACHT_CE_BUILDKIT_TLS_* cannot be combined with a unix:// " +
+			"LEITWACHT_CE_BUILDKIT_GRPC_ADDR (buildkitd serves unix sockets in plaintext)")
+	}
 	if c.MaxConcurrentEnf < 1 {
 		return fmt.Errorf("LEITWACHT_CE_MAX_CONCURRENT = %d (must be >= 1)", c.MaxConcurrentEnf)
 	}
@@ -545,3 +549,9 @@ const defaultCredwatchReportOnly = "/.docker/config.json,/.npmrc,/.netrc,/.pypir
 
 // Suffixes with no event and no enforcement at all. Empty by default.
 const defaultCredwatchExclude = ""
+
+// BuildkitTLSEnabled reports whether any BuildKit TLS option is set.
+func (c *Config) BuildkitTLSEnabled() bool {
+	return c.BuildkitTLSCA != "" || c.BuildkitTLSCert != "" ||
+		c.BuildkitTLSKey != "" || c.BuildkitTLSServerName != ""
+}

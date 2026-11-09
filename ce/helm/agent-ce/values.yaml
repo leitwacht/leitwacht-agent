@@ -198,6 +198,7 @@ buildkit:
   # (see docs/BUILDKIT.md, section 3.3). Empty secretName = plaintext.
   tls:
     secretName: ""
+    # Empty caKey omits the CA: buildkitd is verified against system roots.
     caKey: ca.crt
     certKey: tls.crt
     keyKey: tls.key

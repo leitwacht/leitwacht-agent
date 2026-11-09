@@ -53,9 +53,9 @@ func (c BuildKitTLSConfig) Enabled() bool {
 // Existing connections are never torn down by rotation; new handshakes
 // (after a reconnect) use the new material.
 //
-// TLS is applied unchanged to unix:// addresses. The gRPC authority for
-// a unix socket is "localhost", so set ServerName to a name in the
-// server certificate when combining the two.
+// Do not use TLS with a unix:// address: buildkitd wraps only its TCP
+// listeners in TLS, unix sockets are always plaintext. The CE daemon
+// rejects that combination at startup.
 type BuildKitTLS struct {
 	cfg    BuildKitTLSConfig
 	logger *slog.Logger
@@ -142,13 +142,18 @@ func (t *BuildKitTLS) reloadCert() error {
 
 	pair.Leaf = leaf
 
+	remaining := time.Until(leaf.NotAfter)
+	if remaining <= 0 {
+		return fmt.Errorf("buildkit tls: client certificate %s expired at %s",
+			t.cfg.CertFile, leaf.NotAfter.UTC().Format(time.RFC3339))
+	}
+
 	t.mu.Lock()
 	t.cert = &pair
 	t.certMod, t.certSize = cs.ModTime(), cs.Size()
 	t.keyMod, t.keySize = ks.ModTime(), ks.Size()
 	t.mu.Unlock()
 
-	remaining := time.Until(leaf.NotAfter)
 	attrs := []any{
 		"cert_file", t.cfg.CertFile,
 		"subject", leaf.Subject.String(),

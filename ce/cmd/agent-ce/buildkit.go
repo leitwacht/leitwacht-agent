@@ -82,7 +82,24 @@ func startBuildKitAttribution(
 		)
 	}
 
-	watcher := enforcer.NewAttributionWatcher(cfg.BuildkitGRPCAddr, registry, log)
+	var watcherOpts []enforcer.WatcherOption
+
+	tlsCfg := enforcer.BuildKitTLSConfig{
+		CAFile:     cfg.BuildkitTLSCA,
+		CertFile:   cfg.BuildkitTLSCert,
+		KeyFile:    cfg.BuildkitTLSKey,
+		ServerName: cfg.BuildkitTLSServerName,
+	}
+	if tlsCfg.Enabled() {
+		bkTLS, err := enforcer.LoadBuildKitTLS(tlsCfg, log)
+		if err != nil {
+			return nil, err
+		}
+
+		watcherOpts = append(watcherOpts, enforcer.WithTLS(bkTLS))
+	}
+
+	watcher := enforcer.NewAttributionWatcher(cfg.BuildkitGRPCAddr, registry, log, watcherOpts...)
 
 	go func() {
 		err := watcher.Run(ctx)

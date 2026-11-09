@@ -84,6 +84,14 @@ type Config struct {
 	BuildkitGRPCAddr    string
 	BuildkitCgroupPaths string
 
+	// BuildKit Control connection TLS (LEITWACHT_CE_BUILDKIT_TLS_*).
+	// CA verifies buildkitd; Cert+Key (both or neither) are the mTLS
+	// client pair; ServerName overrides SNI/verification name.
+	BuildkitTLSCA         string
+	BuildkitTLSCert       string
+	BuildkitTLSKey        string
+	BuildkitTLSServerName string
+
 	// BuildkitRequireCIMetadata, when true, makes the agent refuse
 	// any Solve session whose FrontendAttrs lack all of
 	// BuildkitRequiredAttrs. RUN cgroups linked to a refused session
@@ -275,6 +283,10 @@ func Load() (*Config, error) {
 		WebhookAuth:                os.Getenv("LEITWACHT_CE_WEBHOOK_AUTH"),
 		BuildkitGRPCAddr:           os.Getenv("LEITWACHT_CE_BUILDKIT_GRPC_ADDR"),
 		BuildkitCgroupPaths:        os.Getenv("LEITWACHT_CE_BUILDKIT_CGROUP_PATHS"),
+		BuildkitTLSCA:              os.Getenv("LEITWACHT_CE_BUILDKIT_TLS_CA"),
+		BuildkitTLSCert:            os.Getenv("LEITWACHT_CE_BUILDKIT_TLS_CERT"),
+		BuildkitTLSKey:             os.Getenv("LEITWACHT_CE_BUILDKIT_TLS_KEY"),
+		BuildkitTLSServerName:      os.Getenv("LEITWACHT_CE_BUILDKIT_TLS_SERVER_NAME"),
 		BuildkitRequiredAttrs:      os.Getenv("LEITWACHT_CE_BUILDKIT_REQUIRED_ATTRS"),
 		BuildkitDenyVertexPatterns: os.Getenv("LEITWACHT_CE_BUILDKIT_DENY_VERTEX_PATTERNS"),
 		BuildkitEnforcement:        strings.ToLower(strings.TrimSpace(envOr("LEITWACHT_CE_BUILDKIT_ENFORCEMENT", "audit"))),
@@ -408,6 +420,9 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("LEITWACHT_CE_BUILDKIT_ENFORCEMENT = %q (must be audit|shadow|enforce)",
 			c.BuildkitEnforcement)
+	}
+	if (c.BuildkitTLSCert == "") != (c.BuildkitTLSKey == "") {
+		return errors.New("LEITWACHT_CE_BUILDKIT_TLS_CERT and LEITWACHT_CE_BUILDKIT_TLS_KEY must be set together")
 	}
 	if c.MaxConcurrentEnf < 1 {
 		return fmt.Errorf("LEITWACHT_CE_MAX_CONCURRENT = %d (must be >= 1)", c.MaxConcurrentEnf)

@@ -188,6 +188,25 @@ buildkit:
   # port from the agent's namespace.
   grpcAddr: ""
 
+  # TLS for the Control connection (buildkitd --tlscacert --tlscert
+  # --tlskey). Set secretName to a Secret in this release's namespace
+  # (a cert-manager Certificate secret works: ca.crt, tls.crt, tls.key).
+  # It is mounted read-only into the agent. The CA verifies buildkitd; the
+  # client pair is presented for mutual TLS. The client certificate is
+  # re-read when the Secret rotates; the CA on the next reconnect.
+  # mTLS is access control only: it does not give builds an identity
+  # (see docs/BUILDKIT.md, section 3.3). Empty secretName = plaintext.
+  tls:
+    secretName: ""
+    caKey: ca.crt
+    certKey: tls.crt
+    keyKey: tls.key
+    # false = verify buildkitd only, present no client certificate.
+    clientAuth: true
+    # Override the SNI / verification name (needed when grpcAddr is an
+    # IP or a name not in buildkitd's certificate SANs).
+    serverName: ""
+
   # Cgroup parent paths to watch for RUN-container creates. Glob
   # patterns (one `*` per directory level — Go stdlib filepath.Glob
   # shape, `**` is NOT supported) are re-resolved every 15 s; a changed

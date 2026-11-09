@@ -123,7 +123,7 @@ direction, but do not rely on it with Leitwacht yet.
 | Placement | Dedicated namespace and, if you can afford it, dedicated nodes. A privileged pod shares its node's kernel with everything else scheduled there. |
 | Network ingress | NetworkPolicy allowing `:1234` only from the CI job namespace and the agent's namespace. Default-deny everything else. |
 | Network egress | NetworkPolicy egress limited to your registries, mirrors and cluster DNS. Daemon-side fetches are outside Leitwacht's RUN-step coverage, so this is the control for them. |
-| Authentication | See 3.3: the reference setup has no TLS. |
+| Authentication | mTLS on the listener, see 3.3. It restricts who can build; it does not provide per-project identity. |
 | Image | Pin the buildkitd image by digest, not by tag. |
 | Secrets | Never pass secrets as `--build-arg`. Use `--secret` or SSH mounts. Build-args are session metadata: visible to anyone who can read build history, and to the Leitwacht agent. |
 | Registry credentials | `buildctl` forwards the client's `~/.docker/config.json` over the session, so no credentials need to live on buildkitd. Use short-lived job tokens (for example the CI registry token) and write the config in the job, not in the image. |
@@ -132,35 +132,71 @@ direction, but do not rely on it with Leitwacht yet.
 | Entitlements | Do not enable `security.insecure` or `network.host`. A step with `security.insecure` can leave its cgroup or network namespace and is outside enforcement. |
 | Host access | The agent needs `hostPID` and a writable `/sys/fs/cgroup` mount (the shipped charts set both). buildkitd itself should not get `hostPID` or `hostNetwork`. |
 
-### 3.3 Transport security: no TLS in the reference setup
+### 3.3 Transport security
 
-buildkitd's TCP listener in the reference setup is plaintext and
-unauthenticated. Consequences:
+buildkitd's TCP listener is plaintext and unauthenticated unless you give
+it TLS options. Without them, any pod that can reach `:1234` can run
+builds, **and can claim any CI identity** through the build-args.
+Leitwacht records what the session claims (section 7.1).
 
-- Any pod that can reach `:1234` can run builds, **and can claim any CI
-  identity** through the build-args. Leitwacht records what the session
-  claims (section 7.1).
-- NetworkPolicy is therefore your primary access control. Enforce it with
-  a CNI that actually implements NetworkPolicy.
+**mTLS is access control, not build identity.** With
+`buildkitd --tlscacert --tlscert --tlskey` only clients holding a
+certificate from your CA can connect. buildkitd does not expose the
+client certificate to build sessions or build history, so Leitwacht
+cannot tell which certificate a build came from: any client with a valid
+certificate can still claim any `LEITWACHT_CI_*` identity. Per-project
+identity needs one builder per project (a builder-to-project binding is
+planned, not implemented). Until then, treat everyone holding a client
+certificate as one trust domain (see also 3.4).
 
-BuildKit supports mutual TLS (`buildkitd --tlscacert --tlscert --tlskey`,
-and `buildctl --tlscacert --tlscert --tlskey` on the client). It is the
-right control for the CI clients, but note the **current interaction with
-the agent**: the agent dials buildkitd with plaintext gRPC credentials and
-has no TLS configuration option today (`grpcAddr` accepts `tcp://host:port`
-or `unix:///path` only). A TLS-only buildkitd listener will therefore
-break the agent's subscription. Options, in order of preference:
+Supported setups:
 
-1. Keep the TCP listener plaintext, restrict it with NetworkPolicy to the
-   CI and agent namespaces, and accept the residual risk.
-2. Give buildkitd two listeners (`--addr` can be repeated): a mutual-TLS
-   TCP listener for CI clients and a unix socket for the agent, with the
-   socket directory exposed to the agent pod through a `hostPath`
-   volume and `grpcAddr: unix:///path/to/buildkitd.sock`. The shipped
-   charts do not mount such a volume, and this combination is
-   **untested**.
+**(a) mTLS TCP listener for CI and the agent.** The agent dials
+buildkitd over TLS and presents its own client certificate. Issue it from
+the same CA (for example a cert-manager Certificate) into a Secret in the
+agent's namespace and reference it from the chart:
 
-Agent TLS support for the Control connection is not implemented.
+```yaml
+buildkit:
+  grpcAddr: tcp://buildkitd.buildkit.svc:1234
+  tls:
+    secretName: leitwacht-agent-buildkit-client   # ca.crt, tls.crt, tls.key
+    serverName: ""                                # only if grpcAddr is not in the server cert SANs
+```
+
+Outside Helm set `LEITWACHT_CE_BUILDKIT_TLS_CA`, `_TLS_CERT`, `_TLS_KEY`
+and optionally `_TLS_SERVER_NAME` to file paths. Details:
+
+- The CA file is the only trust anchor (no system roots) when set. With
+  no CA file the system roots are used. Set `tls.clientAuth: false` (or
+  leave cert/key unset) to verify buildkitd without presenting a client
+  certificate, for a listener that does not require one.
+- The agent fails fast at startup if a file is unreadable or does not
+  parse, or if only one of cert/key is set. It logs the certificate
+  subject and expiry (never key material) and warns when under 7 days
+  remain.
+- Rotation: the client certificate and key are re-read on a new
+  handshake when either file changed (mtime or size), so a cert-manager
+  renewal needs no restart. The CA bundle is re-read on every reconnect.
+  An established connection is not interrupted by a rotation.
+- Minimum TLS version is 1.2.
+- TLS also works with a `unix://` address, but the gRPC authority for a
+  socket is `localhost`, so you must set the server name. This is
+  unusual; prefer (b) for sockets.
+- The client certificate must carry the `clientAuth` extended key usage;
+  buildkitd's server certificate needs `serverAuth`.
+
+**(b) mTLS TCP for CI, unix socket for the agent.** Give buildkitd two
+listeners (`--addr` can be repeated): a mutual-TLS TCP listener for CI
+clients and a unix socket for the agent, with the socket directory
+exposed to the agent pod through a `hostPath` volume and
+`grpcAddr: unix:///path/to/buildkitd.sock`. The shipped charts do not
+mount such a volume, and this combination is **untested**.
+
+**(c) Plaintext listener plus NetworkPolicy.** Restrict `:1234` with
+NetworkPolicy to the CI and agent namespaces and accept the residual
+risk. NetworkPolicy is then your only access control; enforce it with a CNI
+that implements it.
 
 ### 3.4 Cache sharing is a cross-tenant risk
 
@@ -182,7 +218,11 @@ BuildKit support is off until `grpcAddr` is set.
 
 | Helm value (`buildkit.*`) | CE env (`LEITWACHT_CE_BUILDKIT_*`) | Default | Meaning |
 | --- | --- | --- | --- |
-| `grpcAddr` | `GRPC_ADDR` | empty (off) | buildkitd Control gRPC address, `tcp://host:port` or `unix:///path`. Plaintext. |
+| `grpcAddr` | `GRPC_ADDR` | empty (off) | buildkitd Control gRPC address, `tcp://host:port` or `unix:///path`. Plaintext unless the `tls.*` settings below are set. |
+| `tls.secretName` (CE chart only) | n/a | empty | Secret with the CA and client pair, mounted read-only. The chart sets the three file env vars from it. |
+| `tls.caKey`, `tls.certKey`, `tls.keyKey` (CE chart only) | `TLS_CA`, `TLS_CERT`, `TLS_KEY` (file paths) | `ca.crt`, `tls.crt`, `tls.key` | CA bundle (sole trust anchor when set), client certificate and key (both or neither). Cert/key are reloaded on rotation. |
+| `tls.clientAuth` (CE chart only) | n/a | `true` | `false` omits the client certificate. |
+| `tls.serverName` | `TLS_SERVER_NAME` | empty | Override SNI/verification name. |
 | `cgroupPaths` | `CGROUP_PATHS` (comma list) | none | Cgroup parents to watch. Globs (`*` per directory level, no `**`) are re-resolved in the background (on inotify events, with a 15 s poll as fallback), so a buildkitd pod restart is picked up without an agent restart, with a short delay (7.7). The resolver caps at 32 paths, but the datapath accepts **at most 8 parents**; more makes the attach fail. |
 | `requireCIMetadata` | `REQUIRE_CI_METADATA` | `false` | Flag sessions lacking any of `requiredAttrs` (`build_flag: missing_ci_attribution`). See 4.4. |
 | `requiredAttrs` | `REQUIRED_ATTRS` | `LEITWACHT_CI_PROJECT_PATH` | Plain build-arg names required when `requireCIMetadata` is on. |
@@ -721,7 +761,7 @@ Use these log lines (structured, metadata only) for diagnosis:
 | --- | --- |
 | `buildkit cgroup not attributed: no pending vertex matched before the join deadline` | A RUN cgroup could not be tied to a vertex. Fields: `pending_vertices`, `history_disconnected`, `suppressed_since_last` (the line is rate-limited). A steady stream means missing build-args, a command-matching problem or overlap. |
 | `buildkit cgroup glob matched zero paths` | `cgroupPaths` does not match yet or at all. |
-| `buildkit history stream ended` / `buildkit connect failed` | Control gRPC unreachable: NetworkPolicy, wrong `grpcAddr`, or a TLS-only listener (3.3). |
+| `buildkit history stream ended` / `buildkit connect failed` | Control gRPC unreachable: NetworkPolicy, wrong `grpcAddr`, a TLS-only listener without agent TLS settings, or a certificate/name mismatch (set `tls.serverName`; see 3.3). |
 | `buildkit policy: no slot capacity; cgroup stays in audit` | Slot table full (7.7). |
 | `buildkit dns proxy unbound; ...` / `... serving goroutine exited ...` | DNS proxy down; DNS is failing open. |
 | `kernel lacks bpf_get_netns_cookie for cgroup_skb ...` | The reduced bypass pin is active (7.4). |

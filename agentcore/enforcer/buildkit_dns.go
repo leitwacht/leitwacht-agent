@@ -990,8 +990,21 @@ func runProcs(runPaths []string, max int) []int {
 func (d *buildDNS) defaultSample() []runSample {
 	var out []runSample
 
-	for _, pid := range runProcs(d.runPaths, 16) {
+	pids := runProcs(d.runPaths, 16)
+	filtered := 0
+
+	defer func() {
+		if filtered > 0 && len(out) == 0 {
+			d.rateLimitedErrLocked("every RUN step belongs to a buildkitd the daemon guard could not tie to the watched " +
+				"daemon (agent lacks hostPID or ptrace-level privilege, the watched daemon is not on this node, or a " +
+				"hostNetwork agent dials a masqueraded Service); the proxy is not bound from RUN steps")
+		}
+	}()
+
+	for _, pid := range pids {
 		if d.cfg.Guard != nil && !d.cfg.Guard.IsWatchedPID(pid) {
+			filtered++
+
 			continue
 		}
 

@@ -269,8 +269,11 @@ creates the parent (it does so lazily, at the first RUN step).
 
 ### 4.3 Build DNS proxy prerequisites
 
-The proxy samples only the watched buildkitd's steps when the daemon
-guard can tie it (7.8).
+The proxy samples only the watched buildkitd's steps (daemon guard, 7.8).
+If the guard cannot tie the watched daemon while a buildkitd is visible,
+the proxy does not bind from RUN steps (only via `procCgroup`), so domain
+rules are not enforced (binding fails closed, enforcement fails open; an
+Error is logged).
 
 IP/CIDR rules reach RUN steps through the egress filter. Domain rules
 need the agent to see the names a step resolves. Enable the proxy only
@@ -834,10 +837,11 @@ unattributed and audited, never a wrong job. When two or more buildkitd
 processes are visible the agent logs an Error with each pid and cgroup
 (repeated at most once a minute).
 
-The build DNS proxy (4.3) uses the same guard: it picks the network
-namespace to bind from RUN steps of the watched buildkitd only, when the
-guard can tie it. Steps of another buildkitd, or whose owner cannot be
-resolved while several run, are not sampled.
+The build DNS proxy (4.3) uses the same guard: it binds the network
+namespace of the watched buildkitd's RUN steps only. If the guard cannot
+tie the watched daemon while a buildkitd is visible, the proxy does not
+bind from RUN steps (only via `procCgroup`) and domain rules are not
+enforced (fail-open enforcement, logged as an Error).
 
 Flagged steps link to no vertex and no session, are skipped by the
 session-level fallback, and are filed as unattributed rows
@@ -896,6 +900,7 @@ Use these log lines (structured, metadata only) for diagnosis:
 | `buildkit RUN cgroup not attributed: its buildkitd is not the watched daemon` | The daemon-ancestry guard flagged a RUN cgroup (`flag`: `foreign_daemon` or `daemon_unverified`). Another buildkitd shares the cgroup parent; give each daemon its own `cgroupPaths` (7.8). |
 | `buildkit daemon-ancestry guard: no local buildkitd could be tied to the watched address` | The watched daemon is not on this node, the agent cannot read other processes' fd tables or root (missing privilege), an agent on `hostNetwork` dials a masqueraded Service (use the pod network or the unix socket form), or the connection could not be matched. All local daemons' steps are left unattributed (7.8). |
 | `buildkit daemon-ancestry guard: no connection information to tie the watched daemon` | Only the listening port matches, which is not proof; those steps are `daemon_unverified` (7.8). |
+| `buildkit dns proxy: every RUN step belongs to a buildkitd the daemon guard could not tie to the watched daemon` | The proxy is not bound from RUN steps, so domain rules are not enforced (IP rules still apply). Fix the tie (privilege, hostNetwork, unix socket form; see the guard rows above) or set `procCgroup` (4.3). |
 | `buildkit daemon-ancestry guard: openat2(RESOLVE_IN_ROOT) is unavailable` | The unix socket tie fails closed; local buildkitd steps are unattributed (7.8). |
 | `several buildkitd processes visible on this node` | Lists each pid and cgroup. Only steps of the daemon owning the watched address are attributed (7.8). |
 | `buildkit daemon-ancestry guard cannot verify which buildkitd owns RUN cgroups` | No buildkitd process visible: missing `hostPID` or remote daemon (7.8). Logged once. |

@@ -845,7 +845,7 @@ func TestDaemonGuard_SuppressedRescanRetriesInsteadOfForeign(t *testing.T) {
 
 // dnsSampleEnv stages two RUN cgroups: 5000 under the watched daemon 3000
 // and 5100 under daemon 3100, and returns a buildDNS sampling them.
-func dnsSampleEnv(t *testing.T, guard bool) *buildDNS {
+func dnsSampleEnv(t *testing.T, guard bool) (*buildDNS, *guardEnv) {
 	t.Helper()
 
 	e := newGuardEnv(t, "tcp://h:1234", 0)
@@ -864,6 +864,7 @@ func dnsSampleEnv(t *testing.T, guard bool) *buildDNS {
 	guardWrite(t, filepath.Join(runs, "b", "cgroup.procs"), "5000\n")
 
 	d := &buildDNS{
+		log:        slog.New(slog.NewTextHandler(e.log, nil)),
 		runPaths:   []string{runs},
 		netnsInode: func(pid int) (uint64, error) { return uint64(pid), nil },
 	}
@@ -871,19 +872,40 @@ func dnsSampleEnv(t *testing.T, guard bool) *buildDNS {
 		d.cfg.Guard = e.j.guard
 	}
 
-	return d
+	return d, e
 }
 
 func TestBuildDNS_SampleOnlyWatchedDaemonSteps(t *testing.T) {
-	s := dnsSampleEnv(t, true).defaultSample()
+	d, _ := dnsSampleEnv(t, true)
+	s := d.defaultSample()
 	if len(s) != 1 || s[0].pid != 5000 {
 		t.Fatalf("samples = %+v, want only the watched daemon's step 5000", s)
 	}
 }
 
 func TestBuildDNS_SampleUnchangedWithoutGuard(t *testing.T) {
-	s := dnsSampleEnv(t, false).defaultSample()
+	d, _ := dnsSampleEnv(t, false)
+	s := d.defaultSample()
 	if len(s) != 2 {
 		t.Fatalf("samples = %+v, want both RUN processes", s)
+	}
+}
+
+func TestBuildDNS_AllStepsFilteredLogsError(t *testing.T) {
+	d, e := dnsSampleEnv(t, true)
+
+	// Only foreign steps remain.
+	if err := os.RemoveAll(filepath.Join(e.root, "runs", "b")); err != nil {
+		t.Fatal(err)
+	}
+
+	if s := d.defaultSample(); len(s) != 0 {
+		t.Fatalf("samples = %+v, want none", s)
+	}
+
+	d.defaultSample() // rate limited: no second line
+
+	if n := strings.Count(e.log.String(), "daemon guard could not tie"); n != 1 {
+		t.Fatalf("error count = %d, want 1:\n%s", n, e.log.String())
 	}
 }

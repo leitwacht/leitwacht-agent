@@ -125,7 +125,10 @@ const (
 	// goes to the shared recorder. pendingRehomeGrace is how long such a
 	// recorder waits for its cgroup to be bound before it is emitted
 	// unattributed (a slow join may bind after the first flush).
-	maxPendingRecs     = 1024
+	maxPendingRecs = 1024
+	// maxPendingEntries caps the (domain, type) entries of one pending
+	// recorder; past it the activity goes to the shared recorder.
+	maxPendingEntries  = 256
 	pendingRehomeGrace = 10 * time.Second
 
 	// Event-driven bind: after a new RUN cgroup appears, its cgroup.procs
@@ -133,7 +136,6 @@ const (
 	// (runc adds the first process a moment after the mkdir).
 	runEventRetries    = 50
 	runEventRetryEvery = 2 * time.Millisecond
-	maxRunEventWorkers = 8
 )
 
 // BuildDNSTracker is the DNS attribution source of the build proxy. It is
@@ -246,7 +248,6 @@ type buildDNS struct {
 	// triggers an immediate bind (tests replace it).
 	newSource func(paths []string) CgroupEventSource
 	watchDone chan struct{}
-	eventSem  chan struct{}
 
 	cache    *dnsCache
 	auditCfg *DNSProxyConfig
@@ -303,8 +304,10 @@ type buildDNS struct {
 }
 
 type pendingRec struct {
-	rec   *ViolationRecorder
-	since time.Time
+	rec      *ViolationRecorder
+	since    time.Time
+	last     time.Time // last query; the decision is looked up as of this time
+	inflight int       // queries that hold rec and have not recorded yet
 }
 
 type slotCfgKey struct {
@@ -467,7 +470,6 @@ func newBuildDNS(
 		recs:         map[PolicyKey]*ViolationRecorder{},
 		pend:         map[uint64]*pendingRec{},
 		domains:      newBuildDomains(),
-		eventSem:     make(chan struct{}, maxRunEventWorkers),
 		newSource:    func(paths []string) CgroupEventSource { return NewInotifyCgroupSource(paths) },
 	}
 
@@ -582,39 +584,26 @@ func (d *buildDNS) needsBind() bool {
 	return d.proxy == nil || !d.verified
 }
 
-// onRunCgroup reconciles once the new cgroup holds its first process. It
-// does nothing when the proxy is already bound and verified, and never
-// blocks the watcher (bounded workers; over the bound the poll catches up).
+// onRunCgroup runs on the watcher goroutine (the only one that reacts to
+// events, so reconciles from events never overlap each other). It waits
+// briefly for the new cgroup's first process, then reconciles. It does
+// nothing when the proxy is already bound and verified.
 func (d *buildDNS) onRunCgroup(cgroupPath string) {
-	if !d.needsBind() {
-		return
-	}
+	procs := filepath.Join(cgroupPath, "cgroup.procs")
 
-	select {
-	case d.eventSem <- struct{}{}:
-	default:
-		return
-	}
-
-	go func() {
-		defer func() { <-d.eventSem }()
-
-		procs := filepath.Join(cgroupPath, "cgroup.procs")
-
-		for i := 0; i < runEventRetries; i++ {
-			if d.ctx.Err() != nil || !d.needsBind() {
-				return
-			}
-
-			if firstProcOf(procs) > 0 {
-				d.reconcile()
-
-				return
-			}
-
-			time.Sleep(runEventRetryEvery)
+	for i := 0; i < runEventRetries; i++ {
+		if d.ctx.Err() != nil || !d.needsBind() {
+			return
 		}
-	}()
+
+		if firstProcOf(procs) > 0 {
+			d.reconcile()
+
+			return
+		}
+
+		time.Sleep(runEventRetryEvery)
+	}
 }
 
 func (d *buildDNS) run() {
@@ -674,10 +663,17 @@ func (d *buildDNS) Close() {
 // CNI/bridge mode (latch off). A dead serving goroutine clears the
 // redirect first and rebinds.
 func (d *buildDNS) reconcile() {
-	samples := d.sample()
-
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	// A reconcile that lost the race with Close must not bind again.
+	if d.ctx != nil && d.ctx.Err() != nil {
+		return
+	}
+
+	// Sampled under the lock so concurrent reconciles (poll and event)
+	// never act on a stale sample.
+	samples := d.sample()
 
 	if d.proxy != nil && !d.proxy.Alive() {
 		d.log.Error("buildkit dns proxy: serving goroutine exited; redirect cleared, rebinding")
@@ -1094,8 +1090,13 @@ func findTrustedProc(procRoot, name, cgroupWant string) (int, error) {
 	return best, nil
 }
 
-// searchListFor is the search list of buildkitd's resolv.conf (what RUN
-// steps inherit), refreshed every searchListRefreshTime.
+// searchListFor is the search list read from the resolv.conf of the bound
+// RUN process (buildkitd generates it from its own, but the step can
+// rewrite it, so it is treated as step-controlled), refreshed every
+// searchListRefreshTime. That is safe: only an expansion under the
+// configured cluster domain (never derived from this list) that the cluster
+// DNS confirms as NXDOMAIN is ever dropped; an expansion under any other
+// suffix, including one the step injected, is still recorded.
 func (d *buildDNS) searchListFor(uint64) []string {
 	d.mu.Lock()
 	pid := d.boundPID
@@ -1224,10 +1225,10 @@ func (d *buildDNS) firstSeenAt(id uint64) time.Time {
 // bound yet, one per cgroup so DrainDNS can re-home it once the cgroup is
 // bound; the shared one for everything else (unattributed queries, or the
 // pending-recorder bound reached).
-func (d *buildDNS) recorderFor(dec BuildDNSDecision, cgroupID uint64) *ViolationRecorder {
+func (d *buildDNS) recorderFor(dec BuildDNSDecision, cgroupID uint64) (*ViolationRecorder, func()) {
 	if !dec.Known || dec.Key.Project == "" || dec.State != bkStateBound {
 		if cgroupID == 0 || dec.Known {
-			return d.main // ambiguous / unattributed / degraded never re-home
+			return d.main, noopRelease // ambiguous / unattributed / degraded never re-home
 		}
 
 		return d.pendingFor(cgroupID)
@@ -1243,27 +1244,44 @@ func (d *buildDNS) recorderFor(dec BuildDNSDecision, cgroupID uint64) *Violation
 		d.recs[dec.Key] = r
 	}
 
-	return r
+	return r, noopRelease
 }
 
-// pendingFor is the per-cgroup recorder of a cgroup with no entry yet.
-func (d *buildDNS) pendingFor(id uint64) *ViolationRecorder {
+func noopRelease() {}
+
+// pendingFor is the per-cgroup recorder of a cgroup with no entry yet. The
+// returned release must be called once the query has been recorded: until
+// then the drain keeps the recorder alive. Over the recorder or entry caps
+// the shared recorder is returned instead (nothing is dropped).
+func (d *buildDNS) pendingFor(id uint64) (*ViolationRecorder, func()) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if p, ok := d.pend[id]; ok {
-		return p.rec
+	now := time.Now()
+
+	p, ok := d.pend[id]
+	if !ok {
+		if len(d.pend) >= maxPendingRecs {
+			return d.main, noopRelease
+		}
+
+		r := NewViolationRecorder(nil)
+		r.SetBucketMode()
+
+		p = &pendingRec{rec: r, since: now}
+		d.pend[id] = p
+	} else if p.rec.dnsEntryCount() >= maxPendingEntries {
+		return d.main, noopRelease
 	}
 
-	if len(d.pend) >= maxPendingRecs {
-		return d.main
+	p.last = now
+	p.inflight++
+
+	return p.rec, func() {
+		d.mu.Lock()
+		p.inflight--
+		d.mu.Unlock()
 	}
-
-	r := NewViolationRecorder(nil)
-	r.SetBucketMode()
-	d.pend[id] = &pendingRec{rec: r, since: time.Now()}
-
-	return r
 }
 
 // cfgFor returns the proxy config and policy a decision's queries are
@@ -1374,7 +1392,9 @@ func (d *buildDNS) handle(msg *dns.Msg, q DNSQueryContext) *dns.Msg {
 
 	defer releaseProj()
 
-	rec := d.recorderFor(dec, q.CgroupID)
+	rec, releaseRec := d.recorderFor(dec, q.CgroupID)
+	defer releaseRec()
+
 	cfg, pol := d.cfgFor(dec, rec)
 
 	resp := HandleDNSQuery(msg, cfg, pol, rec, q.PID, q.Comm, q.ParentComm, q.BinaryPath, q.CgroupID)
@@ -1476,10 +1496,12 @@ func (d *buildDNS) drainPending() []DNSActivityEntry {
 
 	ids := make([]uint64, 0, len(d.pend))
 	recs := make([]*pendingRec, 0, len(d.pend))
+	lasts := make([]time.Time, 0, len(d.pend))
 
 	for id, p := range d.pend {
 		ids = append(ids, id)
 		recs = append(recs, p)
+		lasts = append(lasts, p.last)
 	}
 
 	d.mu.Unlock()
@@ -1489,7 +1511,9 @@ func (d *buildDNS) drainPending() []DNSActivityEntry {
 	now := time.Now()
 
 	for i, p := range recs {
-		dec := d.binder.DNSDecision(ids[i])
+		// Also finds a cgroup already removed (short steps end before the
+		// flush): the binder keeps its decision for a while.
+		dec := d.binder.DNSDecisionAt(ids[i], lasts[i])
 		bound := dec.Known && dec.State == bkStateBound && dec.Key.Project != ""
 
 		if !bound && !final && now.Sub(p.since) < pendingRehomeGrace {
@@ -1507,13 +1531,13 @@ func (d *buildDNS) drainPending() []DNSActivityEntry {
 			out = append(out, e)
 		}
 
-		if len(entries) == 0 {
-			d.mu.Lock()
+		d.mu.Lock()
+		if len(entries) == 0 && p.inflight == 0 {
 			if d.pend[ids[i]] == p {
 				delete(d.pend, ids[i])
 			}
-			d.mu.Unlock()
 		}
+		d.mu.Unlock()
 	}
 
 	return out

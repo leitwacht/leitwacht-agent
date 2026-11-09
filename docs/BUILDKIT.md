@@ -272,11 +272,16 @@ Behaviour you can rely on:
   changes every step, latch the redirect off for 10 minutes.
 - **Records of steps not yet bound to a policy.** A query from a step
   that has no policy yet is recorded against its cgroup. At flush the
-  record moves to the policy the step has been bound to since (project,
-  job and policy key are stamped, as for egress rows). If the step is
-  still unbound, it is kept for one more flush interval (about 10 s at
-  most), then reported without a project. Nothing is dropped except past
-  the per-recorder entry caps.
+  record moves to the policy the step is (or, if it already ended, was)
+  bound to: project, job and policy key are stamped, as for egress rows.
+  If the step is still unbound, the record is held for a fixed 10 s, then
+  reported without a project. Nothing is dropped; a step recording more
+  than 256 distinct names while pending, or more than 1024 steps pending
+  at once, sends the excess straight to the shared (unattributed) record.
+- **After a buildkitd restart.** The proxy stays bound and verified on the
+  old network namespace until the poll sees RUN processes in the new one
+  and rebinds, so the first step after a buildkitd restart can still go
+  unlabelled.
 - **Per-step answers.** `enforce`: allowed names resolve and their
   addresses join the step's allow set; denied names get the rule's
   resolution (sinkhole or NXDOMAIN); unmatched names get the sinkhole.
@@ -284,8 +289,8 @@ Behaviour you can rely on:
   `dns_would_block`. `audit`, unattributed and ambiguous steps: answered
   normally, recorded as `dns_observed`. In EE, `dns_observed` records
   with no project (project 0) are those of ambiguous, unattributed or
-  never-bound steps and of queries from outside any RUN cgroup, not of
-  steps that were merely pending when they queried.
+  never-bound steps (after the 10 s hold) and of queries from outside any
+  RUN cgroup; a step that was merely pending when it queried is re-homed.
 - **Bypass pin.** While the proxy is on, port 53 from RUN steps to
   anything but the proxy is dropped (enforce) or `would_block` (shadow).
 - **Limits per step.** At most 8 held and 32 in-flight queries and about

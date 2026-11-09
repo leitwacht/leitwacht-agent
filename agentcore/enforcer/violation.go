@@ -237,6 +237,14 @@ func NewViolationRecorder(dnsCache *DNSCache) *ViolationRecorder {
 	}
 }
 
+// dnsEntryCount is the number of (domain, qtype) entries held.
+func (r *ViolationRecorder) dnsEntryCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return len(r.dnsActivity)
+}
+
 // SetBucketMode enables per-bucket violation limits. Must be called before
 // the first RecordViolation.
 func (r *ViolationRecorder) SetBucketMode() {

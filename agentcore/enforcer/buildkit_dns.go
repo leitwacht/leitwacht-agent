@@ -119,6 +119,21 @@ const (
 	domainRetention       = 15 * time.Minute
 	searchListRefreshTime = 30 * time.Second
 	bindErrLogInterval    = 30 * time.Second
+
+	// maxPendingRecs bounds the per-cgroup recorders that hold the DNS
+	// activity of RUN cgroups not yet bound to a policy; past it activity
+	// goes to the shared recorder. pendingRehomeGrace is how long such a
+	// recorder waits for its cgroup to be bound before it is emitted
+	// unattributed (a slow join may bind after the first flush).
+	maxPendingRecs     = 1024
+	pendingRehomeGrace = 10 * time.Second
+
+	// Event-driven bind: after a new RUN cgroup appears, its cgroup.procs
+	// is read every runEventRetryEvery for up to runEventRetries tries
+	// (runc adds the first process a moment after the mkdir).
+	runEventRetries    = 50
+	runEventRetryEvery = 2 * time.Millisecond
+	maxRunEventWorkers = 8
 )
 
 // BuildDNSTracker is the DNS attribution source of the build proxy. It is
@@ -227,6 +242,12 @@ type buildDNS struct {
 	newDialer func(pid int) (UpstreamDialer, error)
 	dialer    UpstreamDialer
 
+	// newSource builds the cgroup-creation watcher on the RUN parents that
+	// triggers an immediate bind (tests replace it).
+	newSource func(paths []string) CgroupEventSource
+	watchDone chan struct{}
+	eventSem  chan struct{}
+
 	cache    *dnsCache
 	auditCfg *DNSProxyConfig
 	auditPol *policy.ResolvedPolicy
@@ -266,6 +287,10 @@ type buildDNS struct {
 	firstSeen map[uint64]time.Time
 	slotCfgs  map[slotCfgKey]*slotCfg
 	recs      map[PolicyKey]*ViolationRecorder
+	// pend holds the DNS activity of cgroups that had no bound policy at
+	// query time, per cgroup, so DrainDNS can re-home it to the policy the
+	// cgroup was bound to since.
+	pend map[uint64]*pendingRec
 
 	searchMu  sync.Mutex
 	search    []string
@@ -275,6 +300,11 @@ type buildDNS struct {
 	domains *buildDomains
 
 	closeOnce sync.Once
+}
+
+type pendingRec struct {
+	rec   *ViolationRecorder
+	since time.Time
 }
 
 type slotCfgKey struct {
@@ -435,7 +465,10 @@ func newBuildDNS(
 		seeded:       map[uint64]string{},
 		slotCfgs:     map[slotCfgKey]*slotCfg{},
 		recs:         map[PolicyKey]*ViolationRecorder{},
+		pend:         map[uint64]*pendingRec{},
 		domains:      newBuildDomains(),
+		eventSem:     make(chan struct{}, maxRunEventWorkers),
+		newSource:    func(paths []string) CgroupEventSource { return NewInotifyCgroupSource(paths) },
 	}
 
 	d.auditCfg = d.newCfg(nil, false)
@@ -490,6 +523,98 @@ func (d *buildDNS) start(parent context.Context) {
 	d.reconcile()
 
 	go d.run()
+
+	if len(d.runPaths) > 0 && d.newSource != nil {
+		d.watchDone = make(chan struct{})
+
+		go d.watchRunCgroups()
+	}
+}
+
+// watchRunCgroups binds the proxy as soon as a RUN cgroup appears instead
+// of waiting for the next poll tick: the first step after an agent start
+// would otherwise resolve through the cluster DNS unobserved. The poll
+// stays as the fallback (and the only path when the watch cannot run).
+func (d *buildDNS) watchRunCgroups() {
+	defer close(d.watchDone)
+
+	creates := make(chan CgroupCreateEvent, 64)
+	removes := make(chan CgroupRemoveEvent, 64)
+	src := d.newSource(d.runPaths)
+
+	errc := make(chan error, 1)
+
+	go func() { errc <- src.Run(d.ctx, creates, removes) }()
+
+	for {
+		select {
+		case <-d.ctx.Done():
+			<-errc
+
+			return
+		case err := <-errc:
+			if err != nil && !errors.Is(err, context.Canceled) {
+				d.log.Debug("buildkit dns proxy: cgroup watch stopped; binding by poll only", "error", err)
+			}
+
+			return
+		case evt, ok := <-creates:
+			if !ok {
+				creates = nil
+
+				continue
+			}
+
+			d.onRunCgroup(evt.CgroupPath)
+		case _, ok := <-removes:
+			if !ok {
+				removes = nil
+			}
+		}
+	}
+}
+
+// needsBind reports whether the proxy still has to be bound or verified.
+func (d *buildDNS) needsBind() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.proxy == nil || !d.verified
+}
+
+// onRunCgroup reconciles once the new cgroup holds its first process. It
+// does nothing when the proxy is already bound and verified, and never
+// blocks the watcher (bounded workers; over the bound the poll catches up).
+func (d *buildDNS) onRunCgroup(cgroupPath string) {
+	if !d.needsBind() {
+		return
+	}
+
+	select {
+	case d.eventSem <- struct{}{}:
+	default:
+		return
+	}
+
+	go func() {
+		defer func() { <-d.eventSem }()
+
+		procs := filepath.Join(cgroupPath, "cgroup.procs")
+
+		for i := 0; i < runEventRetries; i++ {
+			if d.ctx.Err() != nil || !d.needsBind() {
+				return
+			}
+
+			if firstProcOf(procs) > 0 {
+				d.reconcile()
+
+				return
+			}
+
+			time.Sleep(runEventRetryEvery)
+		}
+	}()
 }
 
 func (d *buildDNS) run() {
@@ -525,6 +650,10 @@ func (d *buildDNS) Close() {
 	d.closeOnce.Do(func() {
 		d.cancel()
 		<-d.done
+
+		if d.watchDone != nil {
+			<-d.watchDone
+		}
 
 		d.mu.Lock()
 		d.unbindLocked("shutdown")
@@ -731,6 +860,10 @@ func (d *buildDNS) bindLocked(pid int) bool {
 	d.boundIno = ino
 	d.verified = false
 	d.lastErr = ""
+
+	// Read the search list now: the sampled process is often gone by the
+	// first query, which would leave expansion suppression without a list.
+	d.primeSearchList(pid)
 
 	d.log.Info("buildkit dns proxy bound in the RUN steps' netns", "listen", d.cfg.ListenAddr, "netns_inode", ino)
 
@@ -987,6 +1120,21 @@ func (d *buildDNS) searchListFor(uint64) []string {
 	return d.search
 }
 
+// primeSearchList stores the search list of pid's resolv.conf.
+func (d *buildDNS) primeSearchList(pid int) {
+	list := readSearchList(d.cfg.ProcRoot, pid)
+
+	d.searchMu.Lock()
+	defer d.searchMu.Unlock()
+
+	if list != nil || d.search == nil {
+		d.search = list
+	}
+
+	d.searchPID = pid
+	d.searchAt = time.Now()
+}
+
 // Active reports whether the redirect is on.
 func (d *buildDNS) Active() bool {
 	d.mu.Lock()
@@ -1072,11 +1220,17 @@ func (d *buildDNS) firstSeenAt(id uint64) time.Time {
 }
 
 // recorderFor is the recorder a decision's DNS activity goes to: one per
-// bound policy key (so the entries carry the project), the shared one for
-// everything else.
-func (d *buildDNS) recorderFor(dec BuildDNSDecision) *ViolationRecorder {
+// bound policy key (so the entries carry the project); for a cgroup not
+// bound yet, one per cgroup so DrainDNS can re-home it once the cgroup is
+// bound; the shared one for everything else (unattributed queries, or the
+// pending-recorder bound reached).
+func (d *buildDNS) recorderFor(dec BuildDNSDecision, cgroupID uint64) *ViolationRecorder {
 	if !dec.Known || dec.Key.Project == "" || dec.State != bkStateBound {
-		return d.main
+		if cgroupID == 0 || dec.Known {
+			return d.main // ambiguous / unattributed / degraded never re-home
+		}
+
+		return d.pendingFor(cgroupID)
 	}
 
 	d.mu.Lock()
@@ -1088,6 +1242,26 @@ func (d *buildDNS) recorderFor(dec BuildDNSDecision) *ViolationRecorder {
 		r.SetBucketMode()
 		d.recs[dec.Key] = r
 	}
+
+	return r
+}
+
+// pendingFor is the per-cgroup recorder of a cgroup with no entry yet.
+func (d *buildDNS) pendingFor(id uint64) *ViolationRecorder {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if p, ok := d.pend[id]; ok {
+		return p.rec
+	}
+
+	if len(d.pend) >= maxPendingRecs {
+		return d.main
+	}
+
+	r := NewViolationRecorder(nil)
+	r.SetBucketMode()
+	d.pend[id] = &pendingRec{rec: r, since: time.Now()}
 
 	return r
 }
@@ -1200,7 +1374,7 @@ func (d *buildDNS) handle(msg *dns.Msg, q DNSQueryContext) *dns.Msg {
 
 	defer releaseProj()
 
-	rec := d.recorderFor(dec)
+	rec := d.recorderFor(dec, q.CgroupID)
 	cfg, pol := d.cfgFor(dec, rec)
 
 	resp := HandleDNSQuery(msg, cfg, pol, rec, q.PID, q.Comm, q.ParentComm, q.BinaryPath, q.CgroupID)
@@ -1283,6 +1457,62 @@ func (d *buildDNS) DrainDNS() []DNSActivityEntry {
 			e.BuildJobName = keys[i].Job
 			e.PolicyKey = keys[i].String()
 			out = append(out, e)
+		}
+	}
+
+	return append(out, d.drainPending()...)
+}
+
+// drainPending emits the DNS activity recorded while a cgroup had no bound
+// policy. A cgroup bound since is stamped with its policy (the same
+// re-keying StampDomains does for egress rows). One still unbound waits up
+// to pendingRehomeGrace (the join may bind after this flush), then is
+// emitted unattributed like the shared recorder's entries: nothing is
+// dropped. At shutdown everything is emitted.
+func (d *buildDNS) drainPending() []DNSActivityEntry {
+	final := d.ctx != nil && d.ctx.Err() != nil
+
+	d.mu.Lock()
+
+	ids := make([]uint64, 0, len(d.pend))
+	recs := make([]*pendingRec, 0, len(d.pend))
+
+	for id, p := range d.pend {
+		ids = append(ids, id)
+		recs = append(recs, p)
+	}
+
+	d.mu.Unlock()
+
+	var out []DNSActivityEntry
+
+	now := time.Now()
+
+	for i, p := range recs {
+		dec := d.binder.DNSDecision(ids[i])
+		bound := dec.Known && dec.State == bkStateBound && dec.Key.Project != ""
+
+		if !bound && !final && now.Sub(p.since) < pendingRehomeGrace {
+			continue
+		}
+
+		_, entries, _ := p.rec.SnapshotAndReset()
+		for _, e := range entries {
+			if bound {
+				e.BuildProjectPath = dec.Key.Project
+				e.BuildJobName = dec.Key.Job
+				e.PolicyKey = dec.Key.String()
+			}
+
+			out = append(out, e)
+		}
+
+		if len(entries) == 0 {
+			d.mu.Lock()
+			if d.pend[ids[i]] == p {
+				delete(d.pend, ids[i])
+			}
+			d.mu.Unlock()
 		}
 	}
 

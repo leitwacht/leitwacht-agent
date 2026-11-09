@@ -220,6 +220,10 @@ func WithBuildKitDNSProxy(c BuildDNSConfig) BuildKitAttachOption {
 
 // buildDNS is the running build DNS proxy.
 type buildDNS struct {
+	// afterSnapshotHook is a test-only hook run in drainPending after a
+	// recorder snapshot and before the delete check (nil in production).
+	afterSnapshotHook func(id uint64)
+
 	cfg    BuildDNSConfig
 	log    *slog.Logger
 	dp     BuildKitDatapath
@@ -1521,6 +1525,11 @@ func (d *buildDNS) drainPending() []DNSActivityEntry {
 		}
 
 		_, entries, _ := p.rec.SnapshotAndReset()
+
+		if d.afterSnapshotHook != nil {
+			d.afterSnapshotHook(ids[i])
+		}
+
 		for _, e := range entries {
 			if bound {
 				e.BuildProjectPath = dec.Key.Project

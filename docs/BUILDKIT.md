@@ -787,8 +787,12 @@ considered, by process name):
   socket is in its fd table). Another pod cannot fake this by listening on
   the same port, and a Service port that differs from `targetPort` works.
   If a live connection is held by no local daemon, the watched daemon is
-  remote and every local buildkitd's steps are flagged (also when NAT
-  rewrites the source address: the fail-safe is unattributed). While the
+  remote and every local buildkitd's steps are flagged `foreign_daemon`
+  (unattributed). This also happens when NAT rewrites the source address,
+  for example an agent on `hostNetwork` dialing a masqueraded Service: use
+  the pod network or the unix socket form. Steps in the first ~5 seconds
+  after a (re)connect can be flagged `foreign_daemon` while the server's
+  accept lags (fail-safe, per step). While the
   connection is down the last tie is kept and re-tied on reconnect. Only
   when there is no connection information at all does the agent match the
   listening port; that is never proof, so those steps are
@@ -882,7 +886,7 @@ Use these log lines (structured, metadata only) for diagnosis:
 | --- | --- |
 | `buildkit cgroup not attributed: no pending vertex matched before the join deadline` | A RUN cgroup could not be tied to a vertex. Fields: `pending_vertices`, `history_disconnected`, `suppressed_since_last` (the line is rate-limited). A steady stream means missing build-args, a command-matching problem or overlap. |
 | `buildkit RUN cgroup not attributed: its buildkitd is not the watched daemon` | The daemon-ancestry guard flagged a RUN cgroup (`flag`: `foreign_daemon` or `daemon_unverified`). Another buildkitd shares the cgroup parent; give each daemon its own `cgroupPaths` (7.8). |
-| `buildkit daemon-ancestry guard: no local buildkitd could be tied to the watched address` | The watched daemon is not on this node, the agent cannot read other processes' fd tables or root (missing privilege), or the connection could not be matched. All local daemons' steps are left unattributed (7.8). |
+| `buildkit daemon-ancestry guard: no local buildkitd could be tied to the watched address` | The watched daemon is not on this node, the agent cannot read other processes' fd tables or root (missing privilege), an agent on `hostNetwork` dials a masqueraded Service (use the pod network or the unix socket form), or the connection could not be matched. All local daemons' steps are left unattributed (7.8). |
 | `buildkit daemon-ancestry guard: no connection information to tie the watched daemon` | Only the listening port matches, which is not proof; those steps are `daemon_unverified` (7.8). |
 | `buildkit daemon-ancestry guard: openat2(RESOLVE_IN_ROOT) is unavailable` | The unix socket tie fails closed; local buildkitd steps are unattributed (7.8). |
 | `several buildkitd processes visible on this node` | Lists each pid and cgroup. Only steps of the daemon owning the watched address are attributed (7.8). |

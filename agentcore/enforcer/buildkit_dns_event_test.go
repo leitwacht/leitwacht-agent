@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 )
@@ -337,11 +338,15 @@ func TestBuildDNS_PendingRecorderKeptWhenEntryArrivesAfterSnapshot(t *testing.T)
 
 	r.d.cancel() // final: eligible at once
 
-	// Simulate the query completing between snapshot and the delete.
-	rec.RecordDNS("race.example.org", "A", "dns_observed", nil, 1, "x", "", "")
-	r.d.mu.Lock()
-	r.d.pend[21].inflight = 0
-	r.d.mu.Unlock()
+	// The query completes between the drain's snapshot and its delete
+	// check: the entry must keep the recorder alive for the next drain.
+	var once sync.Once
+
+	r.d.afterSnapshotHook = func(uint64) {
+		once.Do(func() {
+			rec.RecordDNS("race.example.org", "A", "dns_observed", nil, 1, "x", "", "")
+		})
+	}
 
 	var seen bool
 

@@ -137,7 +137,9 @@ func (g *daemonGuard) refreshLocked() {
 			"address; RUN steps of local buildkitd processes will be left unattributed. Either the watched "+
 			"daemon is not on this node, or the agent lacks permission to read other processes' fd tables "+
 			"and root (needs CAP_SYS_PTRACE-level access; the shipped charts run privileged), or the "+
-			"connection could not be matched (try the unix socket form)",
+			"agent runs on hostNetwork and dials a masqueraded Service (the daemon sees a rewritten "+
+			"source address), or the connection could not be matched (use the pod network or the "+
+			"unix socket form)",
 			"grpc_addr", g.addr, "local_daemons", len(g.daemons))
 	}
 

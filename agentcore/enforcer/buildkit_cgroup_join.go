@@ -171,7 +171,8 @@ type matchState struct {
 	// owner is the buildkitd PID found by ancestry (ownerKnown).
 	owner      int
 	ownerKnown bool
-	walkDef    bool // the ancestry walk completed (not-found is final)
+	walkDef    bool // an ancestry walk completed (not-found is final)
+	sawPID     bool // cgroup.procs listed at least one pid on some attempt
 }
 
 // isInitArgv reports whether argv is a container-runtime helper (runc's
@@ -429,21 +430,53 @@ func (j *CgroupJoiner) tryMatchState(
 	// helper) is remembered for fast steps whose process exits before the
 	// next attempt, and is the only one used once the cgroup is gone.
 	if !st.gone {
-		pid, err := readFirstPID(evt.CgroupPath)
-		if err == nil {
-			var argv []string
+		// A fresh RUN cgroup has an empty cgroup.procs for a few ms, and
+		// its first process may already have exited: walk every listed
+		// pid (bounded) until one resolves to a buildkitd.
+		pids, _ := readCgroupPIDs(evt.CgroupPath, maxCgroupPIDs)
+		if len(pids) > 0 {
+			st.sawPID = true
+		}
 
+		argvDone := false
+
+		for _, pid := range pids {
 			if j.guard != nil && !st.ownerKnown {
-				st.owner, st.ownerKnown, st.walkDef = ancestorDaemon(j.procRoot, pid)
+				owner, found, def := ancestorDaemon(j.procRoot, pid)
+				if found {
+					st.owner, st.ownerKnown = owner, true
+				}
+
+				if def {
+					st.walkDef = true
+				}
 			}
 
-			argv, err = readArgv(j.procRoot, pid)
-			if err == nil {
-				if !isInitArgv(argv) {
-					st.goodPID, st.goodArgv = pid, argv
+			// argv comes only from the first pid with a readable cmdline
+			// (the RUN shell, container pid 1): a later pid is a child
+			// (npm, node, a lifecycle sh) whose argv could match another
+			// build's vertex. An init helper stores nothing this attempt.
+			if !argvDone {
+				if argv, err := readArgv(j.procRoot, pid); err == nil {
+					argvDone = true
+
+					if !isInitArgv(argv) {
+						st.goodPID, st.goodArgv = pid, argv
+					}
 				}
 			}
 		}
+
+		// Only a walk that completed without finding buildkitd is a
+		// genuine "no buildkitd ancestor" (e.g. the containerd worker).
+		if j.guard != nil && !st.ownerKnown && st.walkDef {
+			j.guard.noteWalkFailure()
+		}
+	}
+
+	if j.guard != nil && !st.ownerKnown && !st.sawPID && !final && !st.gone {
+		// Nothing to judge yet (empty cgroup.procs): retry.
+		return false
 	}
 
 	if j.guard != nil {
@@ -1019,14 +1052,18 @@ func (j *CgroupJoiner) handleRemove(evt CgroupRemoveEvent) {
 	}
 }
 
-// readFirstPID reads cgroupPath/cgroup.procs and returns the first
-// PID. Empty cgroups (no processes yet) return os.ErrProcessDone-
-// style errors via the underlying read.
-func readFirstPID(cgroupPath string) (int, error) {
+// maxCgroupPIDs bounds how many cgroup.procs entries are examined.
+const maxCgroupPIDs = 16
+
+// readCgroupPIDs reads cgroupPath/cgroup.procs and returns up to limit
+// PIDs. An empty cgroup (no processes yet) returns an empty slice.
+func readCgroupPIDs(cgroupPath string, limit int) ([]int, error) {
 	data, err := os.ReadFile(filepath.Join(cgroupPath, "cgroup.procs"))
 	if err != nil {
-		return 0, fmt.Errorf("read cgroup.procs: %w", err)
+		return nil, fmt.Errorf("read cgroup.procs: %w", err)
 	}
+
+	var pids []int
 
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -1036,13 +1073,16 @@ func readFirstPID(cgroupPath string) (int, error) {
 
 		pid, err := strconv.Atoi(line)
 		if err != nil {
-			return 0, fmt.Errorf("parse pid %q: %w", line, err)
+			return pids, fmt.Errorf("parse pid %q: %w", line, err)
 		}
 
-		return pid, nil
+		pids = append(pids, pid)
+		if len(pids) >= limit {
+			break
+		}
 	}
 
-	return 0, errors.New("cgroup.procs is empty")
+	return pids, nil
 }
 
 // readArgv returns /proc/<pid>/cmdline split into its argv elements.

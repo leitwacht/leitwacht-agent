@@ -287,8 +287,6 @@ func (g *daemonGuard) verdict(owner int, ownerKnown, final bool) (flag string, r
 	}
 
 	if !ownerKnown {
-		g.noteWalkFailure()
-
 		// Only the watched daemon is visible: nothing else could own the
 		// step (also covers workers whose process tree hides buildkitd).
 		if !v.weak && len(v.daemons) == 1 && len(v.matching) == 1 {
@@ -309,6 +307,12 @@ func (g *daemonGuard) verdict(owner int, ownerKnown, final bool) (flag string, r
 }
 
 func (g *daemonGuard) noteWalkFailure() {
+	// With no buildkitd visible the guard cannot verify anything anyway
+	// (it warns about that separately).
+	if len(g.snapshot(false).daemons) == 0 {
+		return
+	}
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
@@ -638,7 +642,11 @@ func WithDaemonGuardInstance(g *DaemonGuard) JoinerOption {
 // owners are not watched. With no buildkitd visible it returns true, like
 // the joiner (the guard cannot verify anything then).
 func (g *daemonGuard) IsWatchedPID(pid int) bool {
-	owner, found, _ := ancestorDaemon(g.procRoot, pid)
+	owner, found, def := ancestorDaemon(g.procRoot, pid)
+	if !found && def {
+		g.noteWalkFailure()
+	}
+
 	flag, _ := g.verdict(owner, found, true)
 
 	return flag == ""

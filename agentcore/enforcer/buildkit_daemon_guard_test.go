@@ -922,3 +922,145 @@ func TestBuildDNS_AllStepsFilteredLogsErrorOnlyWhenUntied(t *testing.T) {
 		t.Fatalf("error count = %d, want 1:\n%s", n, e.log.String())
 	}
 }
+
+const walkWarnMsg = "has no buildkitd ancestor"
+
+func multiDaemonEnv(t *testing.T, deferred time.Duration) *guardEnv {
+	t.Helper()
+
+	e := newGuardEnv(t, "tcp://h:1234", deferred)
+	fakeProc(t, e.root, 3000, 1, "buildkitd")
+	fakeProc(t, e.root, 3100, 1, "buildkitd")
+	fakeWatchedTCP(t, e.root, 3000, 1234)
+
+	return e
+}
+
+func TestDaemonGuard_EmptyProcsNoWalkWarnThenLinks(t *testing.T) {
+	e := multiDaemonEnv(t, 2*time.Second)
+
+	cg := filepath.Join(e.root, "cgroups", "ctr-guard")
+	guardWrite(t, filepath.Join(cg, "cgroup.procs"), "")
+	guardWrite(t, filepath.Join(cg, "cgroup.events"), "populated 0\n")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	e.j.handleCreate(ctx, CgroupCreateEvent{ContainerID: "ctr-guard", CgroupPath: cg})
+
+	if _, ok := e.reg.LookupByCgroupID(guardCgID); ok {
+		t.Fatal("bound with empty cgroup.procs")
+	}
+
+	// The process appears a few ms later.
+	fakeProc(t, e.root, 5000, 4000, "sh")
+	fakeProc(t, e.root, 4000, 3000, "runc")
+	stageCgroup(t, e.root, "ctr-guard", 5000, "/bin/sh\x00-c\x00npm ci\x00")
+
+	waitFor(t, time.Second, func() bool {
+		_, ok := e.reg.LookupByCgroupID(guardCgID)
+
+		return ok
+	})
+
+	b, _ := e.reg.LookupByCgroupID(guardCgID)
+	assertLinked(t, b, true)
+
+	// Let the deferred goroutine finish before reading the log buffer.
+	waitFor(t, time.Second, func() bool {
+		_, busy := e.j.inflight.Load("ctr-guard")
+
+		return !busy
+	})
+
+	if strings.Contains(e.log.String(), walkWarnMsg) {
+		t.Fatalf("false walk warning:\n%s", e.log.String())
+	}
+}
+
+func TestDaemonGuard_FirstPIDVanishedSecondResolves(t *testing.T) {
+	e := multiDaemonEnv(t, 2*time.Second)
+
+	fakeProc(t, e.root, 5000, 4000, "sh")
+	fakeProc(t, e.root, 4000, 3000, "runc")
+	cg := stageCgroup(t, e.root, "ctr-guard", 5000, "/bin/sh\x00-c\x00npm ci\x00")
+	// pid 4999 already exited: listed first, absent from /proc.
+	guardWrite(t, filepath.Join(cg, "cgroup.procs"), "4999\n5000\n")
+
+	b, ok := e.join(CgroupCreateEvent{ContainerID: "ctr-guard", CgroupPath: cg})
+	assertLinked(t, b, ok)
+
+	if strings.Contains(e.log.String(), walkWarnMsg) {
+		t.Fatalf("false walk warning:\n%s", e.log.String())
+	}
+}
+
+func TestDaemonGuard_GenuineNoAncestorWarnsOnce(t *testing.T) {
+	e := multiDaemonEnv(t, 0)
+
+	b, ok := e.join(e.runUnder(1)) // containerd-shim style: walk ends at init
+	assertBlocked(t, b, ok, BuildFlagDaemonUnverified)
+
+	e.j.guard.noteWalkFailure()
+
+	if n := strings.Count(e.log.String(), walkWarnMsg); n != 1 {
+		t.Fatalf("walk warn count = %d, want 1:\n%s", n, e.log.String())
+	}
+}
+
+func TestDaemonGuard_IsWatchedPIDVanishedNoWarn(t *testing.T) {
+	e := multiDaemonEnv(t, 0)
+
+	if e.j.guard.IsWatchedPID(7777) {
+		t.Fatal("vanished pid reported watched")
+	}
+
+	if strings.Contains(e.log.String(), walkWarnMsg) {
+		t.Fatalf("false walk warning:\n%s", e.log.String())
+	}
+}
+
+// childArgvEnv stages a RUN shell (pid 5000) plus a live child (pid 5001)
+// with the given cmdline, and a second build's pending vertex.
+func childArgvEnv(t *testing.T, childCmd string) (*guardEnv, CgroupCreateEvent) {
+	t.Helper()
+
+	e := multiDaemonEnv(t, 0)
+	e.reg.RegisterSession("rB", time.Unix(1000, 0), map[string]string{
+		FrontendAttrKeyProjectPath: "grp/b", FrontendAttrKeyJobID: "2",
+	})
+	e.reg.UpsertVertex("rB", VertexState{Digest: "dB", Name: "[build 1/2] RUN make all", StartedAt: time.Unix(1010, 0)})
+
+	fakeProc(t, e.root, 4000, 3000, "runc")
+	fakeProc(t, e.root, 5001, 5000, "sh")
+	guardWrite(t, filepath.Join(e.root, "proc", "5001", "cmdline"), childCmd)
+
+	evt := e.runUnder(3000)
+	guardWrite(t, filepath.Join(evt.CgroupPath, "cgroup.procs"), "5000\n5001\n")
+
+	return e, evt
+}
+
+func TestDaemonGuard_ChildArgvOfOtherVertexDoesNotWin(t *testing.T) {
+	e, evt := childArgvEnv(t, "/bin/sh\x00-c\x00make all\x00")
+
+	b, ok := e.join(evt)
+	assertLinked(t, b, ok) // the shell's vertex (dA), not rB's
+}
+
+func TestDaemonGuard_ChildMatchingNothingStillLinksShell(t *testing.T) {
+	e, evt := childArgvEnv(t, "/usr/bin/node\x00setup.js\x00")
+
+	b, ok := e.join(evt)
+	assertLinked(t, b, ok)
+}
+
+func TestDaemonGuard_NoDaemonsVisibleNoWalkWarn(t *testing.T) {
+	e := newGuardEnv(t, "tcp://remote:1234", 0)
+
+	e.join(e.runUnder(1)) // definitive walk, no buildkitd anywhere
+
+	if strings.Contains(e.log.String(), walkWarnMsg) {
+		t.Fatalf("walk warning with no visible buildkitd:\n%s", e.log.String())
+	}
+}

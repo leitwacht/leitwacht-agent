@@ -994,11 +994,21 @@ func (d *buildDNS) defaultSample() []runSample {
 	filtered := 0
 
 	defer func() {
-		if filtered > 0 && len(out) == 0 {
-			d.rateLimitedErrLocked("every RUN step belongs to a buildkitd the daemon guard could not tie to the watched " +
-				"daemon (agent lacks hostPID or ptrace-level privilege, the watched daemon is not on this node, or a " +
-				"hostNetwork agent dials a masqueraded Service); the proxy is not bound from RUN steps")
+		if filtered == 0 || len(out) != 0 {
+			return
 		}
+
+		if d.proxy != nil || d.cfg.Guard.HasTie() {
+			// Bound already, or tied with only another daemon's steps
+			// running right now: nothing is wrong.
+			d.log.Debug("buildkit dns proxy: all sampled RUN steps belong to another buildkitd")
+
+			return
+		}
+
+		d.rateLimitedErrLocked("every RUN step belongs to a buildkitd the daemon guard could not tie to the watched " +
+			"daemon (agent lacks hostPID or ptrace-level privilege, the watched daemon is not on this node, or a " +
+			"hostNetwork agent dials a masqueraded Service); the proxy is not bound from RUN steps")
 	}()
 
 	for _, pid := range pids {

@@ -891,10 +891,10 @@ func TestBuildDNS_SampleUnchangedWithoutGuard(t *testing.T) {
 	}
 }
 
-func TestBuildDNS_AllStepsFilteredLogsError(t *testing.T) {
+func TestBuildDNS_AllStepsFilteredLogsErrorOnlyWhenUntied(t *testing.T) {
+	// Tied guard, only foreign steps running: no Error.
 	d, e := dnsSampleEnv(t, true)
 
-	// Only foreign steps remain.
 	if err := os.RemoveAll(filepath.Join(e.root, "runs", "b")); err != nil {
 		t.Fatal(err)
 	}
@@ -903,7 +903,20 @@ func TestBuildDNS_AllStepsFilteredLogsError(t *testing.T) {
 		t.Fatalf("samples = %+v, want none", s)
 	}
 
-	d.defaultSample() // rate limited: no second line
+	if strings.Contains(e.log.String(), "daemon guard could not tie") {
+		t.Fatalf("tied guard must not log the Error:\n%s", e.log.String())
+	}
+
+	// Untied (port-only tie): Error, rate limited to one line.
+	d, e = dnsSampleEnv(t, true)
+	e.j.guard.tracker = nil
+
+	if err := os.RemoveAll(filepath.Join(e.root, "runs", "b")); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = d.defaultSample()
+	_ = d.defaultSample()
 
 	if n := strings.Count(e.log.String(), "daemon guard could not tie"); n != 1 {
 		t.Fatalf("error count = %d, want 1:\n%s", n, e.log.String())

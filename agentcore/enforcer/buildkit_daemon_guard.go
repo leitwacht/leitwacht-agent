@@ -644,6 +644,14 @@ func (g *daemonGuard) IsWatchedPID(pid int) bool {
 	return flag == ""
 }
 
+// HasTie reports whether the watched daemon is currently tied by proof
+// (a connection or socket match, not just a port). It never forces a rescan.
+func (g *daemonGuard) HasTie() bool {
+	v := g.snapshot(false)
+
+	return !v.weak && len(v.matching) > 0
+}
+
 // WithDaemonConnTracker ties the watched daemon to the agent's own gRPC
 // connection (the watcher must be built with WithConnTracker on the same
 // tracker). Without it, tcp addresses fall back to port matching.

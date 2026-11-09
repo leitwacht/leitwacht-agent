@@ -1532,7 +1532,9 @@ func (d *buildDNS) drainPending() []DNSActivityEntry {
 		}
 
 		d.mu.Lock()
-		if len(entries) == 0 && p.inflight == 0 {
+		// Re-checked under the lock: a whole query may have run since the
+		// snapshot above; its entry must not go with the recorder.
+		if len(entries) == 0 && p.inflight == 0 && p.rec.dnsEntryCount() == 0 {
 			if d.pend[ids[i]] == p {
 				delete(d.pend, ids[i])
 			}

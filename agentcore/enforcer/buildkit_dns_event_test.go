@@ -325,3 +325,35 @@ func TestBuildDNS_StepControlledSearchListCannotHideRecords(t *testing.T) {
 		t.Fatalf("lookup hidden by a step-controlled search list: %+v", entries)
 	}
 }
+
+// A recorder that received an entry after the drain's snapshot is kept.
+func TestBuildDNS_PendingRecorderKeptWhenEntryArrivesAfterSnapshot(t *testing.T) {
+	t.Parallel()
+
+	r := newDNSRig(t, time.Millisecond)
+
+	rec, release := r.d.pendingFor(21)
+	release()
+
+	r.d.cancel() // final: eligible at once
+
+	// Simulate the query completing between snapshot and the delete.
+	rec.RecordDNS("race.example.org", "A", "dns_observed", nil, 1, "x", "", "")
+	r.d.mu.Lock()
+	r.d.pend[21].inflight = 0
+	r.d.mu.Unlock()
+
+	var seen bool
+
+	for i := 0; i < 2; i++ {
+		for _, e := range r.d.DrainDNS() {
+			if e.Domain == "race.example.org" {
+				seen = true
+			}
+		}
+	}
+
+	if !seen {
+		t.Fatal("entry lost")
+	}
+}

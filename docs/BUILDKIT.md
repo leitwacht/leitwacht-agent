@@ -465,6 +465,7 @@ projects.
 | **Job-level (session)** | Session ref, project, job id; no vertex | Join found no vertex, but all builds open at event time share one CI identity. | Same as above. |
 | **Project-level (ambiguous)** | `build_ambiguous: true`, `build_project_path`, no job id, sorted `build_ambiguous_job_ids` (up to 16), common pipeline id if any | Several builds overlap and the step cannot be pinned to one, but every candidate belongs to one project (agent v0.14.1 and later). | Candidates from one project: the project's default policy applies (enforcement is unchanged by the lift). In the EE server these rows are stored under the project as job `buildkit-ambiguous` and raise an advisory. |
 | **Ambiguous across projects** | `build_ambiguous: true`, no project | Candidates belong to different projects, or one lacks a project or job id. | Filed without a project. For enforcement, candidates in different projects, or one without a project claim, run in audit (`enforcement_state: ambiguous_multi_project`). Candidates that share a project but lack a job id are still judged by that project's default policy. |
+| **Other buildkitd** | `build_flag: foreign_daemon` or `daemon_unverified`, no session, no project | The RUN cgroup belongs to a buildkitd the agent is not watching, or several buildkitd processes run on the node and this one cannot be proven to be the watched daemon (7.8). | Audit only (`enforcement_state: unattributed`); never attributed to any job, not even by the session-level fallback. |
 | **Unattributed** | `build_unattributed: true`, no project | No match and no session could be tied to the step. | Audit only (`enforcement_state: unattributed`). In EE: stored with project 0 under the reporting agent's org, advisory raised. |
 
 Binding strengths, weakest last: `exact_argv`, `environ_tiebreak`,
@@ -484,7 +485,8 @@ Other row annotations:
 - `would_block`: the row passed but the bound policy would deny it
   (shadow, or traffic before the step was bound).
 - `build_flag`: `missing_ci_attribution`, `deny_pattern_match`,
-  `argv_untrusted`, `unmatched_under_policy`, `history_disconnected`.
+  `argv_untrusted`, `unmatched_under_policy`, `history_disconnected`,
+  `foreign_daemon`, `daemon_unverified` (section 7.8).
 - `binding_verified`: always `false` today (section 7.1).
 - Actions you will see: `packet_observed`, `packet_allowed`,
   `packet_dropped`, `would_block`, `sinkhole_hit`, `dns_bypass_dropped`,
@@ -690,6 +692,44 @@ hold lasts at most 2 seconds (6.1).
 
 ---
 
+### 7.8 One watched buildkitd per agent
+
+An agent subscribes to exactly one buildkitd (`grpcAddr`) and joins RUN
+cgroups under `cgroupPaths` to that daemon's sessions. Two buildkitd pods
+on one node share `/sys/fs/cgroup/buildkit` by default, so without a check
+the steps of an unwatched daemon could be attributed to the watched
+daemon's builds. To prevent that, the agent resolves which buildkitd owns
+each RUN cgroup by walking process parents (`/proc/<pid>/status`, expected
+tree `buildkitd -> runc -> RUN process`) and refuses to attribute a step
+whose daemon is not the watched one:
+
+- **Exactly one buildkitd process visible on the node:** it is assumed to
+  be the watched daemon; behaviour is unchanged.
+- **None visible** (agent without `hostPID`, or a remote buildkitd): the
+  guard cannot verify anything. Attribution proceeds as before and the
+  agent logs one warning (`... cannot verify which buildkitd owns RUN
+  cgroups ...`). Do not run several buildkitd instances in this setup.
+- **Several visible:** the agent cannot tell which one `grpcAddr` reaches
+  unless the address is a unix socket through a process root
+  (`unix:///proc/<pid>/root/run/buildkit/buildkitd.sock`), which pins the
+  watched PID. With a pinned PID, steps of any other daemon get
+  `build_flag: foreign_daemon`. Without one, no step can be proven and all
+  RUN steps get `build_flag: daemon_unverified`. A step whose ancestry
+  cannot be resolved (process already gone) is `daemon_unverified`.
+
+Flagged steps are linked to no vertex and no session, and run in audit
+like other unattributed rows (the kill opt-in is not extended to them).
+Discovery of buildkitd processes is cached for 15 seconds, so a second
+daemon that appears later is noticed.
+
+The guard needs `hostPID` on the agent (section 3.2). The recommended
+topology is one buildkitd per node per agent, each daemon with its own
+`cgroupPaths`. A `grpcAddr` that is a multi-replica Service is not
+supported: the agent subscribes to whichever replica the connection
+reaches, and the other replicas' steps are never attributed. The ancestry
+walk is verified against the process tree layout above and should be
+checked on your runtime (section 8).
+
 ## 8. Verifying it works
 
 1. Run a wrapped build with a deliberate egress, for example
@@ -720,6 +760,8 @@ Use these log lines (structured, metadata only) for diagnosis:
 | Log message | Meaning |
 | --- | --- |
 | `buildkit cgroup not attributed: no pending vertex matched before the join deadline` | A RUN cgroup could not be tied to a vertex. Fields: `pending_vertices`, `history_disconnected`, `suppressed_since_last` (the line is rate-limited). A steady stream means missing build-args, a command-matching problem or overlap. |
+| `buildkit RUN cgroup not attributed: its buildkitd is not the watched daemon` | The daemon-ancestry guard flagged a RUN cgroup (`flag`: `foreign_daemon` or `daemon_unverified`). Another buildkitd shares the cgroup parent; give each daemon its own `cgroupPaths` and pin the watched one (7.8). |
+| `buildkit daemon-ancestry guard cannot verify which buildkitd owns RUN cgroups` | No buildkitd process visible: missing `hostPID` or remote daemon (7.8). Logged once. |
 | `buildkit cgroup glob matched zero paths` | `cgroupPaths` does not match yet or at all. |
 | `buildkit history stream ended` / `buildkit connect failed` | Control gRPC unreachable: NetworkPolicy, wrong `grpcAddr`, or a TLS-only listener (3.3). |
 | `buildkit policy: no slot capacity; cgroup stays in audit` | Slot table full (7.7). |
@@ -736,7 +778,8 @@ Use these log lines (structured, metadata only) for diagnosis:
   builds need.
 - No secrets in build-args; credentials via `--secret` and short-lived
   tokens.
-- One buildkitd per trust boundary.
+- One buildkitd per trust boundary, and one watched buildkitd per agent
+  (7.8); agent has `hostPID`.
 - `cgroupPaths` dedicated to RUN cgroups; verified against the pod's real
   cgroup tree.
 - Pipelines wrapped; `missing_ci_attribution` flags at zero before any

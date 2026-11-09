@@ -378,6 +378,10 @@ func classify(b CgroupBinding) bindOutcome {
 	// audit would instead let one unwrapped build switch off enforcement
 	// for every concurrent build. Candidate keys decide, as for any binding.
 
+	if isDaemonBlockFlag(b.Flag) {
+		return bindOutcome{state: bkStateUnattributed, strength: StrengthAmbiguous, reason: EnfStateUnattributed}
+	}
+
 	keys := b.CandidateKeys
 
 	strength := b.Strength

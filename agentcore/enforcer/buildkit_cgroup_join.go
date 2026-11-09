@@ -118,6 +118,13 @@ type CgroupJoiner struct {
 	// asked for it.
 	killOnUnattributed bool
 
+	// guard is the daemon-ancestry guard (nil: disabled). guardAddr/guardOn
+	// carry the option until NewCgroupJoiner builds it with the final
+	// procRoot.
+	guard     *daemonGuard
+	guardAddr string
+	guardOn   bool
+
 	// gone marks containers whose cgroup was removed while their match
 	// was still pending: a late link for one goes straight to the retired
 	// cache (atomically), never through a live index entry.
@@ -158,6 +165,10 @@ type matchState struct {
 	// goodPID/goodArgv are the latest argv that is not an init helper.
 	goodPID  int
 	goodArgv []string
+
+	// owner is the buildkitd PID found by ancestry (ownerKnown).
+	owner      int
+	ownerKnown bool
 }
 
 // isInitArgv reports whether argv is a container-runtime helper (runc's
@@ -234,6 +245,10 @@ func NewCgroupJoiner(registry *SessionRegistry, source CgroupEventSource, logger
 
 	for _, opt := range opts {
 		opt(j)
+	}
+
+	if j.guardOn {
+		j.guard = newDaemonGuard(j.guardAddr, j.procRoot, logger)
 	}
 
 	// Let the registry verify bindings against the cgroup's current
@@ -414,12 +429,32 @@ func (j *CgroupJoiner) tryMatchState(
 		if err == nil {
 			var argv []string
 
+			if j.guard != nil && !st.ownerKnown {
+				st.owner, st.ownerKnown = ancestorDaemon(j.procRoot, pid)
+			}
+
 			argv, err = readArgv(j.procRoot, pid)
 			if err == nil {
 				if !isInitArgv(argv) {
 					st.goodPID, st.goodArgv = pid, argv
 				}
 			}
+		}
+	}
+
+	if j.guard != nil {
+		if flag := j.guard.verdict(st.owner, st.ownerKnown); flag != "" {
+			// An unresolved owner may still resolve on a later attempt
+			// (the first process can be a short-lived helper).
+			if flag == BuildFlagDaemonUnverified && !st.ownerKnown && !final && !st.gone {
+				return false
+			}
+
+			if ctx.Err() == nil {
+				j.linkDaemonBlocked(cgroupID, evt, flag)
+			}
+
+			return true
 		}
 	}
 
@@ -858,6 +893,16 @@ func (j *CgroupJoiner) deferredMatch(
 			removedCh = nil
 
 			if st.goodArgv == nil {
+				if j.guard != nil && !st.ownerKnown && j.guard.verdict(0, false) == BuildFlagDaemonUnverified {
+					// Never examined and the daemon cannot be proven: bind
+					// it unattributed (retired) so the session-level
+					// fallback does not guess a job for it.
+					j.gone.Store(evt.ContainerID, true)
+					j.linkDaemonBlocked(cgroupID, evt, BuildFlagDaemonUnverified)
+					j.registry.retireContainer(cgroupID, evt.ContainerID)
+					j.gone.Delete(evt.ContainerID)
+				}
+
 				return
 			}
 

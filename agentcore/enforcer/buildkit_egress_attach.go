@@ -604,6 +604,12 @@ func attributeBySession(violations []Violation, sessions SessionsLookup) {
 			continue
 		}
 
+		// A RUN cgroup of a buildkitd that is not the watched one belongs
+		// to none of the watched sessions: never guess a job for it.
+		if isDaemonBlockFlag(v.BuildFlag) {
+			continue
+		}
+
 		// Candidate sets from the session-level and weak-tail join tiers
 		// are not trusted: the real owner may be a session with no
 		// announced vertex, or the evidence is forgeable. Such rows are

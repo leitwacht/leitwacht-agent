@@ -99,7 +99,8 @@ type Violation struct {
 	// policy might have applied. BuildFlag is an anomaly-worthy
 	// attribution flag from the cgroup-join layer (e.g.
 	// missing_ci_attribution, deny_pattern_match, argv_untrusted,
-	// unmatched_under_policy, history_disconnected); a build that cannot
+	// unmatched_under_policy, history_disconnected, foreign_daemon,
+	// daemon_unverified); a build that cannot
 	// be attributed is flagged, never killed, unless the operator opted
 	// in to the kill switch.
 	EnforcementState string `json:"enforcement_state,omitempty"`

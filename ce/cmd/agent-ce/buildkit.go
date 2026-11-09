@@ -139,7 +139,8 @@ func startBuildKitAttribution(
 			src.ScanExisting = scanExisting
 
 			return enforcer.NewCgroupJoiner(registry, src, log,
-				enforcer.WithKillOnUnattributed(cfg.BuildkitKillOnUnattributed))
+				enforcer.WithKillOnUnattributed(cfg.BuildkitKillOnUnattributed),
+				enforcer.WithDaemonGuard(cfg.BuildkitGRPCAddr))
 		},
 	}
 

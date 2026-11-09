@@ -146,6 +146,28 @@ spec:
             # anyway, this just keeps the pod env clean).
             - name: LEITWACHT_CE_BUILDKIT_GRPC_ADDR
               value: {{ .grpcAddr | quote }}
+            {{- with .tls }}
+            {{- if .secretName }}
+            {{- $caKey := ternary .caKey "ca.crt" (hasKey . "caKey") }}
+            {{- if and (not $caKey) (eq (toString .clientAuth) "false") (not .serverName) }}
+            {{- fail "buildkit.tls.secretName is set but caKey is empty, clientAuth is false and serverName is empty: that configures no TLS (silent plaintext). Set at least one, or clear secretName." }}
+            {{- end }}
+            {{- if $caKey }}
+            - name: LEITWACHT_CE_BUILDKIT_TLS_CA
+              value: {{ printf "/etc/leitwacht-buildkit-tls/%s" $caKey | quote }}
+            {{- end }}
+            {{- if ne (toString .clientAuth) "false" }}
+            - name: LEITWACHT_CE_BUILDKIT_TLS_CERT
+              value: {{ printf "/etc/leitwacht-buildkit-tls/%s" (.certKey | default "tls.crt") | quote }}
+            - name: LEITWACHT_CE_BUILDKIT_TLS_KEY
+              value: {{ printf "/etc/leitwacht-buildkit-tls/%s" (.keyKey | default "tls.key") | quote }}
+            {{- end }}
+            {{- if .serverName }}
+            - name: LEITWACHT_CE_BUILDKIT_TLS_SERVER_NAME
+              value: {{ .serverName | quote }}
+            {{- end }}
+            {{- end }}
+            {{- end }}
             {{- if .cgroupPaths }}
             - name: LEITWACHT_CE_BUILDKIT_CGROUP_PATHS
               value: {{ join "," .cgroupPaths | quote }}
@@ -233,6 +255,11 @@ spec:
               mountPath: {{ .Values.containerd.socket }}
               readOnly: false
             {{- end }}
+            {{- if and .Values.buildkit.grpcAddr .Values.buildkit.tls .Values.buildkit.tls.secretName }}
+            - name: buildkit-tls
+              mountPath: /etc/leitwacht-buildkit-tls
+              readOnly: true
+            {{- end }}
             - name: var-run
               mountPath: /var/run/leitwacht
             - name: bpf
@@ -251,6 +278,12 @@ spec:
           hostPath:
             path: {{ .Values.containerd.socket }}
             type: Socket
+        {{- end }}
+        {{- if and .Values.buildkit.grpcAddr .Values.buildkit.tls .Values.buildkit.tls.secretName }}
+        - name: buildkit-tls
+          secret:
+            secretName: {{ .Values.buildkit.tls.secretName | quote }}
+            defaultMode: 0440
         {{- end }}
         - name: var-run
           hostPath:

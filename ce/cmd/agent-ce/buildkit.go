@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -58,6 +59,11 @@ func startBuildKitAttribution(
 		return nil, nil //nolint:nilnil // documented disable
 	}
 
+	if cfg.BuildkitTLSEnabled() && strings.HasPrefix(cfg.BuildkitGRPCAddr, "unix:") {
+		return nil, errors.New("buildkit TLS settings cannot be combined with a unix:// " +
+			"grpc address: buildkitd serves unix sockets in plaintext")
+	}
+
 	registry := enforcer.NewSessionRegistry(buildKitSessionTTL)
 	registry.SetMaxSessionAge(cfg.BuildkitMaxSessionAge)
 
@@ -83,8 +89,24 @@ func startBuildKitAttribution(
 	}
 
 	connTracker := enforcer.NewBuildKitConnTracker()
-	watcher := enforcer.NewAttributionWatcher(cfg.BuildkitGRPCAddr, registry, log,
-		enforcer.WithConnTracker(connTracker))
+	watcherOpts := []enforcer.WatcherOption{enforcer.WithConnTracker(connTracker)}
+
+	tlsCfg := enforcer.BuildKitTLSConfig{
+		CAFile:     cfg.BuildkitTLSCA,
+		CertFile:   cfg.BuildkitTLSCert,
+		KeyFile:    cfg.BuildkitTLSKey,
+		ServerName: cfg.BuildkitTLSServerName,
+	}
+	if tlsCfg.Enabled() {
+		bkTLS, err := enforcer.LoadBuildKitTLS(tlsCfg, log)
+		if err != nil {
+			return nil, err
+		}
+
+		watcherOpts = append(watcherOpts, enforcer.WithTLS(bkTLS))
+	}
+
+	watcher := enforcer.NewAttributionWatcher(cfg.BuildkitGRPCAddr, registry, log, watcherOpts...)
 
 	go func() {
 		err := watcher.Run(ctx)

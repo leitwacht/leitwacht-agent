@@ -25,6 +25,7 @@ import (
 
 	controlapi "github.com/moby/buildkit/api/services/control"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -1405,6 +1406,9 @@ type AttributionWatcher struct {
 	// BuildKitConnTracker).
 	tracker *BuildKitConnTracker
 
+	// tls, when set, replaces the plaintext transport (see WithTLS).
+	tls *BuildKitTLS
+
 	// Reconnect backoff. Defaults: min 1s, max 60s, growth 2x.
 	minBackoff time.Duration
 	maxBackoff time.Duration
@@ -1656,9 +1660,18 @@ func (w *AttributionWatcher) connect(_ context.Context) (*grpc.ClientConn, error
 
 	opts := w.dialOpts
 	if opts == nil {
-		opts = []grpc.DialOption{
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		creds := credentials.TransportCredentials(insecure.NewCredentials())
+
+		if w.tls != nil {
+			var err error
+
+			creds, err = w.tls.TransportCredentials()
+			if err != nil {
+				return nil, err
+			}
 		}
+
+		opts = []grpc.DialOption{grpc.WithTransportCredentials(creds)}
 
 		// Only tcp targets are tracked; the unix tie needs no connection.
 		// The custom dialer bypasses gRPC's HTTP proxy environment support.

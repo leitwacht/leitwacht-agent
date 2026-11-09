@@ -191,3 +191,49 @@ func TestLoadBuildkitDNSProxy(t *testing.T) {
 		t.Fatalf("set = %v %q %q, err %v", c.BuildkitDNSProxy, c.BuildkitDNSProc, c.BuildkitDNSListen, err)
 	}
 }
+
+func TestLoadBuildkitTLSValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		addr    string
+		env     map[string]string
+		wantErr string
+	}{
+		{"tcp + tls ok", "tcp://bk:1234", map[string]string{"LEITWACHT_CE_BUILDKIT_TLS_CA": "/ca"}, ""},
+		{"unix:// + tls", "unix:///run/bk.sock", map[string]string{"LEITWACHT_CE_BUILDKIT_TLS_CA": "/ca"}, "unix"},
+		{"unix:/path + tls", "unix:/run/bk.sock", map[string]string{"LEITWACHT_CE_BUILDKIT_TLS_SERVER_NAME": "x"}, "unix"},
+		{"unix without tls ok", "unix:///run/bk.sock", nil, ""},
+		{"cert without key", "tcp://bk:1234", map[string]string{"LEITWACHT_CE_BUILDKIT_TLS_CERT": "/c"}, "together"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("LEITWACHT_CE_DNS_UPSTREAM", "10.0.0.2:53")
+			t.Setenv("LEITWACHT_CE_BUILDKIT_GRPC_ADDR", tc.addr)
+
+			for _, k := range []string{
+				"LEITWACHT_CE_BUILDKIT_TLS_CA", "LEITWACHT_CE_BUILDKIT_TLS_CERT",
+				"LEITWACHT_CE_BUILDKIT_TLS_KEY", "LEITWACHT_CE_BUILDKIT_TLS_SERVER_NAME",
+			} {
+				t.Setenv(k, "")
+			}
+
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+
+			_, err := Load()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("err = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}

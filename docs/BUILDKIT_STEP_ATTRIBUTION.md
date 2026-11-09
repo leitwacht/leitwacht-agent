@@ -267,7 +267,7 @@ when ambiguous) — best resolved by trying it and iterating.
 ### Phase 5 — operator config + docs (~3 days)
 
 - New agent config keys: `BUILDKIT_GRPC_ADDR`,
-  `BUILDKIT_GRPC_TLS_CA_FILE` (optional, for hardened deployments).
+  `BUILDKIT_TLS_CA`/`_TLS_CERT`/`_TLS_KEY`/`_TLS_SERVER_NAME` (optional mTLS, see docs/BUILDKIT.md 3.3).
 - Helm chart values for both agent and EE server.
 - NetworkPolicy update in the operator's gitops repo.
 - `docs/EVENT_FLOW.md` updated.

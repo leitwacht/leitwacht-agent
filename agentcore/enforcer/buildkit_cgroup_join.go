@@ -169,6 +169,7 @@ type matchState struct {
 	// owner is the buildkitd PID found by ancestry (ownerKnown).
 	owner      int
 	ownerKnown bool
+	walkDef    bool // the ancestry walk completed (not-found is final)
 }
 
 // isInitArgv reports whether argv is a container-runtime helper (runc's
@@ -430,7 +431,7 @@ func (j *CgroupJoiner) tryMatchState(
 			var argv []string
 
 			if j.guard != nil && !st.ownerKnown {
-				st.owner, st.ownerKnown = ancestorDaemon(j.procRoot, pid)
+				st.owner, st.ownerKnown, st.walkDef = ancestorDaemon(j.procRoot, pid)
 			}
 
 			argv, err = readArgv(j.procRoot, pid)
@@ -446,7 +447,7 @@ func (j *CgroupJoiner) tryMatchState(
 		if flag := j.guard.verdict(st.owner, st.ownerKnown); flag != "" {
 			// An unresolved owner may still resolve on a later attempt
 			// (the first process can be a short-lived helper).
-			if flag == BuildFlagDaemonUnverified && !st.ownerKnown && !final && !st.gone {
+			if flag == BuildFlagDaemonUnverified && !st.ownerKnown && !st.walkDef && !final && !st.gone {
 				return false
 			}
 

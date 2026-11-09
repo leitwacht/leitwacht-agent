@@ -109,12 +109,17 @@ cgroup parent the agent can watch from the host, and RUN steps share the
 buildkitd pod's network namespace (needed for the DNS proxy).
 
 **Rootless buildkitd is untested and unsupported by Leitwacht today.**
-Its cgroup layout and network namespace differ, and the agent's
-`cgroupPaths` and RUN-level detection assume the rootful layout. If the
-layout does not match, the datapath runs in audit and rows carry
-`degraded_reason: run_level_mismatch`. Rootless would reduce what a
-malicious build can do to the node, so it is a worthwhile future
-direction, but do not rely on it with Leitwacht yet.
+In Kubernetes the RUN steps of a rootless buildkitd stay in the
+buildkitd container's own cgroup (there are no per-step cgroups, and the
+cgroup filesystem is read-only), and they share the pod's network
+namespace. With the default `cgroupPaths` the agent therefore finds no
+RUN cgroups and produces **no rows at all** for those builds; this is
+silent, not a `run_level_mismatch` outcome (that degraded reason is
+effectively unreachable). A rootless builder running inside a CI job pod
+should be covered by the agent's normal pod-level attach as that job's own
+egress, but this is inferred from the design and untested. Rootless would
+reduce what a malicious build can do to the node, so it is a worthwhile
+future direction, but do not rely on it with Leitwacht yet.
 
 ### 3.2 Recommendations
 
@@ -698,37 +703,62 @@ An agent subscribes to exactly one buildkitd (`grpcAddr`) and joins RUN
 cgroups under `cgroupPaths` to that daemon's sessions. Two buildkitd pods
 on one node share `/sys/fs/cgroup/buildkit` by default, so without a check
 the steps of an unwatched daemon could be attributed to the watched
-daemon's builds. To prevent that, the agent resolves which buildkitd owns
-each RUN cgroup by walking process parents (`/proc/<pid>/status`, expected
-tree `buildkitd -> runc -> RUN process`) and refuses to attribute a step
-whose daemon is not the watched one:
+daemon's builds. The agent therefore identifies the watched daemon by its
+**listening socket** and resolves which buildkitd owns each RUN cgroup by
+walking process parents (`/proc/<pid>/status`; expected tree for the
+rootful OCI worker: `buildkitd -> runc -> RUN process`; the outermost
+buildkitd on the chain is the owner). The tree layout is verified by
+reading code only and should be checked on your runtime.
 
-- **Exactly one buildkitd process visible on the node:** it is assumed to
-  be the watched daemon; behaviour is unchanged.
-- **None visible** (agent without `hostPID`, or a remote buildkitd): the
-  guard cannot verify anything. Attribution proceeds as before and the
-  agent logs one warning (`... cannot verify which buildkitd owns RUN
-  cgroups ...`). Do not run several buildkitd instances in this setup.
-- **Several visible:** the agent cannot tell which one `grpcAddr` reaches
-  unless the address is a unix socket through a process root
-  (`unix:///proc/<pid>/root/run/buildkit/buildkitd.sock`), which pins the
-  watched PID. With a pinned PID, steps of any other daemon get
-  `build_flag: foreign_daemon`. Without one, no step can be proven and all
-  RUN steps get `build_flag: daemon_unverified`. A step whose ancestry
-  cannot be resolved (process already gone) is `daemon_unverified`.
+How the watched daemon is found (all visible `buildkitd` processes are
+considered, by process name):
 
-Flagged steps are linked to no vertex and no session, and run in audit
-like other unattributed rows (the kill opt-in is not extended to them).
-Discovery of buildkitd processes is cached for 15 seconds, so a second
-daemon that appears later is noticed.
+- `grpcAddr` as `unix://<path>` (any path, including
+  `unix:///proc/<pid>/root/...`): the daemon holding a listening socket
+  on that file.
+- `grpcAddr` as `tcp://host:port`: the local daemon holding a listener on
+  that port. A Service whose port differs from its `targetPort` never
+  matches; the agent logs an Error once. Use the unix socket form or the
+  same port.
 
-The guard needs `hostPID` on the agent (section 3.2). The recommended
-topology is one buildkitd per node per agent, each daemon with its own
-`cgroupPaths`. A `grpcAddr` that is a multi-replica Service is not
-supported: the agent subscribes to whichever replica the connection
-reaches, and the other replicas' steps are never attributed. The ancestry
-walk is verified against the process tree layout above and should be
-checked on your runtime (section 8).
+Outcomes for a RUN cgroup:
+
+- Owner is the watched daemon: attributed as usual.
+- Owner is another local buildkitd: `build_flag: foreign_daemon`.
+- Owner cannot be resolved, or several local daemons match the address:
+  `build_flag: daemon_unverified`. The one exception: if the watched daemon
+  is the only buildkitd visible, an unresolved owner behaves as before
+  (nothing else could own the step).
+- No local daemon matches the address (the watched daemon is remote): every
+  step of a local buildkitd is `foreign_daemon` or `daemon_unverified`.
+
+A second buildkitd (including a process that merely renames itself
+`buildkitd`, a docker-in-docker, or a `buildctl-daemonless` run in a CI
+job) never changes how the watched daemon's steps are treated. When two or
+more buildkitd processes are visible the agent logs an Error with each
+pid and cgroup (repeated at most once a minute).
+
+Flagged steps link to no vertex and no session, are skipped by the
+session-level fallback, and are filed as unattributed rows
+(`build_unattributed: true`, `enforcement_state: unattributed`, audit).
+The kill opt-in is not extended to them. Discovery is cached for 15
+seconds and re-run when an owner does not match, so a daemon restart
+(new pid) is followed.
+
+Requirements and limits:
+
+- The guard needs `hostPID` on the agent (section 3.2). Without it no
+  buildkitd is visible; the guard cannot verify anything, attribution
+  proceeds as before, and the agent logs one warning. Do not run several
+  buildkitd instances in that setup.
+- The guard requires the OCI (runc) worker. With the containerd worker the
+  process tree does not lead to buildkitd; the agent warns once, and steps
+  are `daemon_unverified` whenever another buildkitd is visible.
+- Recommended topology: one buildkitd per node per agent, each with its own
+  `cgroupPaths`. A `grpcAddr` that is a multi-replica Service is not
+  supported: the agent subscribes to whichever replica the connection
+  reaches, and the other replicas' steps are never attributed.
+- The fail-safe is always "unattributed", never a guessed job.
 
 ## 8. Verifying it works
 
@@ -761,6 +791,8 @@ Use these log lines (structured, metadata only) for diagnosis:
 | --- | --- |
 | `buildkit cgroup not attributed: no pending vertex matched before the join deadline` | A RUN cgroup could not be tied to a vertex. Fields: `pending_vertices`, `history_disconnected`, `suppressed_since_last` (the line is rate-limited). A steady stream means missing build-args, a command-matching problem or overlap. |
 | `buildkit RUN cgroup not attributed: its buildkitd is not the watched daemon` | The daemon-ancestry guard flagged a RUN cgroup (`flag`: `foreign_daemon` or `daemon_unverified`). Another buildkitd shares the cgroup parent; give each daemon its own `cgroupPaths` and pin the watched one (7.8). |
+| `buildkit daemon-ancestry guard: no local buildkitd listens on the watched address` | The watched address does not match any local listener (Service port differs from targetPort, or the daemon is remote). All local daemons' steps are left unattributed (7.8). |
+| `several buildkitd processes visible on this node` | Lists each pid and cgroup. Only steps of the daemon owning the watched address are attributed (7.8). |
 | `buildkit daemon-ancestry guard cannot verify which buildkitd owns RUN cgroups` | No buildkitd process visible: missing `hostPID` or remote daemon (7.8). Logged once. |
 | `buildkit cgroup glob matched zero paths` | `cgroupPaths` does not match yet or at all. |
 | `buildkit history stream ended` / `buildkit connect failed` | Control gRPC unreachable: NetworkPolicy, wrong `grpcAddr`, or a TLS-only listener (3.3). |

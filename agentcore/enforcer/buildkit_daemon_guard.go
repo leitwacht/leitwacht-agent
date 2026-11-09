@@ -3,9 +3,9 @@ package enforcer
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,100 +36,186 @@ const (
 	daemonDiscoveryTTL = 15 * time.Second
 )
 
-// pinnedDaemonRe extracts the daemon PID from a gRPC address that points
-// through a host process root (unix:///proc/<pid>/root/...).
-var pinnedDaemonRe = regexp.MustCompile(`^unix:(?://)?/proc/(\d+)/root/`)
-
 // daemonGuard decides, per RUN cgroup, whether its owning buildkitd is the
-// watched daemon. All methods are safe for concurrent use.
+// watched daemon. The watched daemon is identified by the listening socket
+// behind grpcAddr, never by process name alone. All methods are safe for
+// concurrent use.
 type daemonGuard struct {
 	procRoot string
+	addr     string
 	logger   *slog.Logger
 	now      func() time.Time
-	pinned   int // watched daemon PID from the gRPC address, 0 if none
 
-	mu         sync.Mutex
-	scannedAt  time.Time
-	daemons    []int
-	warnedNone bool
+	mu           sync.Mutex
+	scannedAt    time.Time
+	forcedAt     time.Time
+	daemons      []int // every visible buildkitd process
+	matching     []int // visible daemons that listen on grpcAddr
+	warnedNone   bool
+	warnedWalk   bool
+	warnedTie    bool
+	loggedMulti  string
+	loggedMultiT time.Time
 }
 
 func newDaemonGuard(grpcAddr, procRoot string, logger *slog.Logger) *daemonGuard {
-	g := &daemonGuard{procRoot: procRoot, logger: logger, now: time.Now}
-
-	if m := pinnedDaemonRe.FindStringSubmatch(grpcAddr); m != nil {
-		g.pinned, _ = strconv.Atoi(m[1])
-	}
-
-	return g
+	return &daemonGuard{procRoot: procRoot, addr: grpcAddr, logger: logger, now: time.Now}
 }
 
-// discover returns the host PIDs whose comm is buildkitd, cached for
-// daemonDiscoveryTTL unless force is set.
-func (g *daemonGuard) discover(force bool) []int {
+// snapshot returns the cached daemon sets, rescanning when stale or forced.
+// A forced rescan is rate-limited to once per second.
+func (g *daemonGuard) snapshot(force bool) (daemons, matching []int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	if !force && !g.scannedAt.IsZero() && g.now().Sub(g.scannedAt) < daemonDiscoveryTTL {
-		return g.daemons
+	now := g.now()
+	stale := g.scannedAt.IsZero() || now.Sub(g.scannedAt) >= daemonDiscoveryTTL
+	canForce := force && (g.forcedAt.IsZero() || now.Sub(g.forcedAt) >= time.Second)
+
+	if stale || canForce {
+		if canForce {
+			g.forcedAt = now
+		}
+
+		g.refreshLocked()
+		g.scannedAt = now
 	}
 
+	return g.daemons, g.matching
+}
+
+func (g *daemonGuard) refreshLocked() {
 	g.daemons = listDaemonPIDs(g.procRoot)
-	g.scannedAt = g.now()
+	g.matching = nil
 
-	if len(g.daemons) == 0 && !g.warnedNone {
-		g.warnedNone = true
-
-		g.logger.Warn("buildkit daemon-ancestry guard cannot verify which buildkitd owns RUN cgroups: "+
-			"no buildkitd process visible (agent without hostPID, or a remote buildkitd); "+
-			"attribution proceeds unverified",
-			"proc_root", g.procRoot)
+	for _, d := range g.daemons {
+		if daemonListensOn(g.procRoot, d, g.addr) {
+			g.matching = append(g.matching, d)
+		}
 	}
 
-	return g.daemons
+	if len(g.daemons) == 0 {
+		if !g.warnedNone {
+			g.warnedNone = true
+
+			g.logger.Warn("buildkit daemon-ancestry guard cannot verify which buildkitd owns RUN cgroups: "+
+				"no buildkitd process visible (agent without hostPID, or a remote buildkitd); "+
+				"attribution proceeds unverified",
+				"proc_root", g.procRoot)
+		}
+
+		return
+	}
+
+	if len(g.matching) == 0 && !g.warnedTie {
+		g.warnedTie = true
+
+		g.logger.Error("buildkit daemon-ancestry guard: no local buildkitd listens on the watched address; "+
+			"RUN steps of local buildkitd processes will be left unattributed. If the watched daemon is "+
+			"local, the address does not match its listener (a Service port that differs from targetPort "+
+			"never matches): use the unix socket form or the same port",
+			"grpc_addr", g.addr, "local_daemons", len(g.daemons))
+	}
+
+	if len(g.daemons) >= 2 {
+		g.logMultiLocked()
+	}
+}
+
+// logMultiLocked reports several buildkitd processes at Error, with the pid
+// and cgroup of each, when the set changes or once a minute.
+func (g *daemonGuard) logMultiLocked() {
+	key := fmt.Sprint(g.daemons)
+	now := g.now()
+
+	if key == g.loggedMulti && now.Sub(g.loggedMultiT) < time.Minute {
+		return
+	}
+
+	g.loggedMulti, g.loggedMultiT = key, now
+
+	attrs := []any{"count", len(g.daemons), "watched_pids", fmt.Sprint(g.matching)}
+
+	for _, d := range g.daemons {
+		attrs = append(attrs, "pid_"+strconv.Itoa(d)+"_cgroup", readCgroupLine(g.procRoot, d))
+	}
+
+	g.logger.Error("several buildkitd processes visible on this node; only RUN steps whose "+
+		"buildkitd owns the watched address are attributed", attrs...)
+}
+
+func readCgroupLine(procRoot string, pid int) string {
+	b, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "cgroup"))
+	if err != nil {
+		return "unknown"
+	}
+
+	line, _, _ := strings.Cut(strings.TrimSpace(string(b)), "\n")
+
+	return line
+}
+
+func pidIn(xs []int, x int) bool {
+	for _, v := range xs {
+		if v == x {
+			return true
+		}
+	}
+
+	return false
 }
 
 // verdict returns "" when the RUN cgroup may be attributed to the watched
-// daemon, or the BuildFlag to stamp on it. owner is the buildkitd PID found
-// by ancestry when ownerKnown.
+// daemon, or the BuildFlag to stamp on it. owner is the outermost buildkitd
+// found by ancestry when ownerKnown.
 func (g *daemonGuard) verdict(owner int, ownerKnown bool) string {
-	if g.pinned > 0 {
-		switch {
-		case !ownerKnown:
-			return BuildFlagDaemonUnverified
-		case owner == g.pinned:
-			return ""
-		default:
-			return BuildFlagForeignDaemon
-		}
+	daemons, matching := g.snapshot(false)
+
+	if ownerKnown && !pidIn(matching, owner) {
+		// The watched daemon may have restarted (new pid): re-tie once.
+		daemons, matching = g.snapshot(true)
 	}
 
-	ds := g.discover(false)
-
-	switch len(ds) {
-	case 0:
+	if len(daemons) == 0 {
 		return ""
-	case 1:
-		if !ownerKnown || owner == ds[0] {
+	}
+
+	if !ownerKnown {
+		g.noteWalkFailure()
+
+		// Only the watched daemon is visible: nothing else could own the
+		// step (also covers workers whose process tree hides buildkitd).
+		if len(daemons) == 1 && len(matching) == 1 {
 			return ""
 		}
 
-		// The sole daemon may have restarted since the last scan.
-		ds = g.discover(true)
-		if len(ds) == 1 && owner == ds[0] {
-			return ""
-		}
-
-		if len(ds) <= 1 {
-			return BuildFlagForeignDaemon
-		}
-
-		return BuildFlagDaemonUnverified
-	default:
-		// Several daemons and no way to tell which one the gRPC address
-		// reaches: nothing can be proven.
 		return BuildFlagDaemonUnverified
 	}
+
+	switch {
+	case !pidIn(matching, owner):
+		return BuildFlagForeignDaemon
+	case len(matching) == 1:
+		return ""
+	default:
+		return BuildFlagDaemonUnverified
+	}
+}
+
+func (g *daemonGuard) noteWalkFailure() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if g.warnedWalk {
+		return
+	}
+
+	g.warnedWalk = true
+
+	g.logger.Warn("buildkit daemon-ancestry guard: a RUN process has no buildkitd ancestor. "+
+		"The guard requires the OCI (runc) worker; with the containerd worker the process tree "+
+		"does not lead to buildkitd and steps are left unverified when other buildkitd processes exist",
+		"proc_root", g.procRoot)
 }
 
 // listDaemonPIDs scans procRoot for processes named buildkitd.
@@ -171,25 +257,147 @@ func isDaemonProc(procRoot string, pid int) bool {
 	return false
 }
 
+// daemonListensOn reports whether process pid owns a listening socket for
+// addr (unix:// path or tcp:// port). The socket must be held in pid's fd
+// table, so a process that merely shares the network namespace never matches.
+func daemonListensOn(procRoot string, pid int, addr string) bool {
+	p := strconv.Itoa(pid)
+
+	switch {
+	case strings.HasPrefix(addr, "unix:"):
+		path := strings.TrimPrefix(strings.TrimPrefix(addr, "unix:"), "//")
+
+		want, err := os.Stat(path)
+		if err != nil {
+			return false
+		}
+
+		for _, e := range listeningSockets(filepath.Join(procRoot, p, "net", "unix"), 6, 7, 3, "00010000") {
+			if e.path == "" || strings.HasPrefix(e.path, "@") {
+				continue
+			}
+
+			got, err := os.Stat(filepath.Join(procRoot, p, "root", e.path))
+			if err == nil && os.SameFile(want, got) && holdsSocket(procRoot, pid, e.inode) {
+				return true
+			}
+		}
+
+		return false
+	case strings.HasPrefix(addr, "tcp:"):
+		_, port, err := net.SplitHostPort(strings.TrimPrefix(addr, "tcp://"))
+		if err != nil {
+			return false
+		}
+
+		n, err := strconv.Atoi(port)
+		if err != nil {
+			return false
+		}
+
+		for _, f := range []string{"tcp", "tcp6"} {
+			for _, e := range listeningSockets(filepath.Join(procRoot, p, "net", f), 9, 1, 3, "0A") {
+				if strings.HasSuffix(e.path, ":"+fmt.Sprintf("%04X", n)) && holdsSocket(procRoot, pid, e.inode) {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+type sockEntry struct {
+	inode string
+	path  string // unix: socket path; tcp: local "ADDR:PORT"
+}
+
+// listeningSockets parses a /proc/net table. inodeCol and pathCol are field
+// indexes; stCol/stWant select listening rows (unix: Flags 00010000,
+// tcp: st 0A).
+func listeningSockets(file string, inodeCol, pathCol, stCol int, stWant string) []sockEntry {
+	data, err := os.ReadFile(file)
+	if err != nil {
+		return nil
+	}
+
+	var out []sockEntry
+
+	for i, line := range strings.Split(string(data), "\n") {
+		if i == 0 {
+			continue
+		}
+
+		f := strings.Fields(line)
+		if len(f) <= stCol || f[stCol] != stWant {
+			continue
+		}
+
+		e := sockEntry{}
+		if len(f) > inodeCol {
+			e.inode = f[inodeCol]
+		}
+
+		if len(f) > pathCol {
+			e.path = f[pathCol]
+		}
+
+		out = append(out, e)
+	}
+
+	return out
+}
+
+// holdsSocket reports whether pid has an fd for the socket inode.
+func holdsSocket(procRoot string, pid int, inode string) bool {
+	if inode == "" {
+		return false
+	}
+
+	dir := filepath.Join(procRoot, strconv.Itoa(pid), "fd")
+
+	fds, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+
+	want := "socket:[" + inode + "]"
+
+	for _, fd := range fds {
+		if l, err := os.Readlink(filepath.Join(dir, fd.Name())); err == nil && l == want {
+			return true
+		}
+	}
+
+	return false
+}
+
 // ancestorDaemon walks PPid upward from pid (inclusive) and returns the
-// first buildkitd process. Expected tree for a rootful runc worker:
-// buildkitd -> runc -> RUN process. ok is false when none is found within
-// maxAncestryHops (process gone, no hostPID, foreign pid namespace).
-func ancestorDaemon(procRoot string, pid int) (int, bool) {
-	for hops := 0; hops < maxAncestryHops && pid > 1; hops++ {
+// OUTERMOST buildkitd process on the chain: the real daemon, even when a
+// RUN process renamed itself buildkitd (it sits deeper in the chain).
+// Expected tree for a rootful runc worker: buildkitd -> runc -> RUN
+// process. definitive is true when the walk reached the top of the tree
+// cleanly, so retrying cannot change a not-found result; it is false after
+// a read error or the hop limit (process gone mid-walk).
+func ancestorDaemon(procRoot string, pid int) (owner int, found, definitive bool) {
+	for hops := 0; hops < maxAncestryHops; hops++ {
+		if pid <= 1 {
+			return owner, found, true
+		}
+
 		if isDaemonProc(procRoot, pid) {
-			return pid, true
+			owner, found = pid, true
 		}
 
 		ppid, err := readPPid(procRoot, pid)
 		if err != nil || ppid == pid {
-			return 0, false
+			return owner, found, false
 		}
 
 		pid = ppid
 	}
 
-	return 0, false
+	return owner, found, false
 }
 
 func readPPid(procRoot string, pid int) (int, error) {
@@ -226,13 +434,12 @@ func WithDaemonGuard(grpcAddr string) JoinerOption {
 
 // linkDaemonBlocked records an unattributable binding for a RUN cgroup
 // whose daemon is not (provably) the watched one: no vertex, no
-// candidates, so the policy binder classifies it unattributed and the
+// candidates, not ambiguous, so the policy binder classifies it unattributed and the row is filed build_unattributed and the
 // session-level fallback skips it.
 func (j *CgroupJoiner) linkDaemonBlocked(cgroupID uint64, evt CgroupCreateEvent, flag string) {
 	j.linkCgroup(cgroupID, CgroupBinding{
 		ContainerID: evt.ContainerID,
 		CgroupPath:  evt.CgroupPath,
-		Ambiguous:   true,
 		Strength:    StrengthAmbiguous,
 		Flag:        flag,
 	})

@@ -151,6 +151,10 @@ type BuildDNSTracker interface {
 
 // BuildDNSConfig configures the build DNS proxy (WithBuildKitDNSProxy).
 type BuildDNSConfig struct {
+	// Guard, when set, restricts the netns choice to RUN steps of the
+	// watched buildkitd (see DaemonGuard). Nil: every RUN cgroup under the
+	// configured parents counts.
+	Guard *DaemonGuard
 	// Tracker attributes queries to RUN cgroups. Required: without it the
 	// proxy cannot tell RUN steps apart and is not started.
 	Tracker BuildDNSTracker
@@ -987,6 +991,10 @@ func (d *buildDNS) defaultSample() []runSample {
 	var out []runSample
 
 	for _, pid := range runProcs(d.runPaths, 16) {
+		if d.cfg.Guard != nil && !d.cfg.Guard.IsWatchedPID(pid) {
+			continue
+		}
+
 		if ino, err := d.netnsInode(pid); err == nil {
 			out = append(out, runSample{pid: pid, ino: ino})
 		}

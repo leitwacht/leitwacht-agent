@@ -250,7 +250,7 @@ func NewCgroupJoiner(registry *SessionRegistry, source CgroupEventSource, logger
 		opt(j)
 	}
 
-	if j.guardOn {
+	if j.guardOn && j.guard == nil {
 		j.guard = newDaemonGuard(j.guardAddr, j.procRoot, logger)
 		j.guard.tracker = j.guardTracker
 	}

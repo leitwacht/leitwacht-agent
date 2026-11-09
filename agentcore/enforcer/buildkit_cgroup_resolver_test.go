@@ -504,6 +504,18 @@ func TestCgroupResolver_ReplacementAppliesImmediately(t *testing.T) {
 	if j, _, _, _, _, _ := rig.snapshot(); !slices.Equal(j[1], []string{b}) {
 		t.Fatalf("gens=%v, want second generation [%s]", j, b)
 	}
+
+	// The attach owns the build DNS proxy and its run paths: the
+	// replacement generation must start it with the new path set.
+	rig.waitFor(t, "replacement attach", func() bool { return len(rig.attaches) == 2 })
+
+	rig.mu.Lock()
+	got := slices.Clone(rig.attaches[1])
+	rig.mu.Unlock()
+
+	if !slices.Equal(got, []string{b}) {
+		t.Fatalf("replacement attach paths = %v, want [%s]", got, b)
+	}
 }
 
 func TestCgroupResolver_RemovalOnlyStaysDebounced(t *testing.T) {

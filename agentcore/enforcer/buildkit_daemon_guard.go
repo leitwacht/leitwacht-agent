@@ -609,6 +609,41 @@ func WithDaemonGuard(grpcAddr string) JoinerOption {
 	return func(j *CgroupJoiner) { j.guardAddr, j.guardOn = grpcAddr, true }
 }
 
+// DaemonGuard is the shared daemon-ancestry guard. Build one with
+// NewDaemonGuard and pass it to the joiner (WithDaemonGuardInstance) and the
+// build DNS proxy (BuildDNSConfig.Guard) so both judge RUN steps the same
+// way and share one discovery cache.
+type DaemonGuard = daemonGuard
+
+// NewDaemonGuard creates a guard for the watched buildkitd at grpcAddr.
+// tracker may be nil (tcp addresses then only get the weak port tie).
+func NewDaemonGuard(grpcAddr string, tracker *BuildKitConnTracker, logger *slog.Logger) *DaemonGuard {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	g := newDaemonGuard(grpcAddr, "/proc", logger)
+	g.tracker = tracker
+
+	return g
+}
+
+// WithDaemonGuardInstance makes the joiner use a shared guard.
+func WithDaemonGuardInstance(g *DaemonGuard) JoinerOption {
+	return func(j *CgroupJoiner) { j.guard = g }
+}
+
+// IsWatchedPID reports whether the RUN process pid belongs to the watched
+// buildkitd (ancestry plus the guard's cached tie). Unresolved or foreign
+// owners are not watched. With no buildkitd visible it returns true, like
+// the joiner (the guard cannot verify anything then).
+func (g *daemonGuard) IsWatchedPID(pid int) bool {
+	owner, found, _ := ancestorDaemon(g.procRoot, pid)
+	flag, _ := g.verdict(owner, found, true)
+
+	return flag == ""
+}
+
 // WithDaemonConnTracker ties the watched daemon to the agent's own gRPC
 // connection (the watcher must be built with WithConnTracker on the same
 // tracker). Without it, tcp addresses fall back to port matching.

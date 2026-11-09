@@ -842,3 +842,48 @@ func TestDaemonGuard_SuppressedRescanRetriesInsteadOfForeign(t *testing.T) {
 		return ok && b.Flag == ""
 	})
 }
+
+// dnsSampleEnv stages two RUN cgroups: 5000 under the watched daemon 3000
+// and 5100 under daemon 3100, and returns a buildDNS sampling them.
+func dnsSampleEnv(t *testing.T, guard bool) *buildDNS {
+	t.Helper()
+
+	e := newGuardEnv(t, "tcp://h:1234", 0)
+	fakeProc(t, e.root, 3000, 1, "buildkitd")
+	fakeProc(t, e.root, 3100, 1, "buildkitd")
+	fakeWatchedTCP(t, e.root, 3000, 1234)
+	fakeTCPListener(t, e.root, 3100, 1234)
+
+	fakeProc(t, e.root, 4000, 3000, "runc")
+	fakeProc(t, e.root, 4100, 3100, "runc")
+	fakeProc(t, e.root, 5100, 4100, "sh")
+	fakeProc(t, e.root, 5000, 4000, "sh")
+
+	runs := filepath.Join(e.root, "runs")
+	guardWrite(t, filepath.Join(runs, "a", "cgroup.procs"), "5100\n") // foreign daemon first
+	guardWrite(t, filepath.Join(runs, "b", "cgroup.procs"), "5000\n")
+
+	d := &buildDNS{
+		runPaths:   []string{runs},
+		netnsInode: func(pid int) (uint64, error) { return uint64(pid), nil },
+	}
+	if guard {
+		d.cfg.Guard = e.j.guard
+	}
+
+	return d
+}
+
+func TestBuildDNS_SampleOnlyWatchedDaemonSteps(t *testing.T) {
+	s := dnsSampleEnv(t, true).defaultSample()
+	if len(s) != 1 || s[0].pid != 5000 {
+		t.Fatalf("samples = %+v, want only the watched daemon's step 5000", s)
+	}
+}
+
+func TestBuildDNS_SampleUnchangedWithoutGuard(t *testing.T) {
+	s := dnsSampleEnv(t, false).defaultSample()
+	if len(s) != 2 {
+		t.Fatalf("samples = %+v, want both RUN processes", s)
+	}
+}

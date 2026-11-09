@@ -89,6 +89,7 @@ func startBuildKitAttribution(
 	}
 
 	connTracker := enforcer.NewBuildKitConnTracker()
+	daemonGuard := enforcer.NewDaemonGuard(cfg.BuildkitGRPCAddr, connTracker, log)
 	watcherOpts := []enforcer.WatcherOption{enforcer.WithConnTracker(connTracker)}
 
 	tlsCfg := enforcer.BuildKitTLSConfig{
@@ -164,8 +165,7 @@ func startBuildKitAttribution(
 
 			return enforcer.NewCgroupJoiner(registry, src, log,
 				enforcer.WithKillOnUnattributed(cfg.BuildkitKillOnUnattributed),
-				enforcer.WithDaemonGuard(cfg.BuildkitGRPCAddr),
-				enforcer.WithDaemonConnTracker(connTracker))
+				enforcer.WithDaemonGuardInstance(daemonGuard))
 		},
 	}
 
@@ -185,6 +185,7 @@ func startBuildKitAttribution(
 
 			if cfg.BuildkitDNSProxy {
 				opts = append(opts, enforcer.WithBuildKitDNSProxy(enforcer.BuildDNSConfig{
+					Guard:                daemonGuard,
 					Tracker:              mgr.DNSPIDTracker(),
 					ProcName:             cfg.BuildkitDNSProc,
 					ProcCgroupContains:   cfg.BuildkitDNSProcCgroup,

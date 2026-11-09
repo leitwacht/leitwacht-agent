@@ -269,6 +269,9 @@ creates the parent (it does so lazily, at the first RUN step).
 
 ### 4.3 Build DNS proxy prerequisites
 
+The proxy samples only the watched buildkitd's steps when the daemon
+guard can tie it (7.8).
+
 IP/CIDR rules reach RUN steps through the egress filter. Domain rules
 need the agent to see the names a step resolves. Enable the proxy only
 once you have read this section; with it on, names that were previously
@@ -830,6 +833,11 @@ reconnect before the daemon's accept is visible, steps can be flagged:
 unattributed and audited, never a wrong job. When two or more buildkitd
 processes are visible the agent logs an Error with each pid and cgroup
 (repeated at most once a minute).
+
+The build DNS proxy (4.3) uses the same guard: it picks the network
+namespace to bind from RUN steps of the watched buildkitd only, when the
+guard can tie it. Steps of another buildkitd, or whose owner cannot be
+resolved while several run, are not sampled.
 
 Flagged steps link to no vertex and no session, are skipped by the
 session-level fallback, and are filed as unattributed rows

@@ -309,16 +309,38 @@ Behaviour you can rely on:
   policies with domain rules carry `fqdn_rules_inactive`, and the proxy is
   rebound at the next RUN step. Builds never break because the proxy is
   down.
-- **Late binding.** Until a trusted network namespace is known (the first
-  build after an agent or buildkitd start) domain rules are not enforced.
+- **Late binding.** The proxy binds in the RUN steps' network namespace
+  as soon as a RUN cgroup appears (the agent watches the RUN parents and
+  reads the new cgroup's first process, retrying for about 100 ms); the
+  500 ms poll is the fallback. It is not bound from the buildkitd process
+  alone, because a process name is not trusted. What is still lost: a step
+  whose process exits before it can be sampled (and any step the watch
+  misses before the next poll) resolves through the cluster DNS directly
+  until the proxy is bound, so its lookups leave no DNS record and its
+  egress rows get no domain; domain rules are not enforced for it.
   RUN processes in several network namespaces at once, or a namespace that
   changes every step, latch the redirect off for 10 minutes.
+- **Records of steps not yet bound to a policy.** A query from a step
+  that has no policy yet is recorded against its cgroup. At flush the
+  record moves to the policy the step is (or, if it already ended, was)
+  bound to: project, job and policy key are stamped, as for egress rows.
+  If the step is still unbound, the record is held for a fixed 10 s, then
+  reported without a project. Nothing is dropped; a step recording more
+  than 256 distinct names while pending, or more than 1024 steps pending
+  at once, sends the excess straight to the shared (unattributed) record.
+- **After a buildkitd restart.** The proxy stays bound and verified on the
+  old network namespace until the poll sees RUN processes in the new one
+  and rebinds, so the first step after a buildkitd restart can still go
+  unlabelled.
 - **Per-step answers.** `enforce`: allowed names resolve and their
   addresses join the step's allow set; denied names get the rule's
   resolution (sinkhole or NXDOMAIN); unmatched names get the sinkhole.
   `shadow`: everything resolves, would-be denials are recorded as
   `dns_would_block`. `audit`, unattributed and ambiguous steps: answered
-  normally, recorded as `dns_observed`.
+  normally, recorded as `dns_observed`. In EE, `dns_observed` records
+  with no project (project 0) are those of ambiguous, unattributed or
+  never-bound steps (after the 10 s hold) and of queries from outside any
+  RUN cgroup; a step that was merely pending when it queried is re-homed.
 - **Bypass pin.** While the proxy is on, port 53 from RUN steps to
   anything but the proxy is dropped (enforce) or `would_block` (shadow).
 - **Limits per step.** At most 8 held and 32 in-flight queries and about

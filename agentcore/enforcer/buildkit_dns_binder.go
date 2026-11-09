@@ -154,6 +154,22 @@ func (b *BuildPolicyBinder) DNSDecision(id uint64) BuildDNSDecision {
 	return out
 }
 
+// DNSDecisionAt is DNSDecision for flush time: besides the live entry it
+// finds one retired by a cgroup removal within the id-reuse grace of at
+// (steps shorter than the flush interval are gone by then). Only the
+// project, job and state are meaningful.
+func (b *BuildPolicyBinder) DNSDecisionAt(id uint64, at time.Time) BuildDNSDecision {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	d, ok := b.decisionFor(id, at)
+	if !ok {
+		return BuildDNSDecision{}
+	}
+
+	return BuildDNSDecision{Known: true, State: d.state, Mode: d.mode, Key: d.key}
+}
+
 // WaitDecision blocks until id has an entry (any state: ambiguous,
 // unattributed and degraded end the wait too), the deadline passes, or ctx
 // is done, and returns the decision (Known false on timeout). The DNS

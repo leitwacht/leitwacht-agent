@@ -9,7 +9,7 @@
 #
 # Pure Go, no CGO — ships from scratch with a static binary.
 
-ARG GO_VERSION=1.27.3
+ARG GO_VERSION=1.27.4
 
 FROM golang:${GO_VERSION}-alpine AS build
 WORKDIR /src

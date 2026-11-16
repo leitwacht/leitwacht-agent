@@ -1601,6 +1601,7 @@ func (m *Manager) initNetnsContext(nctx *NetnsContext, pid int, pol *policy.Reso
 
 	if m.dnsPIDTracker != nil {
 		proxyCfg.LookupDNSPID = m.dnsPIDTracker.LookupWithBinary
+		proxyCfg.LookupDNSPIDTCP = m.dnsPIDTracker.LookupWithBinaryNoRetry
 	}
 
 	nctx.dnsProxy = NewDNSProxy(proxyCfg)

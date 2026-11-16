@@ -97,6 +97,11 @@ type DNSProxyConfig struct {
 	// (see (*DNSProxy).Start).
 	LookupDNSPID func(netnsCookie uint64, srcPort uint16) (pid uint32, comm string, parentComm string, binaryPath string, cgroupID uint64)
 
+	// LookupDNSPIDTCP, when set, is used instead of LookupDNSPID for TCP
+	// queries. TCP attribution is recorded at connect, before any data, so
+	// it needs no miss retry (which LookupDNSPID may do for UDP).
+	LookupDNSPIDTCP func(netnsCookie uint64, srcPort uint16) (pid uint32, comm string, parentComm string, binaryPath string, cgroupID uint64)
+
 	// DockerUDPDial / DockerTCPDial open a fresh SO_MARK-ed socket to
 	// Docker's embedded resolver (127.0.0.11:53) from inside the container
 	// netns, once per query. UDP is the normal path (it keeps Docker's own
@@ -1052,15 +1057,21 @@ func (p *DNSProxy) Start(udpConn net.PacketConn, tcpListener net.Listener) {
 		if p.cfg.LookupDNSPID != nil {
 			var port int
 
+			lookup := p.cfg.LookupDNSPID
+
 			switch addr := w.RemoteAddr().(type) {
 			case *net.UDPAddr:
 				port = addr.Port
 			case *net.TCPAddr:
 				port = addr.Port
+
+				if p.cfg.LookupDNSPIDTCP != nil {
+					lookup = p.cfg.LookupDNSPIDTCP
+				}
 			}
 
 			if port != 0 {
-				pid, comm, parentComm, binaryPath, cgroupID = p.cfg.LookupDNSPID(p.netnsCookie, uint16(port))
+				pid, comm, parentComm, binaryPath, cgroupID = lookup(p.netnsCookie, uint16(port))
 			}
 		}
 

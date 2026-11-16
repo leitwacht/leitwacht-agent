@@ -20,6 +20,11 @@ func (*DNSPIDTracker) LookupWithBinary(_ uint64, _ uint16) (uint32, string, stri
 	return 0, "", "", "", 0
 }
 
+// LookupWithBinaryNoRetry always returns zero values on non-Linux.
+func (*DNSPIDTracker) LookupWithBinaryNoRetry(_ uint64, _ uint16) (uint32, string, string, string, uint64) {
+	return 0, "", "", "", 0
+}
+
 // BinaryPathForPID always returns empty on non-Linux.
 func (*DNSPIDTracker) BinaryPathForPID(_ uint32) string { return "" }
 

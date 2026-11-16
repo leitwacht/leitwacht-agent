@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -399,12 +401,64 @@ func (t *DNSPIDTracker) RemoveRunParent(cgroupID uint64) {
 	_ = t.objs.DnsRunParents.Delete(cgroupID)
 }
 
+// dnsPIDRetryBudget is the wall-clock budget for retrying a map miss.
+// The attribution entry is written from fexit/udp_sendmsg, which runs
+// after the datagram is already queued to the receiving socket, so the
+// DNS proxy can read the packet and look up before the entry exists.
+// This mostly affects the first datagram on a fresh socket.
+//
+// The race is residual: the fexit program can be delayed by preemption
+// beyond this budget. A structural fix would record the attribution
+// before the datagram is queued (e.g. at udp_send_skb). Separately, a
+// stale entry from an earlier socket that used the same source port can
+// still be returned on the first attempt (pre-existing, not introduced
+// by the retry).
+//
+// Retries yield with runtime.Gosched instead of time.Sleep: sub-ms
+// sleeps round up to ~1 ms each, which would make every persistent miss
+// (untracked senders, TCP queries) cost several ms.
+const dnsPIDRetryBudget = time.Millisecond
+
+// dnsPIDImmediateRetries is how many back-to-back retries precede the
+// first yield; most races resolve within them.
+const dnsPIDImmediateRetries = 3
+
+// lookupWithRetry calls fn; while it returns ebpf.ErrKeyNotExist it
+// yields and retries until budget has elapsed (per now) since the first
+// attempt. Any other error (or success) returns immediately. The last
+// error is returned once the budget is exhausted.
+func lookupWithRetry(fn func() error, budget time.Duration, now func() time.Time, yield func()) error {
+	start := now()
+
+	for attempt := 1; ; attempt++ {
+		err := fn()
+		if !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return err
+		}
+
+		if now().Sub(start) >= budget {
+			return err
+		}
+
+		if attempt > dnsPIDImmediateRetries {
+			yield()
+		}
+	}
+}
+
 // Lookup returns the PID, comm, parent comm, and cgroup ID for a DNS
 // query from netnsCookie:srcPort. Returns zero values on miss.
 // netnsCookie is obtained userspace-side via getsockopt(SO_NETNS_COOKIE)
 // on a socket bound in the container netns — see
 // (*DNSProxy).netnsCookieFromConn.
 func (t *DNSPIDTracker) Lookup(netnsCookie uint64, srcPort uint16) (uint32, string, string, uint64) {
+	return t.lookup(netnsCookie, srcPort, true)
+}
+
+// lookup is Lookup with the miss retry optional: only UDP needs it (the
+// UDP attribution entry is written after the datagram is queued; TCP
+// attribution is written at connect, before any data).
+func (t *DNSPIDTracker) lookup(netnsCookie uint64, srcPort uint16, retry bool) (uint32, string, string, uint64) {
 	if srcPort == 0 {
 		return 0, "", "", 0
 	}
@@ -413,7 +467,15 @@ func (t *DNSPIDTracker) Lookup(netnsCookie uint64, srcPort uint16) (uint32, stri
 
 	var raw [dnsPIDAttrSize]byte
 
-	err := t.objs.DnsPidAttribution.Lookup(key, &raw)
+	read := func() error { return t.objs.DnsPidAttribution.Lookup(key, &raw) }
+
+	var err error
+	if retry {
+		err = lookupWithRetry(read, dnsPIDRetryBudget, time.Now, runtime.Gosched)
+	} else {
+		err = read()
+	}
+
 	if err != nil {
 		if t.logger != nil {
 			t.logger.Debug("dns pid lookup miss",
@@ -463,7 +525,17 @@ func (t *DNSPIDTracker) BinaryPathForPID(pid uint32) string {
 // fetched with a second BPF map read against process_info[pid]; missing
 // binary_path is returned as an empty string (pid/comm/... still valid).
 func (t *DNSPIDTracker) LookupWithBinary(netnsCookie uint64, srcPort uint16) (uint32, string, string, string, uint64) {
-	pid, comm, parentComm, cgroupID := t.Lookup(netnsCookie, srcPort)
+	return t.lookupWithBinary(netnsCookie, srcPort, true)
+}
+
+// LookupWithBinaryNoRetry is LookupWithBinary without the miss retry, for
+// TCP queries.
+func (t *DNSPIDTracker) LookupWithBinaryNoRetry(netnsCookie uint64, srcPort uint16) (uint32, string, string, string, uint64) {
+	return t.lookupWithBinary(netnsCookie, srcPort, false)
+}
+
+func (t *DNSPIDTracker) lookupWithBinary(netnsCookie uint64, srcPort uint16, retry bool) (uint32, string, string, string, uint64) {
+	pid, comm, parentComm, cgroupID := t.lookup(netnsCookie, srcPort, retry)
 	if pid == 0 {
 		return 0, "", "", "", 0
 	}

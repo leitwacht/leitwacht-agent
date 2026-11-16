@@ -29,7 +29,17 @@
 // answer is held until the join binds it or the deadline passes (design
 // section 3), then given per policy, or in audit when never bound.
 //
-// Lifecycle: the proxy follows the buildkitd process. When the process
+// Lifecycle: the proxy follows the buildkitd process. Before the first RUN
+// step exists the netns can come from an optional trusted source
+// (BuildDNSConfig.TrustedPID, e.g. the buildkitd container resolved
+// through the container runtime), so the first build after an agent
+// restart is covered, and the redirect is enabled at once. That is safe: the
+// redirect programs sit only on the BuildKit RUN parent cgroups (none
+// exist before buildkitd's first RUN, so nothing is redirected until
+// then) and match only sockets in the proxy's netns. Until a RUN step is
+// seen in that netns the bind is unconfirmed: a step proving another netns
+// rebinds, or, when buildkitd still occupies the bound netns (CNI or
+// bridge mode), latches the redirect off. When the process
 // (or its netns) changes it is rebound; while it is not bound the redirect
 // is off, DNS goes straight to the upstream (which the port-53 pin
 // allows), and rows of policies with name rules carry
@@ -70,6 +80,14 @@ const (
 	DefaultBuildDNSProc = "buildkitd"
 
 	defaultBuildDNSPoll = 500 * time.Millisecond
+
+	// trustedRetryAfter is how long a failed TrustedPID call is not
+	// repeated.
+	trustedRetryAfter = 5 * time.Second
+
+	// trustedAbsentRetryAfter applies when the source reports the
+	// container does not exist on this node.
+	trustedAbsentRetryAfter = 30 * time.Second
 
 	// maxBuildDNSHolds bounds the queries held at once so a burst from
 	// fresh cgroups cannot exhaust the proxy's in-flight budget; beyond
@@ -168,6 +186,36 @@ type BuildDNSConfig struct {
 	// match alone. Until a trusted netns is known the redirect stays off
 	// (DNS goes to the upstream: fail-open).
 	NetnsPID func() (int, error)
+	// TrustedPID is an optional, trusted pre-RUN source of a process in
+	// buildkitd's netns, consulted when no RUN-cgroup process exists (RUN
+	// samples always win) and before ProcCgroupContains. It closes the
+	// gap after an agent restart: without it the proxy stays unbound until
+	// the first RUN step exists, and that step's DNS goes unrecorded with
+	// domain rules inactive. The consumer must make it trustworthy, for
+	// example by resolving the buildkitd container through the container
+	// runtime from CRI-set container labels (watcher.FindPodContainerPID),
+	// never by process name.
+	//
+	// A PID obtained this way counts as verified: the redirect is enabled
+	// immediately, so the first build step after an agent restart is
+	// covered. The redirect programs are attached only at the BuildKit RUN
+	// parent cgroups (before buildkitd's first-ever RUN they do not exist,
+	// so nothing is redirected) and match only sockets whose netns cookie
+	// is the proxy's. Until a RUN process is seen in the bound netns the
+	// bind is "unconfirmed": a RUN step proving a different netns rebinds
+	// when nobody is left in the old one, and latches the redirect off when
+	// the bound netns is still occupied (CNI or bridge network mode, where
+	// RUN steps never share buildkitd's netns). The ProcCgroupContains
+	// path stays unverified until a RUN process is seen.
+	//
+	// It may block (a container runtime RPC): it is called without any
+	// proxy lock held, never concurrently with itself, and an error or 0
+	// falls through to the next source. After a failure it is not called
+	// again for 5s; when the error wraps ErrTrustedPIDAbsent (no such
+	// container on this node, the normal case on a DaemonSet) for 30s. The
+	// process start time is read when it returns and re-checked after the
+	// bind, so a recycled PID is unbound. Ignored when NetnsPID is set.
+	TrustedPID func() (int, error)
 	// ProcName narrows the ProcCgroupContains lookup (default
 	// "buildkitd"); it is never trusted by itself.
 	ProcName string
@@ -272,8 +320,9 @@ type buildDNS struct {
 	boundPID int
 	boundIno uint64
 	enabled  bool
-	// verified: a live RUN-cgroup process was seen in the bound netns;
-	// the redirect is never enabled before that, and once verified it
+	// verified: a live RUN-cgroup process was seen in the bound netns, or
+	// the bind came from the trusted TrustedPID source; the redirect is
+	// never enabled before that, and once verified it
 	// stays on while the proxy is bound (the proxy's own sockets keep the
 	// netns alive), also between build steps. mismatch latches (for
 	// latchHold) when RUN processes are seen in several netns (CNI/bridge
@@ -285,6 +334,18 @@ type buildDNS struct {
 	proofBinds []time.Time
 	lastErr    string
 	lastErrT   time.Time
+
+	// trustedRetry is when TrustedPID may be called again after a failure;
+	// trustedNow is the clock seam for it.
+	trustedRetry time.Time
+	trustedNow   func() time.Time
+	trustedBusy  bool // a TrustedPID call is in flight
+	// unconfirmed: the bound netns came from TrustedPID and no RUN process
+	// has been seen in it yet.
+	unconfirmed bool
+	// procStart returns a process's start time (/proc/<pid>/stat field
+	// 22), used to detect PID reuse; a seam for tests.
+	procStart func(pid int) (string, error)
 
 	// Per-cgroup isolation: holds in progress, in-flight queries and a
 	// token bucket per cgroup (0 = unattributed shares one).
@@ -328,6 +389,11 @@ type slotCfg struct {
 	cfg *DNSProxyConfig
 	pol *policy.ResolvedPolicy
 }
+
+// ErrTrustedPIDAbsent is what a BuildDNSConfig.TrustedPID source wraps
+// when there is simply no such process on this node (for example no
+// buildkitd container); the proxy then polls it less often.
+var ErrTrustedPIDAbsent = errors.New("trusted pid source: no such process on this node")
 
 var (
 	errBuildDNSNoTracker = errors.New("build dns proxy needs the dns pid tracker")
@@ -478,11 +544,13 @@ func newBuildDNS(
 		recs:         map[PolicyKey]*ViolationRecorder{},
 		pend:         map[uint64]*pendingRec{},
 		domains:      newBuildDomains(),
+		trustedNow:   time.Now,
 		newSource:    func(paths []string) CgroupEventSource { return NewInotifyCgroupSource(paths) },
 	}
 
 	d.auditCfg = d.newCfg(nil, false)
 	d.sample = d.defaultSample
+	d.procStart = func(pid int) (string, error) { return procStartTime(d.cfg.ProcRoot, pid) }
 	d.anyInNetns = d.defaultAnyInNetns
 
 	return d, nil
@@ -490,20 +558,112 @@ func newBuildDNS(
 
 // candidatePID picks the process whose netns a new proxy binds in: a live
 // RUN-cgroup process (trusted: it runs under the configured BuildKit
-// parent), else a cgroup-matched buildkitd when ProcCgroupContains is set.
-// A process name alone is never enough. fromRun tells which.
-func (d *buildDNS) candidatePID(samples []runSample) (pid int, fromRun bool) {
+// parent), else trusted (the PID pollTrusted obtained from TrustedPID, 0
+// for none), else a cgroup-matched buildkitd when ProcCgroupContains is
+// set. A process name alone is never enough. verified tells whether the
+// PID is trusted enough to enable the redirect at once (RUN sample or
+// TrustedPID) rather than only after a RUN process proves the netns
+// (ProcCgroupContains); fromTrusted tells it came from TrustedPID.
+func (d *buildDNS) candidatePID(samples []runSample, trusted int) (pid int, verified, fromTrusted bool) {
 	if len(samples) > 0 {
-		return samples[0].pid, true
+		return samples[0].pid, true, false
+	}
+
+	if trusted > 0 {
+		return trusted, true, true
 	}
 
 	if d.cfg.ProcCgroupContains != "" {
 		if p, err := findTrustedProc(d.cfg.ProcRoot, d.cfg.ProcName, d.cfg.ProcCgroupContains); err == nil {
-			return p, false
+			return p, false, false
 		}
 	}
 
-	return 0, false
+	return 0, false, false
+}
+
+// pollTrusted calls BuildDNSConfig.TrustedPID when the proxy is unbound,
+// no RUN process exists and the failure throttle allows it. It runs
+// without d.mu held (the source may block on a container runtime RPC) and
+// at most once at a time. It never samples RUN processes (candidatePID
+// prefers them anyway). It returns the PID and its start time, or 0.
+func (d *buildDNS) pollTrusted() (pid int, start string) {
+	if d.cfg.TrustedPID == nil || d.cfg.NetnsPID != nil {
+		return 0, ""
+	}
+
+	d.mu.Lock()
+
+	now := d.trustedNow()
+	if d.proxy != nil || d.trustedBusy || now.Before(d.trustedRetry) || (d.ctx != nil && d.ctx.Err() != nil) {
+		d.mu.Unlock()
+
+		return 0, ""
+	}
+
+	d.trustedBusy = true
+
+	d.mu.Unlock()
+
+	p, err := d.cfg.TrustedPID()
+
+	st := ""
+	if err == nil && p > 0 {
+		if st, err = d.procStart(p); err != nil {
+			err = fmt.Errorf("start time of trusted pid: %w", err)
+		}
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.trustedBusy = false
+
+	if err != nil || p <= 0 {
+		// Measured from after the call: a slow failure must not make the
+		// next attempt immediate.
+		after := d.trustedNow()
+
+		switch {
+		case errors.Is(err, ErrTrustedPIDAbsent):
+			d.trustedRetry = after.Add(trustedAbsentRetryAfter)
+
+			d.log.Debug("buildkit dns proxy: no trusted buildkitd process on this node", "error", err)
+		case err != nil:
+			d.trustedRetry = after.Add(trustedRetryAfter)
+
+			d.rateLimitedErrLocked(fmt.Sprintf("trusted pid source failed: %v", err))
+		default:
+			d.trustedRetry = after.Add(trustedRetryAfter)
+		}
+
+		return 0, ""
+	}
+
+	return p, st
+}
+
+// procStartTime returns /proc/<pid>/stat field 22 (start time in clock
+// ticks since boot), which together with the PID identifies a process.
+func procStartTime(procRoot string, pid int) (string, error) {
+	b, err := os.ReadFile(filepath.Join(procRoot, strconv.Itoa(pid), "stat")) //nolint:gosec // procfs
+	if err != nil {
+		return "", fmt.Errorf("read stat: %w", err)
+	}
+
+	str := string(b)
+
+	i := strings.LastIndexByte(str, ')')
+	if i < 0 {
+		return "", errBuildDNSProcGone
+	}
+
+	f := strings.Fields(str[i+1:])
+	if len(f) < 20 {
+		return "", errBuildDNSProcGone
+	}
+
+	return f[19], nil
 }
 
 // newCfg builds a per-policy proxy config for HandleDNSQuery. Seeding is
@@ -671,6 +831,8 @@ func (d *buildDNS) Close() {
 // CNI/bridge mode (latch off). A dead serving goroutine clears the
 // redirect first and rebinds.
 func (d *buildDNS) reconcile() {
+	trusted, trustedStart := d.pollTrusted() // may block: before taking d.mu
+
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -700,13 +862,24 @@ func (d *buildDNS) reconcile() {
 	}
 
 	if d.proxy == nil {
-		pid, fromRun := d.candidatePID(samples)
+		pid, verified, fromTrusted := d.candidatePID(samples, trusted)
 		if pid == 0 {
 			return
 		}
 
+		if fromTrusted && !d.sameProcLocked(pid, trustedStart) {
+			return
+		}
+
 		if d.bindLocked(pid) {
-			d.verified = fromRun
+			if fromTrusted && !d.sameProcLocked(pid, trustedStart) {
+				d.unbindLocked("trusted pid was recycled during the bind")
+
+				return
+			}
+
+			d.verified = verified
+			d.unconfirmed = fromTrusted
 			d.judgeLocked(samples) // latches at once if the RUN steps disagree
 		}
 
@@ -714,6 +887,14 @@ func (d *buildDNS) reconcile() {
 	}
 
 	d.judgeLocked(samples)
+}
+
+// sameProcLocked reports whether pid still has the start time recorded
+// when the trusted source returned it (PID reuse guard).
+func (d *buildDNS) sameProcLocked(pid int, start string) bool {
+	now, err := d.procStart(pid)
+
+	return err == nil && now == start
 }
 
 // reconcileOperatorLocked follows an operator-supplied netns source
@@ -757,6 +938,7 @@ func (d *buildDNS) judgeLocked(samples []runSample) {
 	for _, sm := range samples {
 		if sm.ino == d.boundIno {
 			same = true
+			d.unconfirmed = false
 			d.boundPID = sm.pid
 		} else {
 			foreign[sm.ino] = sm.pid
@@ -777,6 +959,15 @@ func (d *buildDNS) judgeLocked(samples []runSample) {
 		// processes) there. Only the former rebinds. The scan is paid
 		// only here.
 		if d.anyInNetns(d.boundIno) {
+			if d.unconfirmed {
+				// Bound from the trusted source and never confirmed by a
+				// RUN step, which now runs elsewhere while buildkitd still
+				// occupies the bound netns: RUN steps do not share it.
+				d.latchLocked("RUN steps run outside buildkitd's netns (CNI or bridge network mode?)")
+
+				break
+			}
+
 			d.rateLimitedErrLocked("a RUN step runs in a different netns while the bound one is still in use (unshare/insecure entitlement?); not rebinding")
 
 			break
@@ -848,6 +1039,14 @@ func (d *buildDNS) bindLocked(pid int) bool {
 		QueryHandler: d.handle,
 	}
 
+	// TCP attribution needs no miss retry; trackers that offer a
+	// non-retrying lookup get it for TCP queries.
+	if nr, ok := d.cfg.Tracker.(interface {
+		LookupWithBinaryNoRetry(netnsCookie uint64, srcPort uint16) (uint32, string, string, string, uint64)
+	}); ok {
+		proxyCfg.LookupDNSPIDTCP = nr.LookupWithBinaryNoRetry
+	}
+
 	p := NewDNSProxy(proxyCfg)
 	p.Start(udp, tcp)
 
@@ -863,6 +1062,7 @@ func (d *buildDNS) bindLocked(pid int) bool {
 	d.boundPID = pid
 	d.boundIno = ino
 	d.verified = false
+	d.unconfirmed = false
 	d.lastErr = ""
 
 	// Read the search list now: the sampled process is often gone by the
@@ -939,6 +1139,7 @@ func (d *buildDNS) unbindLocked(reason string) {
 
 	d.boundPID = 0
 	d.boundIno = 0
+	d.unconfirmed = false
 
 	if wasActive || reason != "shutdown" {
 		d.log.Warn("buildkit dns proxy unbound; DNS passes to the upstream and domain rules are not enforced until it is bound again",

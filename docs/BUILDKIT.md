@@ -275,6 +275,29 @@ the proxy does not bind from RUN steps (only via `procCgroup`), so domain
 rules are not enforced (binding fails closed, enforcement fails open; an
 Error is logged).
 
+Without a pre-RUN source the proxy stays unbound after every agent restart
+until the first RUN step exists, and that first step's DNS goes unrecorded
+with domain rules inactive. Embedders can close this gap with
+`BuildDNSConfig.TrustedPID`, a callback returning a process in buildkitd's
+netns before any RUN step runs. `watcher.FindPodContainerPID` is a
+ready-made source: it asks containerd for the running task whose
+CRI-set container labels `io.kubernetes.pod.namespace` and
+`io.kubernetes.container.name` match, fails on more than one match, and
+checks that the task's cgroup contains the pod UID. The labels come from
+kubelet through the CRI, so a CI job cannot forge them without Kubernetes
+API rights to create containers in the buildkitd namespace. The proxy
+binds in that netns and the redirect is enabled at once. The redirect
+programs are attached only at the BuildKit RUN parent cgroups (they do not
+exist before buildkitd's first-ever RUN, so nothing is redirected until
+then) and match only sockets in the proxy's netns. Until a RUN step is
+seen in that netns the bind is unconfirmed: if a step proves a different
+netns the proxy rebinds (nobody left in the old one) or, when buildkitd
+still occupies the bound netns (CNI or bridge network mode), latches the
+redirect off and domain rules stay inactive. Sources should wrap
+`enforcer.ErrTrustedPIDAbsent` when there is no buildkitd on the node, so
+the proxy polls them every 30 s instead of every 5 s. It is
+opt-in by the embedder; the CE daemon does not wire it.
+
 IP/CIDR rules reach RUN steps through the egress filter. Domain rules
 need the agent to see the names a step resolves. Enable the proxy only
 once you have read this section; with it on, names that were previously

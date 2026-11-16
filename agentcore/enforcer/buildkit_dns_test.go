@@ -2,6 +2,7 @@ package enforcer
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -973,14 +974,14 @@ func TestBuildDNS_NetnsSourceIgnoresSpoofedComm(t *testing.T) {
 	r := newDNSRig(t, time.Second)
 	r.d.cfg.ProcRoot = root
 
-	if p, _ := r.d.candidatePID(nil); p != 0 {
+	if p, _, _ := r.d.candidatePID(nil, 0); p != 0 {
 		t.Fatalf("candidate %d from a comm match alone", p)
 	}
 
 	r.d.cfg.ProcCgroupContains = uid
 
-	if p, fromRun := r.d.candidatePID(nil); p != 9 || fromRun {
-		t.Fatalf("candidate %d fromRun=%v, want the cgroup-matched 9, unverified", p, fromRun)
+	if p, verified, _ := r.d.candidatePID(nil, 0); p != 9 || verified {
+		t.Fatalf("candidate %d verified=%v, want the cgroup-matched 9, unverified", p, verified)
 	}
 
 	run := filepath.Join(root, "parent", "run-1")
@@ -1401,5 +1402,317 @@ func TestBuildDNS_PerProjectInflightCap(t *testing.T) {
 
 	if _, ok := r.d.admitProject("g/a"); !ok {
 		t.Fatal("not admitted after release")
+	}
+}
+
+func fixedStart(int) (string, error) { return "1", nil }
+
+func TestBuildDNS_CandidateOrder(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	dir := filepath.Join(root, "9")
+	_ = os.MkdirAll(dir, 0o755)
+	_ = os.WriteFile(filepath.Join(dir, "comm"), []byte("buildkitd\n"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "cgroup"), []byte("0::/kubepods/pod12345678_1234_1234_1234_123456789abc/c\n"), 0o644)
+
+	r := newDNSRig(t, time.Second)
+	r.d.cfg.ProcRoot = root
+	r.d.cfg.ProcCgroupContains = "12345678-1234-1234-1234-123456789abc"
+
+	// A RUN sample beats the trusted PID.
+	if p, v, ft := r.d.candidatePID([]runSample{{pid: 77, ino: 1}}, 500); p != 77 || !v || ft {
+		t.Fatalf("pid %d verified=%v fromTrusted=%v, want the RUN sample", p, v, ft)
+	}
+
+	// No samples: the trusted PID, verified.
+	if p, v, ft := r.d.candidatePID(nil, 500); p != 500 || !v || !ft {
+		t.Fatalf("pid %d verified=%v fromTrusted=%v, want trusted 500", p, v, ft)
+	}
+
+	// No trusted PID: ProcCgroupContains, still unverified.
+	if p, v, ft := r.d.candidatePID(nil, 0); p != 9 || v || ft {
+		t.Fatalf("pid %d verified=%v fromTrusted=%v, want unverified 9", p, v, ft)
+	}
+}
+
+func TestBuildDNS_TrustedPIDThrottle(t *testing.T) {
+	t.Parallel()
+
+	r := newDNSRig(t, time.Second)
+	r.d.procStart = fixedStart
+
+	now := time.Unix(1000, 0)
+	r.d.trustedNow = func() time.Time { return now }
+
+	calls := 0
+	tpid, terr := 500, error(nil)
+	r.d.cfg.TrustedPID = func() (int, error) {
+		calls++
+
+		return tpid, terr
+	}
+
+	if p, _ := r.d.pollTrusted(); p != 500 || calls != 1 {
+		t.Fatalf("pid %d calls %d", p, calls)
+	}
+
+	terr = errBuildDNSProcGone
+
+	if p, _ := r.d.pollTrusted(); p != 0 || calls != 2 {
+		t.Fatalf("pid %d calls %d, want a failed call", p, calls)
+	}
+
+	now = now.Add(4 * time.Second)
+
+	if p, _ := r.d.pollTrusted(); p != 0 || calls != 2 {
+		t.Fatalf("pid %d calls %d: called again within the 5s throttle", p, calls)
+	}
+
+	now = now.Add(2 * time.Second)
+	terr = nil
+
+	if p, _ := r.d.pollTrusted(); p != 500 || calls != 3 {
+		t.Fatalf("pid %d calls %d, want a call after the window", p, calls)
+	}
+
+	// "No such container" backs off for 30s.
+	terr = fmt.Errorf("%w: none", ErrTrustedPIDAbsent)
+
+	if p, _ := r.d.pollTrusted(); p != 0 || calls != 4 {
+		t.Fatalf("pid %d calls %d", p, calls)
+	}
+
+	now = now.Add(20 * time.Second)
+
+	if _, _ = r.d.pollTrusted(); calls != 4 {
+		t.Fatalf("calls %d: absent backoff shorter than 30s", calls)
+	}
+
+	now = now.Add(11 * time.Second)
+
+	if _, _ = r.d.pollTrusted(); calls != 5 {
+		t.Fatalf("calls %d, want a call after 30s", calls)
+	}
+
+	// A slow failure is throttled from after the call returns.
+	terr = errBuildDNSProcGone
+	now = now.Add(time.Minute)
+
+	slow := r.d.cfg.TrustedPID
+	r.d.cfg.TrustedPID = func() (int, error) {
+		now = now.Add(5 * time.Second) // the call itself took 5s
+
+		return slow()
+	}
+	calls = 0
+
+	_, _ = r.d.pollTrusted()
+
+	now = now.Add(3 * time.Second)
+
+	if _, _ = r.d.pollTrusted(); calls != 1 {
+		t.Fatalf("calls %d: retry computed from before the call", calls)
+	}
+
+	// pollTrusted never samples RUN processes (no unlocked sample call).
+	r.d.sample = func() []runSample {
+		t.Error("pollTrusted called sample")
+
+		return nil
+	}
+	now = now.Add(time.Minute)
+
+	_, _ = r.d.pollTrusted()
+
+	// Not called while bound.
+	r.d.proxy = &DNSProxy{}
+	calls = 0
+	now = now.Add(time.Minute)
+
+	if _, _ = r.d.pollTrusted(); calls != 0 {
+		t.Fatalf("calls %d while bound", calls)
+	}
+
+	r.d.proxy = nil
+}
+
+func TestBuildDNS_TrustedPIDDoesNotHoldLock(t *testing.T) {
+	t.Parallel()
+
+	r := newDNSRig(t, time.Second)
+	r.d.procStart = fixedStart
+
+	in, release := make(chan struct{}), make(chan struct{})
+	r.d.cfg.TrustedPID = func() (int, error) {
+		close(in)
+		<-release
+
+		return 500, nil
+	}
+
+	done := make(chan struct{})
+
+	go func() {
+		r.d.pollTrusted()
+		close(done)
+	}()
+
+	<-in
+
+	locked := make(chan struct{})
+
+	go func() {
+		_ = r.d.Active() // takes d.mu
+		close(locked)
+	}()
+
+	select {
+	case <-locked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("d.mu held during the TrustedPID call")
+	}
+
+	close(release)
+	<-done
+}
+
+func TestBuildDNS_TrustedPIDBindsWithoutRunProcesses(t *testing.T) {
+	t.Parallel()
+
+	r, env := newRunRig(t)
+	r.d.procStart = fixedStart
+	env.inoOf[500] = 7000
+	r.d.cfg.TrustedPID = func() (int, error) { return 500, nil }
+
+	r.d.reconcile()
+
+	if r.d.proxy == nil || env.binds != 1 || r.d.boundIno != 7000 {
+		t.Fatalf("not bound from the trusted pid: binds=%d ino=%d", env.binds, r.d.boundIno)
+	}
+
+	// Trusted source: the redirect is enabled with no RUN process.
+	if on, _ := r.redirectState(); !on || !r.d.verified || !r.b.DNSProxyActive() {
+		t.Fatal("redirect not enabled right after a trusted bind")
+	}
+
+	env.setProcs(runSample{pid: 100, ino: 7000})
+	r.d.reconcile()
+
+	if on, _ := r.redirectState(); !on || r.d.unconfirmed {
+		t.Fatal("redirect dropped or still unconfirmed after a RUN process in the bound netns")
+	}
+
+	if env.binds != 1 {
+		t.Fatalf("binds = %d, want 1", env.binds)
+	}
+}
+
+func TestBuildDNS_TrustedPIDRecycledNotBound(t *testing.T) {
+	t.Parallel()
+
+	r, env := newRunRig(t)
+	env.inoOf[500] = 7000
+
+	n := 0
+	r.d.procStart = func(int) (string, error) {
+		n++
+
+		return fmt.Sprint(n), nil // a different process on every read
+	}
+	r.d.cfg.TrustedPID = func() (int, error) { return 500, nil }
+
+	r.d.reconcile()
+
+	if r.d.proxy != nil || env.binds != 0 {
+		t.Fatalf("bound a pid whose start time changed: binds=%d", env.binds)
+	}
+}
+
+func TestBuildDNS_TrustedPIDRebindsOnForeignRunNetns(t *testing.T) {
+	t.Parallel()
+
+	r, env := newRunRig(t)
+	r.d.procStart = fixedStart
+	env.inoOf[500] = 7000
+	r.d.cfg.TrustedPID = func() (int, error) { return 500, nil }
+
+	r.d.reconcile()
+
+	if r.d.proxy == nil || r.d.boundIno != 7000 {
+		t.Fatal("not bound from the trusted pid")
+	}
+
+	// A lone RUN step in another netns, nobody left in the old one
+	// (anyInNetns is false): rebind into it despite verified=true.
+	env.setProcs(runSample{pid: 600, ino: 8000})
+	r.d.reconcile()
+
+	if env.binds != 2 || r.d.boundIno != 8000 || r.d.mismatch || r.d.unconfirmed {
+		t.Fatalf("binds=%d ino=%d mismatch=%v, want a rebind into 8000", env.binds, r.d.boundIno, r.d.mismatch)
+	}
+
+	if on, _ := r.redirectState(); !on {
+		t.Fatal("redirect off after the rebind")
+	}
+}
+
+// CNI/bridge mode: buildkitd still occupies the trusted-bound netns while
+// RUN steps run in their own. The unconfirmed bind must not keep the
+// redirect (and the "proxy active" flag) on.
+func TestBuildDNS_TrustedPIDLatchesWhenRunStepsAreElsewhere(t *testing.T) {
+	t.Parallel()
+
+	r, env := newRunRig(t)
+	r.d.procStart = fixedStart
+	env.inoOf[500] = 7000
+	r.d.cfg.TrustedPID = func() (int, error) { return 500, nil }
+	r.d.anyInNetns = func(ino uint64) bool { return ino == 7000 } // buildkitd lives there
+
+	r.d.reconcile()
+
+	if on, _ := r.redirectState(); !on {
+		t.Fatal("redirect not on after the trusted bind")
+	}
+
+	env.setProcs(runSample{pid: 600, ino: 8000})
+	r.d.reconcile()
+
+	if !r.d.mismatch {
+		t.Fatal("did not latch")
+	}
+
+	if on, _ := r.redirectState(); on || r.b.DNSProxyActive() {
+		t.Fatal("redirect still on after RUN steps proved they are outside the bound netns")
+	}
+
+	if env.binds != 1 {
+		t.Fatalf("binds = %d, want no rebind", env.binds)
+	}
+}
+
+// Once a RUN step confirmed the bound netns, a later foreign step is the
+// unshare case: keep the redirect, no latch.
+func TestBuildDNS_ConfirmedBindKeepsUnshareBehaviour(t *testing.T) {
+	t.Parallel()
+
+	r, env := newRunRig(t)
+	r.d.procStart = fixedStart
+	env.inoOf[500] = 7000
+	r.d.cfg.TrustedPID = func() (int, error) { return 500, nil }
+	r.d.anyInNetns = func(ino uint64) bool { return ino == 7000 }
+
+	r.d.reconcile()
+	env.setProcs(runSample{pid: 100, ino: 7000})
+	r.d.reconcile()
+	env.setProcs(runSample{pid: 600, ino: 8000})
+	r.d.reconcile()
+
+	if r.d.mismatch {
+		t.Fatal("latched although a RUN step confirmed the bound netns")
+	}
+
+	if on, _ := r.redirectState(); !on {
+		t.Fatal("redirect dropped for an unshare step")
 	}
 }
